@@ -21,7 +21,10 @@ pi-pane 是 [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) 
 | pi-pane（本仓库） | 轻量 Web 界面：托管主会话、聊天流、图片占位符、通用插件接口 |
 | pi-agora | 协作引擎：子代理、共享桌面（board）、会议、提问与答复、全量对话存档；可以不装 pi-pane 单独使用 |
 
-pi-pane 不认识“子代理”“会议”。pi-agora 提供一个 pi-pane 插件，通过通用接口把子会话树、board、待处理事项等显示出来。两者的集成协议以 pi-agora 仓库的 `docs/integration.md` 为准，本仓库不重复定义。
+pi-pane 不认识“子代理”“会议”，也不依赖 pi-agora。pi-agora 提供一个 pi-pane 插件，通过通用接口把子会话树、board、待处理事项等显示出来。
+
+- 插件接口（pane 协议）以本仓库的 [docs/plugin-api.md](docs/plugin-api.md) 为准，所有插件共用。
+- agora 后台服务的 HTTP API、agora 数据如何映射到插件接口，以 pi-agora 仓库的 `docs/integration.md` 为准。
 
 ## 组成
 
@@ -30,7 +33,7 @@ packages/
   server/             服务端：会话托管、鉴权、WebSocket、附件、插件宿主
   web/                前端
   bridge-extension/   加载进每个主会话的 pi 扩展：图片顺序还原、多题表单通道
-  plugin-api/         插件接口和 pane 协议类型
+  plugin-api/         插件接口和 pane 协议类型（@pi-pane/plugin-api）
 ```
 
 运行环境（计划）：Node.js 24 及以上，pi 1.4.0；只监听本机地址；首先支持 Windows，其他平台随后验证。
@@ -40,7 +43,7 @@ packages/
 | 文档 | 内容 |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 会话托管、浏览器与服务端的数据流和重连、鉴权、插件宿主、核心功能范围、明确不做的功能 |
-| [docs/plugin-api.md](docs/plugin-api.md) | 插件接口：会话树、会话视图、面板、动作、表单、通知，以及 pi 原生扩展 UI 的适配 |
+| [docs/plugin-api.md](docs/plugin-api.md) | 插件接口与 pane 协议（权威定义）：会话树、会话视图、面板、动作、表单、通知的类型和规则、版本协商，以及 pi 原生扩展 UI 的适配 |
 | [docs/image-placeholders.md](docs/image-placeholders.md) | 图片占位符：输入框行为、assetId 与存储、保持图文顺序的做法、P0 验证清单 |
 | [docs/roadmap.md](docs/roadmap.md) | P0、MVP、工程量、明确不做、主要风险 |
-| pi-agora 仓库 `docs/integration.md` | 与 pi-agora 的集成协议（树节点、面板、动作、表单等数据类型的权威定义） |
+| pi-agora 仓库 `docs/integration.md` | agora 后台服务的 HTTP API 和 agora 到本插件接口的映射 |

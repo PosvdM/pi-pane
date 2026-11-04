@@ -4,7 +4,7 @@
 
 pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起一个 `pi --mode rpc` 子进程，把聊天流转发给浏览器；子代理、会议等功能由插件通过通用接口显示，pi-pane 本身不实现这些业务。
 
-插件接口见 [plugin-api.md](plugin-api.md)，图片占位符见 [image-placeholders.md](image-placeholders.md)。与 pi-agora 的集成协议以 pi-agora 仓库的 `docs/integration.md` 为准。
+插件接口和 pane 协议以 [plugin-api.md](plugin-api.md) 为准，图片占位符见 [image-placeholders.md](image-placeholders.md)。pi-pane 不依赖 pi-agora；agora 如何映射到插件接口见 pi-agora 仓库的 `docs/integration.md`。
 
 ## 设计约束
 
@@ -34,7 +34,7 @@ pi-pane 服务端（server）
 | `packages/server` | 服务端：会话托管、RPC 驱动、鉴权、WebSocket、附件、插件宿主 |
 | `packages/web` | 前端：会话列表与树、聊天视图、输入框、对话框、面板 |
 | `packages/bridge-extension` | 加载进每个主会话的 pi 扩展：图片顺序还原、多题表单通道 |
-| `packages/plugin-api` | 插件接口和 pane 协议 v1 的 TypeScript 类型（按 pi-agora `docs/integration.md` 定义） |
+| `packages/plugin-api` | `@pi-pane/plugin-api`：插件接口和 pane 协议 v1 的 TypeScript 类型，按 [plugin-api.md](plugin-api.md) 导出；插件把它作为 peer 依赖 |
 
 前端技术栈（草案）：Vite + Preact。选择理由是打包体积小；P0 期间可以换，但不改变接口。
 
@@ -110,7 +110,7 @@ type ServerMessage =
   | { type: "notification"; notification: PaneNotification };
 ```
 
-`SessionRef`、`TreeChange`、`FormSpec`、`PaneNotification` 等类型由 pane 协议 v1 定义（pi-agora `docs/integration.md`）。主会话的 `SessionRef` 是 `{ source: "pane", id: <piSessionId> }`。
+`SessionRef`、`TreeChange`、`FormSpec`、`PaneNotification` 等类型由 pane 协议 v1 定义（[plugin-api.md](plugin-api.md)）。主会话的 `SessionRef` 是 `{ source: "pane", id: <piSessionId> }`。
 
 ### 事件序号与重连
 
@@ -130,7 +130,8 @@ type ServerMessage =
 - 启动时生成随机访问令牌，写入 `~/.pi/pane/secret/access-token`（仅当前用户可读，Windows 用 ACL），并在终端打印带令牌的地址 `http://127.0.0.1:4319/#token=...`。
 - 浏览器首次用令牌换取会话 Cookie（`HttpOnly`、`SameSite=Strict`），随后从地址栏移除令牌。
 - 每个 HTTP 请求和 WebSocket 握手都校验：Cookie 有效；`Host` 头是 `127.0.0.1:<port>` 或 `localhost:<port>`（防 DNS 重绑定）；`Origin` 与之匹配。`POST` 还要求自定义请求头 `X-Pane-Request: 1`。
-- 浏览器不持有 pi-agora daemon 的任何凭证，插件在服务端代为访问。
+- 浏览器不持有插件后台服务（如 pi-agora daemon）的任何凭证，插件在服务端代为访问。
+- 服务端为每个带副作用的请求（动作、表单提交）测出 loopback 连接的对端进程 PID，作为 `RequestOrigin` 交给插件（见 [plugin-api.md](plugin-api.md)）。pi-pane 自己不据此拒绝请求，由插件决定；例如 pi-agora 拒绝来自子代理进程树的“用户”操作。Windows 上查对端 PID 的具体接口未核实，P0 验证。
 - 不防同一操作系统用户下的恶意程序。
 
 ## 插件宿主

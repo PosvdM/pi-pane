@@ -12,6 +12,7 @@
 | 4 | pane-bridge 通道：`pi.events` 在同一进程内的扩展间收发；ticket 兑换后 `bash` 子进程看不到 | 表单往返成功；环境变量不泄漏 | plugin-api.md |
 | 5 | Windows 进程树终止 | 关闭会话后没有遗留进程（与 pi-agora 共用验证结果） | architecture.md |
 | 6 | 前端打包体积 | Vite + Preact 骨架加上 Markdown 渲染和代码高亮后的体积 | architecture.md |
+| 7 | 请求来源：从浏览器到服务端的 loopback 连接查出对端进程 PID（Windows `GetExtendedTcpTable` 一类接口，可与 pi-agora 共用实现） | 浏览器请求和脚本请求都能拿到正确 PID；单次 < 50 毫秒 | architecture.md、plugin-api.md |
 
 P0 约 2–3 人日。图片顺序还原是最高优先级：它决定 pane-bridge 的形态。
 
@@ -30,10 +31,10 @@ P0 约 2–3 人日。图片顺序还原是最高优先级：它决定 pane-brid
 | P0 | 上表验证项 | 2–3 |
 | M1 服务端 | 会话托管、RPC 驱动、鉴权、WebSocket、重连、附件 | 4–5 |
 | M2 前端 | 聊天视图、输入框与图片占位符、对话框、模型选择 | 4–6 |
-| M3 插件接口 | 插件宿主、树、面板、动作、表单、通知、pane-bridge 表单 | 2–4 |
+| M3 插件接口 | 插件宿主、树、面板、动作、表单、通知、请求来源、pane-bridge 表单 | 2–4 |
 | 合计 | | 12–18 |
 
-与 pi-agora（25–35 人日）合计 37–53 人日，日历时间 8–11 周。M1、M2 可以和 pi-agora 的开发并行；M3 的联调需要 pi-agora 的 pane 插件（pi-agora M4）。公开发布前的加固另算。
+与 pi-agora（27–37 人日）合计 39–55 人日，日历时间约 8–12 周。M1、M2 可以和 pi-agora 的开发并行；M3 的联调需要 pi-agora 的 pane 插件（pi-agora M4）。公开发布前的加固另算。
 
 ## 明确不做
 
@@ -52,5 +53,5 @@ P0 约 2–3 人日。图片顺序还原是最高优先级：它决定 pane-brid
 | pi 升级改变 RPC 或扩展 UI 协议 | 托管和对话框失效 | 锁定 pi 版本范围；关键路径写集成测试 |
 | 同一会话在终端和 pi-pane 同时运行 | 会话文件被两个进程写入 | 打开前检查最近修改时间并提示；无法完全避免 |
 | 用户扩展在 RPC 模式下行为不同 | 部分扩展功能不可用 | 依赖 pi 的 RPC 降级；在文档中列出已知不支持的方法 |
-| 集成协议两边不同步 | 插件显示错误 | 协议只在 pi-agora `docs/integration.md` 定义；版本协商；插件契约测试 |
+| pane 协议升级后插件未跟上 | 插件被拒绝加载或显示错误 | 协议只在本仓库 plugin-api.md 定义；版本协商且至少兼容上一版；`@pi-pane/plugin-api` 契约测试 |
 | 前端体积随功能增长 | 违背轻量目标 | 设打包体积预算，CI 检查 |
