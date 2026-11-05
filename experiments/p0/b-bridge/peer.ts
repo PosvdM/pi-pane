@@ -1,5 +1,6 @@
 import { appendFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 function log(data) { appendFileSync(process.env.B_LOG, JSON.stringify({ at: Date.now(), ...data }) + '\n'); }
 export default function(pi) {
   log({ kind: 'peer-factory', name: process.env.B_PEER_NAME || 'peer', paneTicket: Boolean(process.env.PANE_BRIDGE_TICKET), agoraTicket: Boolean(process.env.AGORA_LAUNCH_TICKET) });
@@ -7,18 +8,25 @@ export default function(pi) {
     const conn = globalThis[Symbol.for('pi-pane.bridge')];
     log({ kind: 'peer-global', visible: Boolean(conn), instance: conn?.sequence });
   });
-  pi.registerCommand('b-form', { handler: async (_, ctx) => {
+  const observers = [
+    pi.events.on('pane:pong', value => log({ kind: 'pong', ...value })),
+    pi.events.on('pane:form:response', value => log({ kind: 'form-response', ...value })),
+  ];
+  pi.on('session_shutdown', () => { for (const off of observers.splice(0)) off(); });
+  pi.registerCommand('b-form', { handler: async args => {
+    const requestId = args.trim() || randomUUID();
     let pong;
-    const remove = pi.events.on('pane:pong', data => { pong = data; });
-    pi.events.emit('pane:ping', { id: 'ping' });
+    const remove = pi.events.on('pane:pong', data => { if (data.requestId === requestId) pong = data; });
+    pi.events.emit('pane:ping', { requestId });
     remove();
     if (!pong) throw new Error('No pong');
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => { off(); reject(new Error('form timeout')); }, 5000);
       const off = pi.events.on('pane:form:response', value => {
+        if (value.requestId !== requestId) return;
         clearTimeout(timer); off(); log({ kind: 'form-result', ...value }); resolve();
       });
-      pi.events.emit('pane:form:request', { requestId: `form-${pong.instance}`, spec: { title: '本地表单', questions: [{ id: 'pick', type: 'select', options: ['A', 'B'] }] } });
+      pi.events.emit('pane:form:request', { requestId, spec: { title: '本地表单', questions: [{ id: 'pick', type: 'select', options: ['A', 'B'] }] } });
     });
   } });
   pi.registerCommand('b-global-use', { handler: async () => {

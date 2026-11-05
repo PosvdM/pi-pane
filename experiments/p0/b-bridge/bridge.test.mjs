@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { createExperiment, readJsonl } from '../harness/index.mjs';
+import { createExperiment, readJsonl } from './experiment.mjs';
 import { startBridge } from './server.mjs';
 import { images, image, encode, restore, signature, validateImages } from './images.mjs';
 
@@ -59,22 +59,38 @@ async function assertRestored(e, rpc, sent, requestIndex = -1) {
 for (const route of ['prompt', 'steer', 'follow_up']) {
   test(`图片 1/2/3/8：${route} 交错三图，重复三次`, async t => {
     const f = await fixture(t);
-    const rpc = await f.start();
+    const rpc = await f.start({ env: { B_SYNC: '1' } });
     for (let n = 0; n < 3; n++) {
       const sent = encode(images, ['红方块', '蓝圆', '字母C', '结束'], `order${n}`);
       const from = rpc.cursor;
-      if (route !== 'prompt') {
-        const reqCount = (await f.e.requests()).length;
-        await f.e.setScript({ routes: [{ when: { request: reqCount + 1 }, reply: { segments: [{ type: 'text', text: 'busy', delayMs: 500 }] } }], fallback: textReply });
-        await rpc.command({ type: 'prompt', message: 'start busy' });
-        await f.e.waitForProvider(entry => entry.kind === 'request' && entry.request === reqCount + 1);
-        assert.equal((await rpc.command({ type: route, ...sent })).success, true);
-      } else assert.equal((await rpc.command({ type: 'prompt', ...sent })).success, true);
-      await rpc.waitFor('agent_settled', { from });
+      const requestCount = (await f.e.requests()).length;
+      const restoreGate = f.bridge.armBarrier(`restore:order${n}`);
+      const busyMessage = `busy:${route}:${n}`;
+      const busyGate = route === 'prompt' ? undefined : f.bridge.armBarrier(`provider:${busyMessage}`);
+      try {
+        if (busyGate) {
+          assert.equal((await rpc.command({ type: 'prompt', message: busyMessage })).success, true);
+          await busyGate.waitEntered();
+          assert.equal(busyGate.released, false);
+          assert.equal((await rpc.command({ type: 'get_state' })).data.isStreaming, true);
+          assert.equal((await rpc.command({ type: route, ...sent })).success, true);
+          await rpc.waitFor(event => event.type === 'queue_update' && JSON.stringify(event).includes(sent.message), { from });
+          assert.equal(busyGate.released, false);
+          busyGate.release();
+        } else assert.equal((await rpc.command({ type: 'prompt', ...sent })).success, true);
+        await restoreGate.waitEntered();
+        assert.equal(restoreGate.released, false);
+        assert.equal((await f.e.requests()).length, requestCount + (busyGate ? 1 : 0));
+        restoreGate.release();
+        await rpc.waitFor('agent_settled', { from });
+      } finally {
+        busyGate?.release();
+        restoreGate.release();
+      }
       const user = await assertRestored(f.e, rpc, sent);
       const queue = rpc.events.slice(from).filter(r => r.event.type === 'queue_update');
       if (route !== 'prompt') {
-        assert.ok(queue.length >= 2);
+        assert.equal(queue.length, 2);
         assert.match(JSON.stringify(queue[0]), /pane-img/);
         assert.doesNotMatch(JSON.stringify(queue.at(-1)), /pane-img/);
       }
@@ -82,7 +98,7 @@ for (const route of ['prompt', 'steer', 'follow_up']) {
       const restored = logs.findLast(r => r.kind === 'restore');
       const req = (await f.e.requests()).at(-1);
       assert.ok(Date.parse(req.timestamp) >= restored.at);
-      observation(t, route, { repetition: n + 1, content: signature(user.content), restoreAt: restored.at, providerAt: Date.parse(req.timestamp), queueUpdates: queue.length });
+      observation(t, route, { repetition: n + 1, content: signature(user.content), restoreAt: restored.at, providerAt: Date.parse(req.timestamp), queueUpdates: queue.length, busyBarrier: Boolean(busyGate), restoreBarrier: true });
     }
   });
 }
@@ -133,6 +149,7 @@ test('图片 5：export_html 的数据与实际用户渲染分支，重复三次
     assert.ok(output.indexOf('<img ') < output.indexOf('段1'));
     assert.ok(output.indexOf(images[2].data) < output.indexOf('段1'));
     await writeFile(join(f.e.root, `render-${n}.html`), output);
+    if (process.env.P0_RECORD === '1' && n === 0) await writeFile(join(here, 'export-order.html'), output);
     observation(t, 'export', { repetition: n + 1, embedded: signature(entry.message.content), rendered: 'I1,I2,I3,T1+T2+T3+tail', firstImageOffset: output.indexOf('<img '), firstTextOffset: output.indexOf('段1'), designPass: false });
   }
 });
@@ -318,7 +335,19 @@ test('pane #9：new/resume/fork/clone/reload 连续替换，每次表单/图片/
       assert.equal(old.status, 409);
       assert.equal((await rpc.command({ type: 'prompt', message: '/b-stale' })).success, true);
       assert.equal((await f.logs()).findLast(r => r.kind === 'stale-result').error, 'bridge 409');
-      assert.equal((await rpc.command({ type: 'prompt', message: '/b-form' })).success, true);
+      const requestId = `form-${repeat}-${type}-${current}`;
+      assert.equal((await rpc.command({ type: 'prompt', message: `/b-form ${requestId}` })).success, true);
+      assert.equal((await rpc.command({ type: 'prompt', message: '/b-drain' })).success, true);
+      const formLogs = await f.logs();
+      const counts = {
+        http: f.bridge.records.filter(r => r.type === 'form' && r.requestId === requestId).length,
+        response: formLogs.filter(r => r.kind === 'form-response' && r.requestId === requestId).length,
+        pong: formLogs.filter(r => r.kind === 'pong' && r.requestId === requestId).length,
+      };
+      observation(t, 'form-counts', { requestId, instance: current, ...counts, starts: formLogs.filter(r => r.kind === 'session-start' && r.instance === current).length });
+      assert.deepEqual(counts, { http: 1, response: 1, pong: 1 });
+      assert.equal(formLogs.filter(r => r.kind === 'listeners-bound' && r.instance === current).length, 1);
+      assert.equal(f.bridge.records.filter(r => r.type === 'bridgeReady' && r.instance === current).length, 1);
       assert.equal((await rpc.command({ type: 'prompt', message: '/b-global-use' })).success, true);
       const sent = encode();
       await rpc.promptAndWait(sent.message, { images: sent.images });
@@ -334,6 +363,9 @@ test('pane #9：new/resume/fork/clone/reload 连续替换，每次表单/图片/
     }
   }
   f.bridge.hooks.onShutdown = undefined;
+  const allLogs = await f.logs();
+  assert.ok(allLogs.some(row => row.kind === 'session-start' && allLogs.filter(other => other.kind === 'session-start' && other.instance === row.instance).length === 2));
+  assert.equal(f.bridge.records.filter(row => row.type === 'bridgeReady').length, 11);
   assert.equal(gated.length, 10);
   assert.ok(gated.every(result => result.error === 'bridge_not_ready'));
   assert.ok((await f.e.requests()).every(r => !r.lastUser.includes('BLOCK_BEFORE_READY')));

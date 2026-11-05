@@ -34,13 +34,34 @@ export default async function(pi) {
   }
   (conn.calls ??= []).push(call);
   const off = [];
-  pi.on('session_start', async (event, ctx) => {
-    await call('bridgeReady', { reason: event.reason, sessionFile: ctx.sessionManager.getSessionFile(), trusted: ctx.isProjectTrusted() });
+  const pendingForms = new Set();
+  let start;
+  function bindListeners() {
+    log({ kind: 'listeners-bound', instance });
     off.push(pi.events.on('pane:ping', data => pi.events.emit('pane:pong', { ...data, instance })));
-    off.push(pi.events.on('pane:form:request', async data => {
-      const result = await call('form', data);
-      pi.events.emit('pane:form:response', { requestId: data.requestId, outcome: result.outcome, instance });
+    off.push(pi.events.on('pane:form:request', data => {
+      const job = (async () => {
+        const result = await call('form', data);
+        pi.events.emit('pane:form:response', { requestId: data.requestId, outcome: result.outcome, instance });
+      })();
+      pendingForms.add(job);
+      void job.finally(() => pendingForms.delete(job)).catch(error => log({ kind: 'form-error', error: error.message }));
     }));
+  }
+  pi.on('session_start', async (event, ctx) => {
+    log({ kind: 'session-start', instance, reason: event.reason });
+    // RPC 替换可能对同一实例发两次 start，绑定和就绪请求只执行一次。
+    if (!start) {
+      bindListeners();
+      start = call('bridgeReady', { reason: event.reason, sessionFile: ctx.sessionManager.getSessionFile(), trusted: ctx.isProjectTrusted() });
+    }
+    await start;
+  });
+  pi.on('before_provider_request', async event => {
+    if (process.env.B_SYNC !== '1') return;
+    const lastUser = event.payload.messages?.findLast(message => message.role === 'user');
+    const text = typeof lastUser?.content === 'string' ? lastUser.content : lastUser?.content?.filter(block => block.type === 'text').map(block => block.text).join('');
+    if (text?.startsWith('busy:')) await call('barrier', { barrierId: `provider:${text}` });
   });
   pi.on('session_before_switch', async event => { await call('lock', { reason: event.reason, target: event.targetSessionFile }); });
   pi.on('session_before_fork', async event => { await call('lock', { reason: 'fork', entryId: event.entryId }); });
@@ -52,12 +73,19 @@ export default async function(pi) {
     const result = restore(event.message);
     if (result.invalid) ctx.ui.notify('图片顺序未还原', 'warning');
     if (result.message) {
-      // 延迟用于检测模型请求是否真的等待替换完成。
-      await new Promise(resolve => setTimeout(resolve, 35));
+      if (process.env.B_SYNC === '1') {
+        const text = event.message.content.filter(block => block.type === 'text').map(block => block.text).join('');
+        const nonce = text.match(/⟦pane-img:([a-z0-9]{6,8}):/)[1];
+        await call('barrier', { barrierId: `restore:${nonce}` });
+      }
       log({ kind: 'restore', instance, timestamp: event.message.timestamp, types: result.message.content.map(b => b.type) });
       return { message: result.message };
     }
   });
+  pi.registerCommand('b-drain', { handler: async () => {
+    await Promise.all([...pendingForms]);
+    log({ kind: 'forms-drained', instance, pending: pendingForms.size });
+  } });
   pi.registerCommand('b-resize', { handler: async args => {
     const hashes = [];
     for (const img of JSON.parse(args)) {

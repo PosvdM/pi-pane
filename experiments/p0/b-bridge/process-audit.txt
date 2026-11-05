@@ -1,9 +1,4 @@
-Recorded PID audit (macOS)
-Sources: cumulative recorded PID snapshot plus run.tap, startup-observation.tap, verification.tap
-Recorded pi/MCP PIDs: 81
-PIDs: 47749, 47757, 47769, 47800, 47804, 47811, 47820, 47822, 47827, 47829, 47834, 47836, 47841, 47843, 47851, 47856, 47950, 47961, 47995, 48002, 49751, 49760, 49777, 49805, 49812, 49831, 49840, 49865, 49867, 49883, 49886, 49892, 49895, 49900, 49929, 49934, 50073, 50083, 50136, 50151, 53037, 53044, 53053, 53061, 53068, 53076, 53081, 53086, 53089, 53094, 53096, 53101, 53107, 53112, 53140, 53142, 53376, 53385, 53409, 53418, 54418, 54419, 54423, 54438, 54478, 54485, 54512, 54519, 54521, 54526, 54528, 54533, 54535, 54537, 54542, 54550, 54567, 54858, 54868, 54954, 54966
-Command: ps -p <recorded PIDs> -o pid=,ppid=,command=
-Live rows returned:
-(no output)
-No recorded pi/MCP process was alive at the audit. The audit did not terminate any process.
-Each fixture also awaited harness.stop(); MCP teardown checked its own recorded PID.
+Run directory: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-b-run-ZNQIOb
+Recorded pi/MCP PIDs: 15846, 15853, 15855, 15860, 15865, 15872, 15879, 15881, 15886, 15888, 15893, 15895, 15900, 15902, 15910, 15912, 15981, 15983, 15997, 16001, 15845
+Alive after test cleanup: []
+No process was terminated by this audit.

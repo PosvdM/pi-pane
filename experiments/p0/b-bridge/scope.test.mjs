@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createExperiment, readJsonl } from '../harness/index.mjs';
+import { createExperiment, readJsonl } from './experiment.mjs';
 import { startBridge } from './server.mjs';
 import { encode, images } from './images.mjs';
 

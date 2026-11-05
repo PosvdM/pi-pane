@@ -14,26 +14,26 @@
 | 验证项 | 结论 | 依据 |
 | --- | --- | --- |
 | pane #1：图片清单全部通过 | 不通过 | 清单 #5 的 HTML 用户消息渲染将全部图片放在全部文字前，3 次一致。真实模型语义、浏览器交互和负载可接受预算也未完整验证。 |
-| pane #9：pane-bridge 通道 | 通过 | 连续 10 次替换后新实例处理图片、表单和锁请求；旧实例返回 409；共享连接仅兑换一次；同进程扩展能读取并使用凭证。stdio input 可承载 JSON 往返。此结论不包含真实写锁互斥或浏览器表单实现。 |
+| pane #9：pane-bridge 通道 | 通过 | 重复 `session_start` 的绑定和就绪请求均幂等；10 次替换后的每个唯一 requestId 恰好对应 1 次 HTTP form、1 个总线回应、1 个 pong。旧实例返回 409；共享连接仅兑换一次；同进程扩展能读取并使用凭证。此结论不包含真实写锁互斥或浏览器表单实现。 |
 | agora #14：launch ticket | 通过 | 删除扩展排首位时后续扩展、MCP、bash 均看不到 ticket；即使 `builtin:mcp` 排在删除扩展前，MCP 进程也在删除后启动。删除前的其他扩展能读到 ticket。 |
 
 重跑命令：
 
 ```sh
-node --test --test-reporter=tap experiments/p0/b-bridge/*.test.mjs
+node experiments/p0/b-bridge/run.mjs
 ```
 
-[run.tap](run.tap) 的末尾为：
+[verification.tap](verification.tap) 是通过 `P0_RECORD=1 node experiments/p0/b-bridge/run.mjs` 显式记录的完整重跑，末尾为：
 
 ```text
-# tests 18
-# pass 15
+# tests 21
+# pass 18
 # fail 0
 # skipped 3
-# duration_ms 39496.896708
+# duration_ms 34049.781292
 ```
 
-测试断言包含已知的不符行为，所以退出码为 0 不表示设计全部通过。补充角色/时间戳、独立 nonce 校验和非 user 消息范围测试后的最终完整重跑见 [verification.tap](verification.tap)：19 项、16 通过、0 失败、3 跳过，耗时 44.3 秒。下文资源数值引用 `run.tap` 的一轮，不是多轮平均值。
+测试断言包含已知的不符行为，所以退出码为 0 不表示设计全部通过。普通运行的 TAP 和进程审计写入每次独立命名的临时目录，只有 `P0_RECORD=1` 才刷新仓库里的 `verification.tap`、`process-audit.txt` 和 `export-order.html`。完整默认运行也得到 21 项、18 通过、3 跳过，且已提交的五个证据文件逐字节未变。`run.tap` 保留为历史图片与资源观测，不能用它未统计重复次数的桥接测试代替当前幂等验收。下文资源数值引用 `run.tap` 的一轮，不是多轮平均值。
 
 ## 图片顺序：pane #1
 
@@ -41,7 +41,7 @@ node --test --test-reporter=tap experiments/p0/b-bridge/*.test.mjs
 
 `images.mjs` 生成红色方块、蓝色圆形、白底黑色字母 C 三张合法 PNG。大小分别为 89、149、98 字节；图片内容不同，测试逐字节比较图片数据，不以图片大小代替身份比较。
 
-服务端原型生成含独立 nonce 的 `⟦pane-img:<nonce>:<k>⟧` 字符串和图片数组。`bridge.ts` 只替换 `role: user` 的消息，并保留角色和时间戳。它在 `message_end` 中刻意等待 35 毫秒后返回替换，以检测 provider 请求是否等待处理器完成。
+服务端原型生成含独立 nonce 的 `⟦pane-img:<nonce>:<k>⟧` 字符串和图片数组。`bridge.ts` 只替换 `role: user` 的消息，并保留角色和时间戳。时序实验在 `message_end` 设置显式还原 barrier：测试确认已进入处理器且尚未释放时，provider 请求数没有增加；由测试释放后，provider 才收到替换后的内容。
 
 普通发送、steer、follow-up 的每次实验同时比较四个位置：RPC `message_end`、`get_entries`、磁盘 JSONL 和 provider 实际收到的用户内容。恢复实验另起 pi 进程。压缩调用真实 pi 的手动和自动压缩路径，摘要回复仍来自假 provider。
 
@@ -52,13 +52,13 @@ node --test --test-reporter=tap experiments/p0/b-bridge/*.test.mjs
 | # | 验证内容与通过标准 | 实测结果与关键日志摘录 | 结论 |
 | --- | --- | --- | --- |
 | 1 | 普通 `prompt`：模型描述正确，文件 content 交错。 | 3 次，provider/RPC/entries/磁盘均为 `T红,I红,T蓝,I蓝,TC,IC,T尾`。`prompt repetition:1 content:["T:红方块[Image #1]","I:89",…,"T:结束"]`。真实模型描述未测。 | 部分通过 |
-| 2 | 运行中 steer：送达消息还原，队列正常出队。 | 3 次，运行中的假请求延迟 500 ms 后继续。每次 2 个 `queue_update`，第一个含标记，最后一个不含标记；provider 和持久化均交错。`steer repetition:1 queueUpdates:2`。真实模型描述未测。 | 部分通过 |
-| 3 | follow-up：送达消息还原，队列正常出队。 | 3 次，`follow_up repetition:1 queueUpdates:2`；顺序和图片字节在四个位置一致。真实模型描述未测。 | 部分通过 |
+| 2 | 运行中 steer：送达消息还原，队列正常出队。 | 3 次，假请求停在显式 provider barrier，确认 `get_state.isStreaming:true`、steer 已入队且 barrier 未释放，再由测试放行。每次 2 个 `queue_update`，第一个含标记，最后一个不含标记；provider 和持久化均交错。`steer repetition:1 queueUpdates:2`。真实模型描述未测。 | 部分通过 |
+| 3 | follow-up：送达消息还原，队列正常出队。 | 3 次，同样由 provider barrier 保持运行中并确认 follow-up 入队，释放后交付。`follow_up repetition:1 queueUpdates:2,busyBarrier:true,restoreBarrier:true`；顺序和图片字节在四个位置一致。真实模型描述未测。 | 部分通过 |
 | 4 | 关闭并恢复后，模型仍能按编号引用历史图片。 | 3 次，停止 pi 后用相同 `--session` 文件和新 ticket 重启，再发文字。provider 上下文中的第一条用户消息与恢复前逐字节一致。`resume repetition:1 preserved:["T:段1[Image #1]","I:89",…]`。模型引用是否正确未测。 | 部分通过 |
 | 5 | `export_html` 按交错顺序显示。 | 3 次，导出内嵌数据保持交错，但执行导出 HTML 自带的用户渲染分支得到 `I1,I2,I3,T1+T2+T3+tail`。第一张图片偏移 74，第一段文字偏移 736。 | 不通过 |
 | 6 | 手动和自动压缩不报错，压缩后可继续。 | 各 3 次，手动 `compact` 返回 success，自动产生带 result 的 `compaction_end`，每次新增 1 条 compaction，随后普通输入完成。完整历史里的图片消息仍可由 `get_entries` 读取。`compact automatic:false requests:4`；`automatic:true requests:5`。 | 通过 |
 | 7 | Claude、GPT Sol、GPT Astra、Gemini 各通过普通发送。 | 测试明确 skip：`需要真模型；本实验只允许假 provider，不发网络请求`。没有把同一假 provider 改名成四个模型。 | macOS 上无法验证 |
-| 8 | `message_end` 处理完成后才开始本轮模型请求，替换只作用于 user。 | prompt、steer、follow-up 各 3 次，等待 35 ms 后返回替换，provider 已收到交错内容。例如 `restoreAt:1793856956832,providerAt:1793856956834`；有同一毫秒的记录，但内容断言仍确认已替换。另测 assistant 两条、真实 read 工具结果一条中的相同标记保持原样：`userReplacements:1,unchangedAssistantMessages:2,unchangedToolResults:1,warnings:0`。 | 通过 |
+| 8 | `message_end` 处理完成后才开始本轮模型请求，替换只作用于 user。 | prompt、steer、follow-up 各 3 次，还原 barrier 未释放时 provider 请求数不增加；释放后 provider 收到交错内容。例如 `restoreAt:1793889116143,providerAt:1793889116146,restoreBarrier:true`；时序结论由 barrier 和内容断言确认，不依赖时间戳间隔。另测 assistant 两条、真实 read 工具结果一条中的相同标记保持原样：`userReplacements:1,unchangedAssistantMessages:2,unchangedToolResults:1,warnings:0`。 | 通过 |
 | 9 | 开启 `images.autoResize` 后顺序和对应关系不变。 | 3 次，小图逐字节不变。2100×24 和 24×2100 两图变为 2000×23 与 23×2000，mime 分别为 PNG、JPEG。独立调用 pi 公开的 `resizeImage()` 得到参考结果，provider 图片按位置的 SHA-256 与参考一致。`referenceHashOrderMatches:true`。 | 通过 |
 | 10 | 纯图片、相邻两图、10 图、相似手写标记的边界。 | 每种 3 次，provider 与持久化内容符合预期。普通手写 `[Image #1]`、格式不匹配的 `⟦pane-img:short:1⟧` 保留为文字。无效数量/nonce/编号消息只产生「图片顺序未还原」警告，不替换。图片语义描述未测。 | 部分通过 |
 | 11 | 无 bridge 还原的备用编码仍能按编号对应。 | 3 次，发送 `[Image #k]` 文字加图片尾数组，provider 收到 `T,I1,I2,I3`，图片字节及编号顺序一致。真实模型按编号理解未测。 | 部分通过 |
@@ -128,7 +128,7 @@ node --test --test-reporter=tap experiments/p0/b-bridge/*.test.mjs
 1. 第一次工厂读取并删除 ticket，以 loopback HTTP 兑换凭证，保存在 `globalThis[Symbol.for('pi-pane.bridge')]`。
 2. 执行两组 new、resume、fork、clone、reload，共 10 次替换。第一组使用 RPC，reload 通过扩展命令；第二组使用扩展命令，clone 对当前 leaf 调用 `ctx.fork(..., { position: 'at' })`。
 3. 工厂总共运行 11 次，实例号从 1 到 11。服务端只看到 1 次兑换。后续工厂的 `ticketVisible` 均为 false。
-4. 每次新实例处理图像还原及 `pane:form:request` → HTTP → `pane:form:response`。答案为 `{ pick: 'B' }`。通过 `pane:ping` 同步取得 `pane:pong`。
+4. 每次新实例处理图像还原及 `pane:form:request` → HTTP → `pane:form:response`。答案为 `{ pick: 'B' }`。每次替换使用一个唯一 requestId，先等待所有已发起的表单处理 Promise 完成，再按该 id 严格断言 HTTP form 请求、总线回应和 pong 各 1 次；独立的常驻观察器保留所有回应，不会在第一条回应后丢弃后续重复。
 5. 从全局连接对象里保存的旧实例 `call()` 闭包实际发请求，均收到 `409 stale_instance`。测试另用旧序号直接发请求，也收到 409。
 6. 8 次 new/resume/fork/clone 的前置锁回报，以及各次 shutdown 的目标路径回报，均经回连成功。reload 没有额外伪造前置锁请求。
 7. shutdown 后、bridgeReady 前的 10 次提交均被原型输入门禁拒绝，provider 从未收到 `BLOCK_BEFORE_READY`。首次启动未 ready 时也拒绝提交。
@@ -138,6 +138,8 @@ node --test --test-reporter=tap experiments/p0/b-bridge/*.test.mjs
 关键日志：
 
 ```json
+{"observation":"form-counts","requestId":"form-0-new_session-2","instance":2,"http":1,"response":1,"pong":1,"starts":2}
+{"observation":"form-counts","requestId":"form-1-reload-11","instance":11,"http":1,"response":1,"pong":1,"starts":1}
 {"observation":"replacement","repeat":1,"type":"reload","instance":11,"staleStatus":409,"formInstance":11,"peerCredentialUse":200}
 {"observation":"bridge-scope","factories":11,"child":{"pane":false,"agora":false},"blockedBeforeReady":10,"locks":8,"launches":1}
 {"observation":"stdio-and-ticket","earlyPeerTicket":true,"replayStatus":403,"requestMethod":"input","response":{"answers":["A","B"]}}
@@ -145,6 +147,20 @@ node --test --test-reporter=tap experiments/p0/b-bridge/*.test.mjs
 ```
 
 结论：通过。
+
+### 重复 start 的原型约束
+
+pi 1.5.0 的 RPC new、resume、fork、clone 路径在 runtime 完成替换时 rebind 一次，RPC 命令分支又 rebind 一次；同一扩展实例可以收到两次 `session_start`。依据是 `dist/core/agent-session-runtime.js:120–123` 和 `dist/modes/rpc/rpc-mode.js:334–340,474–497`。实测第一组四种 RPC 替换均为 `starts:2`，reload 和扩展命令替换为 `starts:1`。
+
+**原型必须对重复 `session_start` 保持幂等**。每实例只安装一套监听，复用同一个就绪 Promise；shutdown 注销这套监听。测试同时断言每实例只绑定一次、只发一次 bridgeReady，而不是通过更换实例号掩盖重复 start。
+
+未加幂等保护的原型在严格计数下得到：
+
+```json
+{"observation":"form-counts","requestId":"form-0-new_session-2","instance":2,"http":2,"response":2,"pong":2,"starts":2}
+```
+
+该反例使 pane #9 判为部分通过。原始失败日志保留在 `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-b-run-bf9gWw/verification.tap`，现场为 `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-axCLKV`。幂等保护后的 10 个 requestId 全部满足严格的 1/1/1，因此当前结论恢复通过；没有放宽请求或回应次数断言。
 
 ### stdio 备选的实测范围
 
@@ -207,7 +223,9 @@ Hint: Start without extensions using "pi -ne".
 
 ### harness 使用情况
 
-没有修改 harness，也没有发现阻碍本组验证的 harness 错误。以下是测量限制：
+没有修改共用 harness。`experiment.mjs` 在 B 组测试进程内给 `RpcDriver.stop()` 加本地防护：已退出的 child 不走发信号路径，并发或重复停止复用同一个 Promise，覆盖启动失败的内部清理以及 `stop()` 后再次 `cleanup()` 的路径。两个独立测试断言已退出时底层停止次数为 0、并发和重复停止时底层停止次数为 1。这个包装只作用于本组进程，不表示共用 harness 的文件已修复。
+
+以下是测量限制：
 
 - 默认关闭 `images.autoResize`；本组对缩放场景显式开启，对 12 MiB 原始字节负载显式保留关闭。
 - 事件和完整历史请求缓存在驱动内存中，多条大图消息使测试驱动 RSS 增长。报告没有将其混同于生产服务端内存。
@@ -218,18 +236,20 @@ Hint: Start without extensions using "pi -ne".
 
 以下目录保留数据，所有其中启动的进程均已停止：
 
-- `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-ddkNFK`：最终 19 项完整重跑的导出不符现场。
+- `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-XpyPBh`：当前 21 项记录运行的导出不符现场。
+- `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-axCLKV`：重复 start 原型的 2/2/2 反例现场。
+- `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-ddkNFK`：历史 19 项重跑的导出不符现场。
 - `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-FdG3ib`：补充断言过程中的前一轮导出不符现场。
 - `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-iuFdTu`：报告所用导出不符现场，含原始导出 HTML、渲染片段、JSONL 和 provider 请求。
 - `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-E7PiLe`：补充覆盖时同一导出不符的前一轮现场。
 - `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-KXvyZQ`：最初启动故障实验的原始失败现场。
 
-普通成功现场已删除。以后重跑也会保留导出不符现场；`B_KEEP=1` 可保留其他成功现场。
+普通成功现场已删除。每次运行的汇总 TAP 和进程审计仍保存在独立临时目录；当前记录运行是 `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-b-run-ZNQIOb`。以后重跑也会保留导出不符现场；`B_KEEP=1` 可保留其他成功现场。
 
 ### 进程结果
 
-测试结束时已调用 harness `stop()` 终止自己启动的 pi 进程组，等待退出后关闭自己启动的 HTTP 服务。正常停止日志的 pi 退出码为 143；故障注入启动退出码为 1。MCP PID 50136、50151 在停止后均不存在：`mcp-cleanup remaining:0`。真实 bash 工具已完成，未启动后台任务。
+测试结束时已调用 harness `stop()` 终止自己启动的 pi 进程组，等待退出后关闭自己启动的 HTTP 服务。正常停止日志的 pi 退出码为 143；故障注入启动退出码为 1。当前记录运行的 MCP PID 15997、16001 在停止后均不存在：`mcp-cleanup remaining:0`。真实 bash 工具已完成，未启动后台任务。
 
-额外对各轮日志累计记录的 81 个 pi/MCP PID 执行存活检查，没有返回存活行，见 [process-audit.txt](process-audit.txt)。没有遗留进程。未使用 `pkill`、`killall` 或按名字终止；未修改全局安装；未推送或创建 PR。
+当前记录运行对 TAP 中的 21 个已记录 pi/MCP PID 做存活检查，结果为 `Alive after test cleanup: []`，见 [process-audit.txt](process-audit.txt)。严格计数反例和默认完整运行各自的临时进程审计也为空；收尾时额外检查本次返工四轮日志中的 47 个已记录 PID，也没有存活行。没有发现遗留进程。未使用 `pkill`、`killall` 或按名字终止；未修改全局安装；未推送或创建 PR。
 
 只更新了本实验目录的说明、结果和证据；`docs/` 仍保持设计草案原文，符合本组边界。
