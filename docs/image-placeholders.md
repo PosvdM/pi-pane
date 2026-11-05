@@ -58,28 +58,50 @@ type DraftNode =
 
 - 每个 `assetId` 都已上传成功且在服务端存在；
 - 类型是 PNG、JPEG、GIF 或 WebP；
-- 单张大小不超过 20 MiB，单条消息不超过 20 张（**上限待定**，P0 按各模型服务的限制调整）；
+- 单张不超过 4 MiB、单条消息不超过 10 张且合计不超过 12 MiB（均指浏览器缩放后的大小，见“上传”；**上限待定**，P0 按各模型服务的限制调整）。pi 把一条用户消息连同 base64 图片写成会话文件的一行，base64 还会把体积放大约三分之一，上限定得低是为了避免出现几十 MiB 的单行 JSONL；
+- 以上检查浏览器先做一次，服务端在发给 pi 之前再做一次，不通过的不发送；
 - 当前模型支持图片输入：RPC `get_state` 返回的模型对象中 `input` 包含 `"image"`（依据：pi `docs/rpc-commands.md` 的 Model object）。不支持时禁止发送并提示切换模型。
 
 ### 草稿保存
 
-每个会话的草稿（节点序列，只含 `assetId`，不含图片数据）保存在浏览器 `localStorage`，刷新页面后恢复。
+- 每个会话的草稿（节点序列，只含 `assetId`，不含图片数据）保存在浏览器 `localStorage`，刷新页面后恢复。
+- 服务端看不到浏览器里的草稿，不按“是否被草稿引用”决定清理，而是按期限清理（见“清理”）。
+- 恢复草稿时，前端用 `POST /api/assets/touch` 提交草稿里的全部 `assetId`：仍存在的延长期限，已删除的在响应中列出。已删除的图片节点显示“图片已过期，请重新添加”，在用户删掉或替换之前不能发送。
 
 ## assetId 与存储
 
-- `assetId = "sha256-" + 图片原始字节的 sha256 十六进制`，内容相同的图片只存一份。
+- `assetId = "sha256-" + 上传的图片字节（浏览器缩放后）的 sha256 十六进制`，内容相同的图片只存一份。
 - 存储位置：
 
   ```text
-  ~/.pi/pane/assets/<hex 前两位>/<hex>.<扩展名>     原图
+  ~/.pi/pane/assets/<hex 前两位>/<hex>.<扩展名>     图片（发给 pi 的就是这份）
   ~/.pi/pane/assets/<hex 前两位>/<hex>.thumb.webp   缩略图（最长边 256 像素）
   ~/.pi/pane/assets/<hex 前两位>/<hex>.json         元数据：mimeType、size、width、height、createdAt
   ```
 
-- 缩略图由浏览器用 canvas 生成后和原图一起上传，服务端不依赖图像处理的原生模块。
-- 上传接口：`POST /api/assets`，请求体为图片原始字节，`Content-Type` 为图片类型，缩略图通过同一请求的 multipart 部分上传（草案）。响应 `{ assetId, width, height }`。
+- 服务端不依赖图像处理的原生模块，缩放和缩略图都在浏览器里用 canvas 完成。
 - 图片发送后，pi 会把图片数据（base64）写进会话文件，历史消息的显示以会话文件为准，不依赖 assets 目录。
-- 清理：没有被任何草稿引用、且创建超过 30 天的资源由服务端定期删除（**期限待定**）。
+
+### 上传
+
+1. 浏览器读取图片。最长边超过 2000 像素或大小超过单张上限时，用 canvas 缩放到最长边 2000 像素并重新编码（2000 与 pi `images.autoResize` 的默认尺寸一致，依据：pi `docs/settings.md`）。PNG、JPEG、WebP 保持原类型；GIF 需要缩放时只保留第一帧，转为 PNG 并提示用户。缩放后仍超过单张上限时拒绝添加。
+2. 浏览器生成最长边 256 像素的 WebP 缩略图。
+3. `POST /api/assets`，`Content-Type: multipart/form-data`，两个部分：`image`（第 1 步得到的字节，带图片类型）和 `thumb`（缩略图）。服务端检查文件头与声明的类型一致、大小不超限，计算 `assetId`，响应 `{ assetId, width, height }`。
+
+### 清理
+
+- 每个资源记录最后使用时间：上传、发送、`touch` 都会更新。
+- 最后使用超过 7 天的资源由服务端定期删除（**期限待定**）。已发送的图片在会话文件里，删除 assets 不影响历史消息。
+- 草稿里引用的资源被删除后，按“草稿保存”中的方式提示。
+
+### 历史消息中的图片
+
+会话文件和插件提供的条目里，图片是内联的 base64。服务端发给浏览器的快照、历史页和 `pane_entries` 事件里不内联图片：
+
+- 服务端把每个 `ImageContent` 解码、计算 sha256，存入 `~/.pi/pane/cache/blobs/`，在发给浏览器的数据里把它替换为 `{ "type": "image", "mimeType": "…", "blob": "sha256-<hex>", "width": …, "height": … }`。
+- 浏览器用 `fetch` 带 `Authorization` 头请求 `GET /api/blobs/sha256-<hex>`，转成 `blob:` URL 显示，并按哈希缓存。
+- `cache/blobs/` 是从会话文件派生的缓存，按总大小（默认 1 GiB）淘汰最久未用的文件，可以随时删除；缺失时服务端从会话文件重新提取。
+- 只有 PNG、JPEG、GIF、WebP 按图片显示，其他类型只显示类型和大小（见 [architecture.md](architecture.md#渲染与资源安全)）。
 
 ## 送给 pi
 
@@ -88,7 +110,7 @@ type DraftNode =
 pi 的消息类型允许用户消息的内容是有序的 `(TextContent | ImageContent)[]`（依据：pi `docs/message-types.md`），但现有提交路径会拆散顺序：
 
 - RPC `prompt`、`steer`、`follow_up` 命令只有 `message`（字符串）和 `images`（数组）两个字段（依据：pi `docs/rpc-commands.md`）。
-- 扩展的 `sendUserMessage()` 把内容数组里的文字合并成一个字符串、图片另放一个数组，再调用 `prompt()`（依据：`dist/core/agent-session.js` 第 1906 行起）。
+- 扩展的 `sendUserMessage()` 把内容数组里的文字合并成一个字符串、图片另放一个数组，再调用 `prompt()`（依据：`dist/core/agent-session.js` 第 1924 行起）。
 
 两条路径最终都得到“所有文字在前、所有图片在后”的用户消息。
 
@@ -117,15 +139,21 @@ pi 的消息类型允许用户消息的内容是有序的 `(TextContent | ImageC
    ]
    ```
 
-   依据：`dist/core/extensions/types.d.ts` 的 `MessageEndEventResult`（“Replace the finalized message. The replacement must keep the original message role.”）；`dist/core/agent-session.js` 中 `message_end` 先交给扩展处理并原地替换消息（`_replaceMessageInPlace`），之后才写入会话文件。
+   依据：`dist/core/extensions/types.d.ts` 的 `MessageEndEventResult`（“Replace the finalized message. The replacement must keep the original message role.”）；`dist/core/agent-session.js` 中 `message_end` 先交给扩展处理并原地替换消息（`_replaceMessageInPlace`，第 944–960 行），之后才写入会话文件（第 760–779 行）。
 
 3. **校验不通过**：不替换，扩展用 `ctx.ui.notify` 发警告，pi-pane 在该消息上标注“图片顺序未还原”。
 
 保留 `[Image #k]` 标签文字，是为了让模型和用户能用同一个编号指代图片。
 
-### 降级
+带标记的文字还有一个用处：pi 在用户消息开始时按完全相同的文字把它从 steer/follow-up 队列里删除（`message_start` 早于 `message_end` 的替换，依据：`dist/core/agent-session.js` 第 738–757 行），每条消息的 `nonce` 不同，所以 pi-pane 能把 `queue_update` 和 `clear_queue` 返回的文字唯一对应到自己发出的草稿（见 [architecture.md](architecture.md#steer-与-follow-up-的送达)）。
 
-pane-bridge 启动时会连回 pi-pane 服务端。服务端没有收到某个会话的 bridge 连接（例如用户配置导致扩展加载失败）时，不发送标记，改为发送“文字中带 `[Image #k]` 标签 + 图片按编号排在末尾”，并在输入框上方提示“图片将附在文字之后”。
+### 没有 pane-bridge 时
+
+pane-bridge 没有就绪（加载失败、回连失败、会话替换后没有重新绑定）时，服务端不向该会话发送任何输入，并在就绪超时后终止该进程：会话写锁也依赖 pane-bridge，此时继续运行不安全，见 [architecture.md](architecture.md#会话替换后的重绑定)。用户只能只读查看或重启该会话，不存在“没有 pane-bridge 但照常发送”的运行状态。
+
+### 备用编码
+
+“文字中带 `[Image #k]` 标签 + 图片按编号排在末尾”（不发送标记，也不需要 pane-bridge 还原）是设计层面的备用方案：只在 P0 证明 `message_end` 替换不可用时，整体改用这种编码，并在输入框上方提示“图片将附在文字之后”。它不是单个会话在缺少 pane-bridge 时的运行时退路。
 
 ### 未采用的方案
 
@@ -156,6 +184,9 @@ pane-bridge 启动时会连回 pi-pane 服务端。服务端没有收到某个�
 | 8 | 时序 | 确认 `message_end` 的扩展处理在本轮模型请求之前完成（模型收到的是替换后的消息） |
 | 9 | 自动缩放 | `images.autoResize` 开启（默认，依据：pi `docs/settings.md`）时顺序和对应关系不变 |
 | 10 | 边界 | 只有图片没有文字；两张图片紧挨；10 张图片；标记被用户手动输入的相似文字干扰 |
-| 11 | 降级 | 去掉 pane-bridge 后按“降级”方式发送，模型仍能按编号对应 |
+| 11 | 备用编码 | 按“备用编码”发送（不经还原），模型仍能按编号对应；用于判断 P0 失败时的备用方案是否可行 |
+| 12 | 合法的最大负载 | 一条消息带 10 张图片、合计刚好不超过 12 MiB（如 3 张接近 4 MiB 加 7 张小图）：发送成功；会话文件能被 pi 和 pi-pane 的只读解析正常读取；单行 JSONL 大小、`get_entries` 的响应时间和服务端内存在可接受范围内（记录数值，据此调整上限） |
+| 13 | 超限必须拒绝 | 单张缩放后仍超过 4 MiB、第 11 张图片、合计超过 12 MiB（如 4 张接近 4 MiB 的图片）三种情况都在浏览器端被拦下并说明原因；绕过浏览器直接调用接口时服务端同样拒绝，不发给 pi |
+| 14 | 停止时取回 | 运行中排队两条带图片的 steer 后点“停止”：两条消息连同图片回到输入框，顺序不变 |
 
 任何一项不通过，先记录 pi 的实际行为，再决定调整编码方式、改用其他路径，或推动上游修改。
