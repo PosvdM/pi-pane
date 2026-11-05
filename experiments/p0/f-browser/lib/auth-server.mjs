@@ -2,8 +2,11 @@
 // - 只监听 127.0.0.1；Host 必须正好是 127.0.0.1:<port>；带 Origin 时必须是规范源；不开放 CORS。
 // - 配对码（80 位随机数，一次性，10 分钟过期，连续输错 5 次作废）换会话凭证。
 // - 会话凭证只在内存，Authorization: Bearer 发送，24 小时无活动失效，可吊销；不发 Set-Cookie。
+//   HTTP 请求、WebSocket 首帧和已鉴权连接上的业务帧都走 useCredential()：同一套空闲过期检查，
+//   有效时记为活动。sweep() 定期吊销空闲过期的凭证并关闭它们的连接。
 // - WebSocket：先 POST /api/ws-ticket 取 30 秒一次性 ticket，首帧 {type:"auth",ticket}，5 秒内无有效首帧即关闭；
-//   首帧之前不推送数据，鉴权后先发 banners。
+//   首帧之前不推送数据，鉴权后先发 banners。连接状态 pending → authed，或进入终态 rejected / closing；
+//   终态下不再分发任何帧、不再发送数据。
 // 单独运行：node lib/auth-server.mjs [port]，终端打印配对地址，按 Enter 生成新配对码。
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -42,13 +45,20 @@ export async function startAuthServer(opts = {}) {
     wsAuthTimeoutMs = 5000,
     maxPairFailures = 5,
     banners = [{ id: 'demo', text: 'prototype banner' }],
+    // 可注入的定时器，测试用可控时钟驱动 5 秒首帧超时。
+    timers = { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (h) => clearTimeout(h) },
+    // 定期清理空闲凭证并关闭其 WebSocket；0 表示不启动（测试里手动调用 sweep）。
+    sweepIntervalMs = 60_000,
   } = opts;
 
   const instanceId = rand(12);
   const codes = new Map(); // code -> { createdAt, failures, state: 'active'|'used'|'burned' }
   const creds = new Map(); // token -> { createdAt, lastUsed }
   const tickets = new Map(); // ticket -> { token, expiresAt }
-  const sockets = new Set(); // { conn, token }
+  // 已建立的 WebSocket：{ conn, entry, token, state }。
+  // state：pending（等首帧）→ authed；首帧无效或超时 → rejected；
+  // 已鉴权的连接被吊销、空闲过期或服务端关闭 → closing。rejected 和 closing 是终态。
+  const sockets = new Set();
   const log = [];
   let actualPort = port;
   let host = '';
@@ -83,28 +93,58 @@ export async function startAuthServer(opts = {}) {
     return null;
   }
 
+  /**
+   * HTTP 和 WebSocket 共用的凭证规则：凭证存在且距上次活动不超过 idleMs 才有效；
+   * 有效时把本次调用记为活动，过期时吊销（并关闭它的 WebSocket）。返回无效原因或 null。
+   */
+  function useCredential(token) {
+    const c = creds.get(token);
+    if (!c) return 'unknown_credential';
+    if (now() - c.lastUsed > idleMs) {
+      revoke(token, 'idle');
+      return 'credential_idle_expired';
+    }
+    c.lastUsed = now();
+    return null;
+  }
+
   function bearer(req) {
     const m = /^Bearer ([A-Za-z0-9_-]+)$/.exec(req.headers.authorization ?? '');
     if (!m) return null;
-    const c = creds.get(m[1]);
-    if (!c) return null;
-    if (now() - c.lastUsed > idleMs) {
-      revoke(m[1], 'idle');
-      return null;
+    return useCredential(m[1]) ? null : m[1];
+  }
+
+  function closeSocket(s, state, code, reason) {
+    if (s.state === 'rejected' || s.state === 'closing') return;
+    s.state = state;
+    s.entry.state = state;
+    s.entry.closeReason = reason;
+    if (s.timer) timers.clearTimeout(s.timer);
+    s.conn.close(code, reason);
+  }
+
+  /** 只在 authed 状态发送；其他状态的发送尝试计入 entry.sendBlocked。 */
+  function sendTo(s, obj) {
+    if (s.state !== 'authed' || !s.conn.send(JSON.stringify(obj))) {
+      s.entry.sendBlocked = (s.entry.sendBlocked ?? 0) + 1;
+      return false;
     }
-    c.lastUsed = now();
-    return m[1];
+    s.entry.sent = (s.entry.sent ?? 0) + 1;
+    return true;
   }
 
   function revoke(token, why) {
     creds.delete(token);
     for (const [t, v] of tickets) if (v.token === token) tickets.delete(t);
-    for (const s of sockets) {
-      if (s.token === token) {
-        s.conn.close(4403, `revoked:${why}`);
-        sockets.delete(s);
-      }
-    }
+    for (const s of sockets) if (s.token === token) closeSocket(s, 'closing', 4403, `revoked:${why}`);
+  }
+
+  /** 清理已空闲过期的凭证，关闭它们的 WebSocket。只检查，不记为活动。 */
+  function sweep() {
+    const expired = [];
+    for (const [token, c] of creds) if (now() - c.lastUsed > idleMs) expired.push(token);
+    for (const token of expired) revoke(token, 'idle');
+    return expired.length;
   }
 
   function send(res, status, body, extra = {}) {
@@ -229,35 +269,33 @@ export async function startAuthServer(opts = {}) {
     }
     entry.status = 101;
     const conn = acceptUpgrade(req, socket, head);
-    let authed = false;
-    const timer = setTimeout(() => {
+    const s = { conn, entry, token: null, state: 'pending', timer: null };
+    entry.state = 'pending';
+    entry.dropped = 0;
+    sockets.add(s);
+    s.timer = timers.setTimeout(() => {
+      s.timer = null;
+      if (s.state !== 'pending') return;
       entry.auth = 'timeout';
-      conn.close(4401, 'auth timeout');
+      closeSocket(s, 'rejected', 4401, 'auth timeout');
     }, wsAuthTimeoutMs);
     conn.on('close', () => {
-      clearTimeout(timer);
-      for (const s of sockets) if (s.conn === conn) sockets.delete(s);
+      if (s.timer) timers.clearTimeout(s.timer);
+      sockets.delete(s);
+      entry.droppedAfterClose = conn.droppedAfterClose;
     });
     conn.on('message', (text) => {
-      if (!authed) {
-        clearTimeout(timer);
-        let msg;
-        try {
-          msg = JSON.parse(text);
-        } catch {
-          msg = null;
-        }
-        const t = msg?.type === 'auth' && typeof msg.ticket === 'string' ? tickets.get(msg.ticket) : null;
-        if (t) tickets.delete(msg.ticket); // 一次性：查到就作废，无论是否过期
-        if (!t || t.expiresAt < now() || !creds.has(t.token)) {
-          entry.auth = !msg || msg.type !== 'auth' ? 'bad_first_frame' : !t ? 'unknown_ticket' : 'expired_ticket';
-          return conn.close(4401, entry.auth);
-        }
-        authed = true;
-        entry.auth = 'ok';
-        sockets.add({ conn, token: t.token });
-        conn.send(JSON.stringify({ type: 'banners', banners }));
+      if (s.state === 'pending') return onFirstFrame(s, text);
+      if (s.state !== 'authed') {
+        // rejected / closing 是终态：不分发任何帧。
+        entry.dropped += 1;
         return;
+      }
+      // 已鉴权连接上的每个业务帧都按 HTTP 的同一规则检查并更新凭证活动时间。
+      const why = useCredential(s.token);
+      if (why) {
+        entry.dropped += 1;
+        return closeSocket(s, 'closing', 4401, why);
       }
       let msg;
       try {
@@ -265,8 +303,36 @@ export async function startAuthServer(opts = {}) {
       } catch {
         return;
       }
-      if (msg.type === 'ping') conn.send(JSON.stringify({ type: 'pong', n: msg.n }));
+      if (msg.type === 'ping') sendTo(s, { type: 'pong', n: msg.n });
     });
+  }
+
+  function onFirstFrame(s, text) {
+    if (s.timer) timers.clearTimeout(s.timer);
+    s.timer = null;
+    let msg;
+    try {
+      msg = JSON.parse(text);
+    } catch {
+      msg = null;
+    }
+    const isAuth = msg?.type === 'auth' && typeof msg.ticket === 'string';
+    const t = isAuth ? tickets.get(msg.ticket) : null;
+    if (t) tickets.delete(msg.ticket); // 一次性：查到就作废，无论是否有效
+    let why = null;
+    if (!isAuth) why = 'bad_first_frame';
+    else if (!t) why = 'unknown_ticket';
+    else if (t.expiresAt < now()) why = 'expired_ticket';
+    else why = useCredential(t.token); // 与 HTTP 相同：空闲过期即拒绝，有效则记为活动
+    if (why) {
+      s.entry.auth = why;
+      return closeSocket(s, 'rejected', 4401, why);
+    }
+    s.state = 'authed';
+    s.entry.state = 'authed';
+    s.entry.auth = 'ok';
+    s.token = t.token;
+    sendTo(s, { type: 'banners', banners });
   }
 
   const server = http.createServer((req, res) => {
@@ -282,6 +348,8 @@ export async function startAuthServer(opts = {}) {
     server.listen(port, '127.0.0.1', resolve);
   });
   actualPort = server.address().port;
+  const sweeper = sweepIntervalMs > 0 ? setInterval(sweep, sweepIntervalMs) : null;
+  sweeper?.unref();
   host = `127.0.0.1:${actualPort}`;
   origin = `http://${host}`;
 
@@ -295,9 +363,12 @@ export async function startAuthServer(opts = {}) {
     codeState: (code) => ({ ...codes.get(code) }),
     credentialCount: () => creds.size,
     socketCount: () => sockets.size,
+    socketStates: () => [...sockets].map((x) => x.state),
     revoke,
+    sweep,
     async close() {
-      for (const s of sockets) s.conn.close(1001, 'server shutdown');
+      if (sweeper) clearInterval(sweeper);
+      for (const s of sockets) closeSocket(s, 'closing', 1001, 'server shutdown');
       server.closeAllConnections?.();
       await new Promise((r) => server.close(() => r()));
     },

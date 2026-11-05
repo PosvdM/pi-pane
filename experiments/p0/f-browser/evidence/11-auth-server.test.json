@@ -1,0 +1,231 @@
+{
+  "file": "11-auth-server.test",
+  "node": "v26.12.0",
+  "platform": "darwin",
+  "notes": [
+    {
+      "test": "Host 必须正好是 127.0.0.1:<port>",
+      "label": "host-matrix",
+      "value": {
+        "127.0.0.1:62203 /api/instance": 200,
+        "127.0.0.1:62203 /": 200,
+        "localhost:62203 /api/instance": 403,
+        "localhost:62203 /": 403,
+        "LOCALHOST:62203 /api/instance": 403,
+        "LOCALHOST:62203 /": 403,
+        "localhost.:62203 /api/instance": 403,
+        "localhost.:62203 /": 403,
+        "127.0.0.1 /api/instance": 403,
+        "127.0.0.1 /": 403,
+        "127.0.0.1:62204 /api/instance": 403,
+        "127.0.0.1:62204 /": 403,
+        "evil.test:62203 /api/instance": 403,
+        "evil.test:62203 /": 403,
+        "[::1]:62203 /api/instance": 403,
+        "[::1]:62203 /": 403,
+        "127.1:62203 /api/instance": 403,
+        "127.1:62203 /": 403,
+        "2130706433:62203 /api/instance": 403,
+        "2130706433:62203 /": 403,
+        "(empty) /api/instance": 403
+      }
+    },
+    {
+      "test": "带 Origin 时必须是规范源；不开放 CORS",
+      "label": "origin-matrix",
+      "value": {
+        "http://127.0.0.1:62225": 200,
+        "http://127.0.0.1:62226": 403,
+        "http://localhost:62225": 403,
+        "https://127.0.0.1:62225": 403,
+        "null": 403,
+        "http://127.0.0.1:62225/": 403,
+        "OPTIONS cross-origin": 403
+      }
+    },
+    {
+      "test": "所有响应带安全头，且没有 Set-Cookie",
+      "label": "headers-checked",
+      "value": [
+        "GET / -> 200",
+        "GET /app.js -> 200",
+        "GET /api/instance -> 200",
+        "GET /api/whoami -> 401",
+        "GET /api/whoami -> 200",
+        "GET /api/whoami -> 403",
+        "POST /api/auth/pair -> 401",
+        "POST /api/ws-ticket -> 200",
+        "GET /nope -> 404"
+      ]
+    },
+    {
+      "test": "配对码：一次性、10 分钟过期、连续输错 5 次作废；跨源的错误尝试不计数",
+      "label": "code-format",
+      "value": "20 hex chars = 80 bits"
+    },
+    {
+      "test": "服务端重启：新 instanceId，旧凭证 401 且响应说明 instanceId 已变",
+      "label": "restart",
+      "value": {
+        "old": "Qz_GQx771I9bF4AF",
+        "new": "Jwyq-3sL-n_kF7f6",
+        "status": 401,
+        "body": {
+          "error": "unauthorized",
+          "instanceId": "Jwyq-3sL-n_kF7f6"
+        }
+      }
+    },
+    {
+      "test": "WebSocket 握手校验 Host 和 Origin",
+      "label": "ws-handshake",
+      "value": {
+        "canonical": 101,
+        "no-origin": 101,
+        "other-port-origin": 403,
+        "localhost-host": 403,
+        "localhost-host-canonical-origin": 403,
+        "null-origin": 403
+      }
+    },
+    {
+      "test": "WebSocket 首帧 ticket：一次性、30 秒有效、首帧前不推送、鉴权后先发 banners",
+      "label": "ws-ok-first-message",
+      "value": "{\"type\":\"banners\",\"banners\":[{\"id\":\"demo\",\"text\":\"prototype banner\"}]}"
+    },
+    {
+      "test": "WebSocket 首帧 ticket：一次性、30 秒有效、首帧前不推送、鉴权后先发 banners",
+      "label": "ws-close-codes",
+      "value": {
+        "reuse": {
+          "code": 4401,
+          "reason": "unknown_ticket",
+          "at": 1793888818012
+        },
+        "notAuth": {
+          "code": 4401,
+          "reason": "bad_first_frame",
+          "at": 1793888818013
+        },
+        "expired": {
+          "code": 4401,
+          "reason": "expired_ticket",
+          "at": 1793888818015
+        },
+        "revoked": {
+          "code": 4403,
+          "reason": "revoked:logout",
+          "at": 1793888818015
+        }
+      }
+    },
+    {
+      "test": "WebSocket 拒绝是终态：非法首帧后紧跟合法 auth 和 ping，始终收不到 banners 和 pong",
+      "label": "ws-reject-terminal",
+      "value": {
+        "same-write": {
+          "close": {
+            "code": 4401,
+            "reason": "bad_first_frame"
+          },
+          "received": 0,
+          "clientDroppedAfterClose": 0,
+          "serverState": "rejected",
+          "auth": "bad_first_frame",
+          "ignoredFrames": 2,
+          "ignoredByAuthLayer": 0,
+          "ignoredByConnectionLayer": 2,
+          "sendBlocked": 0,
+          "ticketStillUsable": true
+        },
+        "separate-writes": {
+          "close": {
+            "code": 4401,
+            "reason": "bad_first_frame"
+          },
+          "received": 0,
+          "clientDroppedAfterClose": 0,
+          "serverState": "rejected",
+          "auth": "bad_first_frame",
+          "ignoredFrames": 2,
+          "ignoredByAuthLayer": 0,
+          "ignoredByConnectionLayer": 2,
+          "sendBlocked": 0,
+          "ticketStillUsable": true
+        }
+      }
+    },
+    {
+      "test": "空闲过期：ticket 尚未过期，但凭证已空闲过期时首帧被拒",
+      "label": "idle-ticket-valid-credential-expired",
+      "value": {
+        "close": {
+          "code": 4401,
+          "reason": "credential_idle_expired"
+        },
+        "received": 0,
+        "httpAfter": 401
+      }
+    },
+    {
+      "test": "空闲过期：连接建立后，业务帧计为活动；空闲过期后业务帧被拒并关闭连接",
+      "label": "idle-after-connect",
+      "value": {
+        "httpAfterWsActivity": 200,
+        "pongs": [
+          1,
+          2
+        ],
+        "close": {
+          "code": 4403,
+          "reason": "revoked:idle"
+        },
+        "pongsAfter": [
+          1,
+          2
+        ],
+        "httpAfterExpiry": 401
+      }
+    },
+    {
+      "test": "空闲过期：没有任何帧时，定期清理吊销凭证并关闭连接",
+      "label": "idle-sweep",
+      "value": {
+        "swept": 1,
+        "close": {
+          "code": 4403,
+          "reason": "revoked:idle"
+        },
+        "http": 401
+      }
+    },
+    {
+      "test": "WebSocket 5 秒首帧超时（可控时钟）",
+      "label": "ws-timeout-virtual",
+      "value": {
+        "at4999": [
+          "pending"
+        ],
+        "at5000": [
+          "rejected"
+        ],
+        "close": {
+          "code": 4401,
+          "reason": "auth timeout"
+        },
+        "received": 0
+      }
+    },
+    {
+      "test": "WebSocket 5 秒首帧超时（真实墙钟，只记录时延）",
+      "label": "ws-timeout-wallclock",
+      "value": {
+        "code": 4401,
+        "reason": "auth timeout",
+        "ms": 5001,
+        "configuredMs": 5000,
+        "lateByMs": 1
+      }
+    }
+  ]
+}

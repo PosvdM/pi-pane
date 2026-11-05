@@ -1,0 +1,260 @@
+{
+  "file": "11-auth-browser.test",
+  "node": "v26.12.0",
+  "platform": "darwin",
+  "notes": [
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "browser",
+      "value": "本机 Google Chrome（playwright-core channel=chrome，headless）"
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "A-after-pair",
+      "value": {
+        "href": "http://127.0.0.1:62161/",
+        "hash": "",
+        "cookie": "",
+        "events": [
+          "paired"
+        ]
+      }
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "A-ws",
+      "value": {
+        "ok": true,
+        "first": {
+          "type": "banners",
+          "banners": [
+            {
+              "id": "demo",
+              "text": "prototype banner"
+            }
+          ]
+        },
+        "close": null
+      }
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "B-events",
+      "value": [
+        "bc-asked",
+        "bc-recv:credential/1446701927-1926047276",
+        "got-from-tab"
+      ]
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "evil-page-observed",
+      "value": {
+        "corsGetInstance": {
+          "ok": false,
+          "error": "TypeError: Failed to fetch"
+        },
+        "noCorsGetInstance": {
+          "ok": true,
+          "value": {
+            "type": "opaque",
+            "status": 0
+          }
+        },
+        "simplePostPair": {
+          "ok": true,
+          "value": {
+            "type": "opaque",
+            "status": 0
+          }
+        },
+        "preflightTicket": {
+          "ok": false,
+          "error": "TypeError: Failed to fetch"
+        },
+        "websocket": {
+          "constructed": true,
+          "opened": false,
+          "messages": [],
+          "closeCode": 1006
+        },
+        "broadcastChannel": {
+          "supported": true,
+          "received": [],
+          "windowMs": 1000
+        },
+        "openerAccess": {
+          "ok": false,
+          "error": "SecurityError: Failed to read a named property 'sessionStorage' from 'Window': Blocked a frame with origin \"http://127.0.0.1:62162\" from accessing a cross-origin frame."
+        },
+        "ownStorage": {
+          "sessionStorage": 0,
+          "cookie": ""
+        }
+      }
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "evil-server-log",
+      "value": [
+        {
+          "kind": "http",
+          "method": "GET",
+          "path": "/api/instance",
+          "origin": "http://127.0.0.1:62162",
+          "secFetchSite": "same-site",
+          "status": 403,
+          "reason": "bad_origin"
+        },
+        {
+          "kind": "http",
+          "method": "GET",
+          "path": "/api/instance",
+          "secFetchSite": "same-site",
+          "status": 200,
+          "reason": "ok"
+        },
+        {
+          "kind": "http",
+          "method": "POST",
+          "path": "/api/auth/pair",
+          "origin": "http://127.0.0.1:62162",
+          "secFetchSite": "same-site",
+          "status": 403,
+          "reason": "bad_origin"
+        },
+        {
+          "kind": "http",
+          "method": "OPTIONS",
+          "path": "/api/ws-ticket",
+          "origin": "http://127.0.0.1:62162",
+          "secFetchSite": "same-site",
+          "status": 403,
+          "reason": "bad_origin"
+        },
+        {
+          "kind": "ws",
+          "path": "/ws",
+          "origin": "http://127.0.0.1:62162",
+          "status": 403,
+          "reason": "bad_origin"
+        },
+        {
+          "kind": "http",
+          "method": "GET",
+          "path": "/",
+          "secFetchSite": "same-site",
+          "status": 200
+        },
+        {
+          "kind": "http",
+          "method": "GET",
+          "path": "/app.js",
+          "origin": "http://127.0.0.1:62161",
+          "secFetchSite": "same-origin",
+          "status": 200
+        },
+        {
+          "kind": "http",
+          "method": "GET",
+          "path": "/device-key.js",
+          "origin": "http://127.0.0.1:62161",
+          "secFetchSite": "same-origin",
+          "status": 200
+        },
+        {
+          "kind": "http",
+          "method": "GET",
+          "path": "/jcs.js",
+          "origin": "http://127.0.0.1:62161",
+          "secFetchSite": "same-origin",
+          "status": 200
+        },
+        {
+          "kind": "http",
+          "method": "GET",
+          "path": "/jcs-vectors.js",
+          "origin": "http://127.0.0.1:62161",
+          "secFetchSite": "same-origin",
+          "status": 200
+        }
+      ]
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "A-events-during-attack",
+      "value": [
+        "bc-recv:request/control-1793888815813",
+        "bc-answered"
+      ]
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "cross-port-cookie",
+      "value": {
+        "setOnOtherPort": "p0_other_port=1",
+        "sentToPane": [
+          "p0_other_port=1"
+        ],
+        "paneDocumentCookie": "p0_other_port=1",
+        "whoami": 200
+      }
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "host-check",
+      "value": {
+        "localhost": 403,
+        "rebind.test": 403
+      }
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "host-check-server-log",
+      "value": [
+        "localhost:62161",
+        "rebind.test:62161",
+        "localhost:62161"
+      ]
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "logout",
+      "value": {
+        "logoutStatus": 200,
+        "B": {
+          "hasCredential": false,
+          "wsClose": {
+            "code": 4403,
+            "reason": "revoked:logout"
+          },
+          "events": [
+            "bc-asked",
+            "bc-recv:credential/1446701927-1926047276",
+            "got-from-tab",
+            "bc-recv:credential/control-1793888815813",
+            "bc-recv:logout/-",
+            "cleared:bc-logout"
+          ]
+        }
+      }
+    },
+    {
+      "test": "pane #11 鉴权（浏览器） > chrome",
+      "label": "restart",
+      "value": {
+        "phaseC": "need-pair",
+        "eventsC": [
+          "bc-asked"
+        ],
+        "aWhoami": 401,
+        "aPhase": "need-pair",
+        "aEvents": [
+          "bc-recv:request/534866028-2519640445",
+          "bc-ignored",
+          "cleared:401-instance-changed"
+        ]
+      }
+    }
+  ]
+}

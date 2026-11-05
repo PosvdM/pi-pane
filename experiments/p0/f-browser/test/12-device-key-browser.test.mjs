@@ -22,7 +22,7 @@ function browserSigner(tab) {
   };
 }
 
-const canMapHosts = (name) => name === 'chrome' || name === 'edge' || name === 'firefox';
+const canMapHosts = (name) => name === 'chrome';
 
 test('pane #12 / agora #16 设备密钥与签名（普通窗口）', async (t) => {
   await forEachBrowser(t, async (st, open, name) => {

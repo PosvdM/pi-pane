@@ -1,15 +1,17 @@
 // pane P0 #14：Vite + Preact 骨架加 Markdown 渲染（markdown-it）、代码高亮（highlight.js）和 CSP 后的 gzip 体积。
 // 构建三个高亮语言集合的变体；主方案为 common。构建产物在 CSP 头下用浏览器加载，确认没有 CSP 违规。
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 import { cspFor } from '../lib/auth-server.mjs';
 import { probe, launch } from '../lib/browsers.mjs';
+import { SELECTED } from './browser-common.mjs';
 import { note } from './helpers.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -17,6 +19,9 @@ const BUNDLE = path.join(ROOT, 'bundle');
 const VITE = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
 const BUDGET = 300 * 1024;
 const VARIANTS = ['common', 'min', 'full'];
+// 每次运行构建到独立的临时目录，结束后删除。
+const OUT = mkdtempSync(path.join(tmpdir(), 'p0-f-bundle-'));
+after(() => rmSync(OUT, { recursive: true, force: true }));
 
 function listFiles(dir) {
   const out = [];
@@ -50,12 +55,12 @@ test('pane #14 前端打包体积', { timeout: 300_000, skip: !existsSync(VITE) 
   for (const v of VARIANTS) {
     const r = spawnSync(process.execPath, [VITE, 'build', '--config', path.join(BUNDLE, 'vite.config.js')], {
       cwd: ROOT,
-      env: { ...process.env, P0_HLJS: v },
+      env: { ...process.env, P0_HLJS: v, P0_OUTDIR: path.join(OUT, `dist-${v}`) },
       encoding: 'utf8',
       timeout: 120_000,
     });
     assert.equal(r.status, 0, r.stderr || r.stdout);
-    const dist = path.join(BUNDLE, `dist-${v}`);
+    const dist = path.join(OUT, `dist-${v}`);
     const m = measure(dist);
     results[v] = m;
     note(t, `size-${v}`, {
@@ -64,10 +69,10 @@ test('pane #14 前端打包体积', { timeout: 300_000, skip: !existsSync(VITE) 
     });
   }
   // CSP 前提：没有内联脚本；产物里没有 eval / new Function
-  const html = readFileSync(path.join(BUNDLE, 'dist-common', 'index.html'), 'utf8');
+  const html = readFileSync(path.join(OUT, 'dist-common', 'index.html'), 'utf8');
   const inline = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)].filter(([, attrs, body]) => !/\bsrc=/.test(attrs) || body.trim());
   assert.equal(inline.length, 0, 'no inline script');
-  const js = listFiles(path.join(BUNDLE, 'dist-common')).filter((f) => f.endsWith('.js')).map((f) => readFileSync(f, 'utf8')).join('\n');
+  const js = listFiles(path.join(OUT, 'dist-common')).filter((f) => f.endsWith('.js')).map((f) => readFileSync(f, 'utf8')).join('\n');
   const evalHits = { eval: (js.match(/\beval\s*\(/g) ?? []).length, newFunction: (js.match(/new Function\s*\(/g) ?? []).length };
   note(t, 'eval-scan', evalHits);
   note(t, 'budget', { common: `${kib(results.common.total.gzip6)} / ${kib(BUDGET)}`, min: kib(results.min.total.gzip6), full: kib(results.full.total.gzip6) });
@@ -95,9 +100,9 @@ function serveDist(dist) {
   });
 }
 
-test('pane #14 构建产物在 CSP 下运行（Chrome、WebKit）', { timeout: 180_000 }, async (t) => {
-  const dist = path.join(BUNDLE, 'dist-common');
-  for (const name of ['chrome', 'webkit']) {
+test('pane #14 构建产物在 CSP 下运行', { timeout: 180_000 }, async (t) => {
+  const dist = path.join(OUT, 'dist-common');
+  for (const name of SELECTED) {
     await t.test(name, { timeout: 60_000 }, async (st) => {
       if (!existsSync(path.join(dist, 'index.html'))) return st.skip('先运行体积测试生成 dist-common');
       const p = await probe(name);

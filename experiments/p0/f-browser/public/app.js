@@ -6,7 +6,8 @@ import { runJcsVectors, trickyPayload } from './jcs-vectors.js';
 
 const STORAGE_KEY = 'pi-pane.auth';
 const CHANNEL = 'pi-pane-auth';
-const ASK_TIMEOUT_MS = 500;
+// 没有其他已登录标签页时，等待这么久后显示配对页；有回应时立即结束。
+const ASK_TIMEOUT_MS = 1500;
 
 const state = { phase: 'booting', events: [], ws: null, wsMessages: [], wsClose: null };
 const channel = 'BroadcastChannel' in globalThis ? new BroadcastChannel(CHANNEL) : null;
@@ -176,6 +177,23 @@ window.__f = {
     cookie: document.cookie,
   }),
   token: () => load()?.token ?? null,
+  // 正向对照：用指定 nonce 在频道里索要凭证，返回是否收到同源标签页的回应。
+  probeChannel: async (nonce) => {
+    if (!channel) return false;
+    const inst = load()?.instanceId ?? state.instanceId;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 10_000);
+      const onMsg = (e) => {
+        if (e.data?.type === 'credential' && e.data.nonce === nonce) {
+          clearTimeout(timer);
+          channel.removeEventListener('message', onMsg);
+          resolve(true);
+        }
+      };
+      channel.addEventListener('message', onMsg);
+      channel.postMessage({ type: 'request', nonce, instanceId: inst });
+    });
+  },
   whoami: () => api('/api/whoami'),
   connectWs,
   logout,
