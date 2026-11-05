@@ -1,0 +1,18 @@
+{
+  "name": "p0-f-browser",
+  "private": true,
+  "type": "module",
+  "description": "P0 F 组：浏览器鉴权、设备密钥签名、前端打包体积的实验",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "browsers": "node scripts/install-browsers.mjs"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "2.10.6",
+    "highlight.js": "11.12.0",
+    "markdown-it": "15.0.3",
+    "playwright-core": "1.64.1",
+    "preact": "11.1.1",
+    "vite": "8.3.5"
+  }
+}

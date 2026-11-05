@@ -1,0 +1,23 @@
+@import 'highlight.js/styles/github.css';
+
+body {
+  font-family: system-ui, sans-serif;
+  margin: 0;
+}
+main {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 16px;
+}
+.msg pre.hljs {
+  padding: 8px;
+  overflow-x: auto;
+}
+form {
+  display: flex;
+  gap: 8px;
+}
+textarea {
+  flex: 1;
+  min-height: 60px;
+}
