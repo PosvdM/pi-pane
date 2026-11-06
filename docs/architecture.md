@@ -76,7 +76,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 - 始终带 `--session <路径>`，不让 pi 自己选文件名：pi-pane 必须在 pi 打开会话文件之前持有它的写锁（见“会话写锁”）。
 - **新建会话**：按 hostkit.md“会话写锁”的情况 ②，pi-pane 在会话目录下预先分配一个新文件路径，取得该路径的写锁后以 `--session <该路径>` 拉起；文件不存在时 pi 新建会话并沿用这个路径。不用 `--session-id` 或不带 `--session` 让 pi 自己生成路径。
-- **Fork 为新会话**（从只读视图）：P0 实测发现 pi 的 `SessionManager.forkFrom()` 会在源文件无尾换行或尾部截断时修改源文件（末尾追加换行，并将截断行永久留在文件中间），违背对源文件的只读承诺。因此只读查看要 fork 时，pi-pane 先将源文件复制到临时目录，再在进程内对临时副本调用 `SessionManager.forkFrom(副本, cwd, sessionDir)` 生成新文件；然后取得新文件的写锁，再以 `--session <新文件>` 拉起，并删除临时副本。这是 hostkit.md“会话写锁”的情况 ⑤（先写后锁），取锁失败时不拉起并告诉用户。不用 `--fork` 参数。
+- **Fork 为新会话**（从只读视图）：P0 实测发现 pi 的 `SessionManager.forkFrom()` 会在源文件无尾换行或尾部截断时修改源文件（末尾追加换行，并将截断行永久留在文件中间），违背对源文件的只读承诺。因此只读查看要 fork 时，pi-pane 先将源文件复制到临时目录，再在进程内对临时副本调用 `SessionManager.forkFrom(副本, cwd, sessionDir)` 生成新文件。`forkFrom()` 把传入的路径写进新文件会话头的 `parentSession`，会话列表读取这个字段（依据：`dist/core/session-manager.js` 的 `forkFrom()` 与会话列表读取）；所以在取得新文件的写锁并拉起 pi 之前，将新文件会话头的 `parentSession` 修正为规范化后的原始源文件路径；只修改新生成的文件，原始源文件保持只读。随后取得新文件的写锁，以 `--session <新文件>` 拉起，并清理临时副本。这是 hostkit.md“会话写锁”的情况 ⑤（先写后锁），取锁失败时不拉起并告诉用户。不用 `--fork` 参数。P1 增加测试，验证源文件字节不变，且新会话的父路径指向真实源文件。
 
 - **不加 `-ne`**：主会话加载用户自己配置的 pi 扩展、技能、MCP，和在终端里运行 pi 一样。pi-agora 的扩展也是这样进入主会话的。
 - **不加 `--approve`**：项目资源是否加载按用户的信任决定，见“项目信任”。
@@ -98,6 +98,8 @@ node <pi>/dist/bundle/cli.js --mode rpc
 打开没有托管的会话时不拉起进程：
 
 - 服务端自己只读解析会话 JSONL，旧版本格式（v1、v2）在内存里迁移到 v3，不改写文件。不能用 `SessionManager.open()`：它在文件为空或需要迁移时会调用 `_rewriteFile()` 改写文件（依据：`dist/core/session-manager.js` 第 666–727 行）。
+- v2/v3 条目 id 来自文件，具有稳定性；v1 在解析/迁移时派生的 id 不可作为跨进程或迁移前后的持久键（见 [plugin-api.md](plugin-api.md#三种投影)）。
+- 末尾未完成的截断行，以及 pi 补换行后留在文件中间的不完整行，跳过并记录诊断，不因此判为文件损坏。在线与离线的叶子计算采用统一规则；P0 的一致性结论限于文件重新打开语义，不保证运行中导航后尚未追加条目时两者叶子相同。
 - 只读视图监视文件的修改时间，变化时发 `resync` 重新解析。
 - 用户第一次在只读视图里发送消息时，服务端按“会话写锁”的规则拉起进程，之后转为托管会话。
 
@@ -112,7 +114,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 | --- | --- | --- |
 | 打开已有会话 | ① | 拉起 pi 之前取得写锁 |
 | 新建会话 | ② | 预先分配路径、取得写锁后以 `--session <路径>` 拉起（见“拉起”） |
-| 从只读视图 Fork | ⑤ | 在 pi-pane 进程里用 `forkFrom()` 创建新文件后取得写锁，再拉起（见“拉起”） |
+| 从只读视图 Fork | ⑤ | 在 pi-pane 进程里对临时副本调用 `forkFrom()` 创建新文件、修正新文件的 `parentSession` 后取得写锁，再拉起（见“拉起”） |
 | 进程内切换到已有会话 | ③ | 见“会话切换” |
 | 进程内 new、fork、clone | ④ | 见“会话切换” |
 | 关闭、回收 | — | 确认 pi 进程树已退出后释放 |
@@ -151,7 +153,7 @@ RPC 模式不显示 pi 内置的信任提示。启动阶段交给 `project_trust
 pi 决定信任的顺序（依据：`dist/core/project-trust.js` 的 `resolveProjectTrusted`、`dist/core/extensions/runner.js` 第 109–136 行的 `emitProjectTrustEvent`）：
 
 1. 命令行 `--approve`/`--no-approve`；
-2. 目录里没有需要信任的项目资源时直接通过；
+2. 目录里没有需要信任的项目资源时，返回 `ProjectTrustStore.get(cwd) ?? true`：已有保存决定时使用该决定（包括父目录继承的决定），否则视为信任；此分支不调用 `project_trust` 处理器；
 3. 按扩展加载顺序调用 `project_trust` 处理器，第一个返回 `"yes"` 或 `"no"` 的生效，`"undecided"` 交给下一个；
 4. `trust.json` 里保存的决定；
 5. `defaultProjectTrust`：`"always"` 加载，`"never"` 不加载，`"ask"` 在 RPC 下因为没有 UI 而不加载。
