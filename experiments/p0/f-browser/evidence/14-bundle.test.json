@@ -1,0 +1,89 @@
+{
+  "file": "14-bundle.test",
+  "node": "v26.12.0",
+  "platform": "darwin",
+  "notes": [
+    {
+      "test": "pane #14 前端打包体积",
+      "label": "size-common",
+      "value": {
+        "total": {
+          "raw": "264.5 KiB",
+          "gzip6": "97.9 KiB",
+          "gzip9": "97.8 KiB",
+          "brotli": "78.1 KiB"
+        },
+        "files": [
+          "assets/index-DaQG2L4J.css: raw 1.2 KiB, gzip 0.5 KiB",
+          "assets/index-Rd9oKpB_.js: raw 262.8 KiB, gzip 97.1 KiB",
+          "index.html: raw 0.4 KiB, gzip 0.3 KiB"
+        ]
+      }
+    },
+    {
+      "test": "pane #14 前端打包体积",
+      "label": "size-min",
+      "value": {
+        "total": {
+          "raw": "176.0 KiB",
+          "gzip6": "67.4 KiB",
+          "gzip9": "67.3 KiB",
+          "brotli": "59.4 KiB"
+        },
+        "files": [
+          "assets/index-DTnw4TGq.js: raw 174.4 KiB, gzip 66.6 KiB",
+          "assets/index-DaQG2L4J.css: raw 1.2 KiB, gzip 0.5 KiB",
+          "index.html: raw 0.4 KiB, gzip 0.3 KiB"
+        ]
+      }
+    },
+    {
+      "test": "pane #14 前端打包体积",
+      "label": "size-full",
+      "value": {
+        "total": {
+          "raw": "1013.0 KiB",
+          "gzip6": "342.9 KiB",
+          "gzip9": "342.5 KiB",
+          "brotli": "275.0 KiB"
+        },
+        "files": [
+          "assets/index-CXawby03.js: raw 1011.4 KiB, gzip 342.1 KiB",
+          "assets/index-DaQG2L4J.css: raw 1.2 KiB, gzip 0.5 KiB",
+          "index.html: raw 0.4 KiB, gzip 0.3 KiB"
+        ]
+      }
+    },
+    {
+      "test": "pane #14 前端打包体积",
+      "label": "eval-scan",
+      "value": {
+        "eval": 0,
+        "newFunction": 0
+      }
+    },
+    {
+      "test": "pane #14 前端打包体积",
+      "label": "budget",
+      "value": {
+        "common": "97.9 KiB / 300.0 KiB",
+        "min": "67.4 KiB",
+        "full": "342.9 KiB"
+      }
+    },
+    {
+      "test": "pane #14 构建产物在 CSP 下运行 > chrome",
+      "label": "csp-render",
+      "value": {
+        "violations": [],
+        "xss": false,
+        "highlighted": true,
+        "rawHtmlEscaped": true,
+        "noJavascriptHref": true,
+        "noDataHref": true,
+        "remoteImageAsLink": true,
+        "externalRel": true
+      }
+    }
+  ]
+}

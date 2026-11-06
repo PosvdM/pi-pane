@@ -35,9 +35,10 @@ function bcTry(instanceId) {
     const got = [];
     ch.onmessage = (e) => got.push(e.data);
     ch.postMessage({ type: 'request', nonce: 'evil', instanceId });
+    // 负向观察窗口：1 秒内没有回应。测试另用 pi-pane 标签页的事件日志和正向对照确认这条消息没有跨源送达。
     setTimeout(() => {
       ch.close();
-      resolve({ supported: true, received: got });
+      resolve({ supported: true, received: got, windowMs: 1000 });
     }, 1000);
   });
 }
@@ -80,7 +81,17 @@ window.__f = {
     r.openerAccess = await attempt(async () => {
       const w = window.open(`${target}/`, '_blank');
       if (!w) return 'popup-blocked';
-      await new Promise((res) => setTimeout(res, 1500));
+      // 弹出窗口先是与本页同源的 about:blank；条件等待它导航到 pi-pane（跨源后读 location 会抛错），截止 10 秒。
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        try {
+          void w.location.href;
+        } catch {
+          break;
+        }
+        if (Date.now() > deadline) throw new Error('popup did not navigate to pi-pane');
+        await new Promise((res) => setTimeout(res, 20));
+      }
       try {
         return { read: w.sessionStorage.getItem('pi-pane.auth') };
       } finally {

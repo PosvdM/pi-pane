@@ -2,3 +2,4 @@ node_modules/
 .browsers/
 bundle/dist*/
 .tmp/
+.evidence/

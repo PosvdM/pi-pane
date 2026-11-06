@@ -62,13 +62,19 @@ export function decodeFrame(buf) {
   return { opcode, payload, masked, rest: buf.subarray(off + len) };
 }
 
-/** 一条 WebSocket 连接（服务端或客户端视角）。事件：message(text)、close(code, reason)。 */
+/**
+ * 一条 WebSocket 连接（服务端或客户端视角）。事件：message(text)、close(code, reason)。
+ * 状态：open → closing（已发出 close 帧）→ closed（底层连接已断）。
+ * 只有 open 状态才分发收到的文本帧、才发送数据帧；closing 之后收到的数据帧计入 droppedAfterClose 并丢弃。
+ */
 export class WsConnection extends EventEmitter {
   constructor(socket, { isClient = false } = {}) {
     super();
     this.socket = socket;
     this.isClient = isClient;
+    this.state = 'open';
     this.closed = false;
+    this.droppedAfterClose = 0;
     this.buf = Buffer.alloc(0);
     socket.on('data', (d) => this.#onData(d));
     socket.on('close', () => this.#finish(1006, ''));
@@ -81,14 +87,16 @@ export class WsConnection extends EventEmitter {
       const f = decodeFrame(this.buf);
       if (!f) return;
       this.buf = f.rest;
-      if (f.opcode === 0x1) this.emit('message', f.payload.toString('utf8'));
-      else if (f.opcode === 0x8) {
+      if (f.opcode === 0x1) {
+        if (this.state === 'open') this.emit('message', f.payload.toString('utf8'));
+        else this.droppedAfterClose += 1;
+      } else if (f.opcode === 0x8) {
         const code = f.payload.length >= 2 ? f.payload.readUInt16BE(0) : 1005;
         const reason = f.payload.length > 2 ? f.payload.subarray(2).toString('utf8') : '';
         if (!this.closeSent) this.close(code === 1005 ? 1000 : code, reason);
         this.#finish(code, reason);
         this.socket.end();
-      } else if (f.opcode === 0x9) this.#write(encodeFrame(0xa, f.payload, { mask: this.isClient }));
+      } else if (f.opcode === 0x9 && this.state === 'open') this.#write(encodeFrame(0xa, f.payload, { mask: this.isClient }));
     }
   }
 
@@ -99,17 +107,21 @@ export class WsConnection extends EventEmitter {
   #finish(code, reason) {
     if (this.closed) return;
     this.closed = true;
+    this.state = 'closed';
     this.emit('close', code, reason);
   }
 
+  /** 只在 open 状态发送；返回是否真的写出。 */
   send(text) {
-    if (this.closed) return;
+    if (this.state !== 'open') return false;
     this.#write(encodeFrame(0x1, text, { mask: this.isClient }));
+    return true;
   }
 
   close(code = 1000, reason = '') {
     if (this.closeSent) return;
     this.closeSent = true;
+    if (this.state === 'open') this.state = 'closing';
     const r = Buffer.from(reason, 'utf8');
     const p = Buffer.alloc(2 + r.length);
     p.writeUInt16BE(code, 0);

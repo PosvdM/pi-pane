@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { startAuthServer } from '../lib/auth-server.mjs';
 import { startPlainServer } from '../lib/plain-server.mjs';
 import { forEachBrowser } from './browser-common.mjs';
-import { note, sleep } from './helpers.mjs';
+import { note, waitFor } from './helpers.mjs';
 
 test('pane #11 鉴权（浏览器）', async (t) => {
   await forEachBrowser(t, async (st, open, name) => {
@@ -50,7 +50,10 @@ test('pane #11 鉴权（浏览器）', async (t) => {
       const E = await b.newTab();
       await E.goto(`${other.origin}/evil/`);
       const attack = await E.call('attack', s.origin, s.instanceId);
-      await sleep(300);
+      // 正向对照：同源的 pi-pane 标签页 B 在同一频道里发出请求，A 能收到并回应。
+      const controlNonce = `control-${Date.now()}`;
+      const controlAnswered = await B.call('probeChannel', controlNonce);
+      await waitFor(async () => (await A.call('snapshot')).events.some((e) => e.endsWith(`/${controlNonce}`)), { what: 'A saw control request' });
       const serverSaw = s.log.slice(logFrom).map((e) => ({
         kind: e.kind ?? 'http',
         method: e.method,
@@ -64,6 +67,7 @@ test('pane #11 鉴权（浏览器）', async (t) => {
       note(st, 'evil-server-log', serverSaw);
       const aEventsAfter = (await A.call('snapshot')).events.slice(aEventsBefore);
       note(st, 'A-events-during-attack', aEventsAfter);
+      assert.equal(controlAnswered, true, 'positive control on the same channel');
       assert.equal(attack.corsGetInstance.ok, false, 'CORS read blocked');
       assert.equal(attack.preflightTicket.ok, false, 'preflight blocked');
       assert.equal(attack.websocket.opened, false, 'ws handshake rejected');
@@ -96,7 +100,7 @@ test('pane #11 鉴权（浏览器）', async (t) => {
       const H = await b.newTab();
       const hostResults = {};
       for (const h of ['localhost', 'rebind.test']) {
-        if (h === 'rebind.test' && (name === 'webkit' || name === 'safari')) {
+        if (h === 'rebind.test' && name !== 'chrome') {
           hostResults[h] = '未测（无法在该驱动里映射主机名）';
           continue;
         }
@@ -111,15 +115,20 @@ test('pane #11 鉴权（浏览器）', async (t) => {
       const hostLog = s.log.filter((e) => e.reason === 'bad_host').map((e) => e.host);
       note(st, 'host-check-server-log', hostLog);
       assert.ok(hostLog.some((h) => h.startsWith('localhost:')), 'localhost request reached server and was rejected');
-      if (name === 'chrome' || name === 'edge' || name === 'firefox') {
+      if (name === 'chrome') {
         assert.ok(hostLog.some((h) => h.startsWith('rebind.test:')), 'rebind.test rejected');
       }
       await H.close();
 
       // 6. 退出登录：广播 logout，其他标签页清除凭证；服务端关闭 WebSocket
       const logoutStatus = await A.call('logout');
-      await sleep(500);
-      const snapB2 = await B.call('snapshot');
+      const snapB2 = await waitFor(
+        async () => {
+          const sb = await B.call('snapshot');
+          return !sb.hasCredential && sb.wsClose ? sb : null;
+        },
+        { what: 'B cleared credential and websocket closed' },
+      );
       note(st, 'logout', { logoutStatus, B: { hasCredential: snapB2.hasCredential, wsClose: snapB2.wsClose, events: snapB2.events } });
       assert.equal(snapB2.hasCredential, false);
       assert.ok(snapB2.wsClose, 'B websocket closed');

@@ -1,0 +1,290 @@
+{
+  "file": "12-device-key-browser.test",
+  "node": "v26.12.0",
+  "platform": "darwin",
+  "notes": [
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "browser",
+      "value": "本机 Google Chrome（playwright-core channel=chrome，headless）"
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "userAgent",
+      "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36"
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "support",
+      "value": {
+        "ok": true
+      }
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "jcs-vector-failures",
+      "value": []
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "device",
+      "value": {
+        "deviceId": "PmSvzTb0DLlmLkHqxL0IBk3YUAweA-0OkyfmzoLSxYs",
+        "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5hJlpTe7YFEdk5CEwbKGLMRZwxjXwpoffQJaG3sRZMl-AOITDNPsF4B9f-uzbRUtbydYmsoElBjiATZjrAurLg",
+        "alg": "ECDSA-P256-SHA256",
+        "createdAt": "2026-11-05T14:27:04.017Z",
+        "created": true
+      }
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "private-key",
+      "value": {
+        "extractable": false,
+        "type": "private",
+        "algorithm": {
+          "name": "ECDSA",
+          "namedCurve": "P-256"
+        },
+        "usages": [
+          "sign"
+        ],
+        "exports": {
+          "pkcs8": "InvalidAccessError",
+          "jwk": "InvalidAccessError",
+          "raw": "InvalidAccessError"
+        }
+      }
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "presence-scenarios",
+      "value": {
+        "legit": {
+          "ok": true,
+          "status": 200
+        },
+        "replay-same": {
+          "ok": false,
+          "status": 409,
+          "code": "already_handled",
+          "step": 1
+        },
+        "replay-other-confirmation": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "expired": {
+          "ok": false,
+          "status": 410,
+          "code": "expired",
+          "step": 1
+        },
+        "tampered-target": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "tampered-paramsHash": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "tampered-action": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "tampered-expiresAt": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "after-tamper-legit": {
+          "ok": true,
+          "status": 200
+        },
+        "stored-params-changed": {
+          "ok": false,
+          "status": 409,
+          "code": "challenge_mismatch",
+          "step": 5
+        },
+        "signature-bitflip": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "other-domain": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "verify-p1363": true,
+        "verify-der-default": false,
+        "pk-mismatch-claim-old-id": {
+          "ok": false,
+          "status": 403,
+          "code": "public_key_mismatch",
+          "step": 3
+        },
+        "unpaired-new-device": {
+          "ok": false,
+          "status": 403,
+          "code": "device_not_paired",
+          "step": 3
+        },
+        "old-pk-new-signature": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "bad-alg": {
+          "ok": false,
+          "status": 400,
+          "code": "bad_alg",
+          "step": 3
+        },
+        "concurrent": [
+          {
+            "ok": true,
+            "status": 200
+          },
+          {
+            "ok": false,
+            "status": 409,
+            "code": "already_handled",
+            "step": "commit"
+          }
+        ],
+        "nonce-used": {
+          "ok": false,
+          "status": 409,
+          "code": "nonce_used",
+          "step": 2
+        },
+        "invalid-state": {
+          "ok": false,
+          "status": 409,
+          "code": "invalid_state",
+          "step": 6
+        },
+        "tricky-canonical-equal": true,
+        "tricky-verify": true,
+        "executed": [
+          "cf_44eab07457ba",
+          "cf_14d77cbb04b5",
+          "cf_3ede394c84ab"
+        ],
+        "auditDenied": [
+          "1:already_handled",
+          "4:bad_signature",
+          "1:expired",
+          "4:bad_signature",
+          "4:bad_signature",
+          "4:bad_signature",
+          "4:bad_signature",
+          "5:challenge_mismatch",
+          "4:bad_signature",
+          "4:bad_signature",
+          "3:public_key_mismatch",
+          "3:device_not_paired",
+          "4:bad_signature",
+          "3:bad_alg",
+          "commit:already_handled",
+          "2:nonce_used",
+          "6:invalid_state"
+        ]
+      }
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "after-restart",
+      "value": {
+        "created": false,
+        "sameDevice": true
+      }
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "other-origin-device",
+      "value": {
+        "created": true,
+        "differs": true
+      }
+    },
+    {
+      "test": "pane #12 / agora #16 设备密钥与签名（普通窗口） > chrome",
+      "label": "insecure-context",
+      "value": {
+        "support": {
+          "ok": false,
+          "reason": "insecure-context"
+        },
+        "device": {
+          "error": "unsupported",
+          "message": "insecure-context"
+        }
+      }
+    },
+    {
+      "test": "pane #12 设备密钥（无痕 / 隐私窗口） > chrome",
+      "label": "browser",
+      "value": "本机 Google Chrome（playwright-core channel=chrome，headless）"
+    },
+    {
+      "test": "pane #12 设备密钥（无痕 / 隐私窗口） > chrome",
+      "label": "private",
+      "value": {
+        "support": {
+          "ok": true
+        },
+        "device": {
+          "deviceId": "3tkHGKNP-7AkeMGmUo8TCWyNAVjYjKtpLSkqPMS8238",
+          "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJ8347hPGxS6JmS4kPcYKc70vk7P_dbgnL671TYPZxD0o1zeSZJg32wsfxaHjrTXmEWgv2ULpv236CZuzCTIPRQ",
+          "alg": "ECDSA-P256-SHA256",
+          "createdAt": "2026-11-05T14:27:05.301Z",
+          "created": true
+        },
+        "inspect": {
+          "extractable": false,
+          "type": "private",
+          "algorithm": {
+            "name": "ECDSA",
+            "namedCurve": "P-256"
+          },
+          "usages": [
+            "sign"
+          ],
+          "exports": {
+            "pkcs8": "InvalidAccessError",
+            "jwk": "InvalidAccessError",
+            "raw": "InvalidAccessError"
+          }
+        },
+        "afterReload": {
+          "created": false,
+          "same": true
+        },
+        "verified": true
+      }
+    },
+    {
+      "test": "pane #12 设备密钥（无痕 / 隐私窗口） > chrome",
+      "label": "private-reopen",
+      "value": {
+        "created": true,
+        "sameAsBefore": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,162 @@
+{
+  "file": "16-verifier-node.test",
+  "node": "v26.12.0",
+  "platform": "darwin",
+  "notes": [
+    {
+      "test": "RFC 8785 向量（Node.js）",
+      "label": "jcs-failures",
+      "value": []
+    },
+    {
+      "test": "agora #16 验签场景（Node.js 签名）",
+      "label": "presence-scenarios",
+      "value": {
+        "legit": {
+          "ok": true,
+          "status": 200
+        },
+        "replay-same": {
+          "ok": false,
+          "status": 409,
+          "code": "already_handled",
+          "step": 1
+        },
+        "replay-other-confirmation": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "expired": {
+          "ok": false,
+          "status": 410,
+          "code": "expired",
+          "step": 1
+        },
+        "tampered-target": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "tampered-paramsHash": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "tampered-action": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "tampered-expiresAt": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "after-tamper-legit": {
+          "ok": true,
+          "status": 200
+        },
+        "stored-params-changed": {
+          "ok": false,
+          "status": 409,
+          "code": "challenge_mismatch",
+          "step": 5
+        },
+        "signature-bitflip": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "other-domain": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "verify-p1363": true,
+        "verify-der-default": false,
+        "pk-mismatch-claim-old-id": {
+          "ok": false,
+          "status": 403,
+          "code": "public_key_mismatch",
+          "step": 3
+        },
+        "unpaired-new-device": {
+          "ok": false,
+          "status": 403,
+          "code": "device_not_paired",
+          "step": 3
+        },
+        "old-pk-new-signature": {
+          "ok": false,
+          "status": 403,
+          "code": "bad_signature",
+          "step": 4
+        },
+        "bad-alg": {
+          "ok": false,
+          "status": 400,
+          "code": "bad_alg",
+          "step": 3
+        },
+        "concurrent": [
+          {
+            "ok": true,
+            "status": 200
+          },
+          {
+            "ok": false,
+            "status": 409,
+            "code": "already_handled",
+            "step": "commit"
+          }
+        ],
+        "nonce-used": {
+          "ok": false,
+          "status": 409,
+          "code": "nonce_used",
+          "step": 2
+        },
+        "invalid-state": {
+          "ok": false,
+          "status": 409,
+          "code": "invalid_state",
+          "step": 6
+        },
+        "tricky-canonical-equal": true,
+        "tricky-verify": true,
+        "executed": [
+          "cf_f4b5e19d753b",
+          "cf_9d59c555a6c5",
+          "cf_1d5563df1cf6"
+        ],
+        "auditDenied": [
+          "1:already_handled",
+          "4:bad_signature",
+          "1:expired",
+          "4:bad_signature",
+          "4:bad_signature",
+          "4:bad_signature",
+          "4:bad_signature",
+          "5:challenge_mismatch",
+          "4:bad_signature",
+          "4:bad_signature",
+          "3:public_key_mismatch",
+          "3:device_not_paired",
+          "4:bad_signature",
+          "3:bad_alg",
+          "commit:already_handled",
+          "2:nonce_used",
+          "6:invalid_state"
+        ]
+      }
+    }
+  ]
+}
