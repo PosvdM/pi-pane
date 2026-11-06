@@ -46,7 +46,7 @@ pi-pane 不替代终端：会话仍然是 pi 自己的会话文件，在终端�
 | pi-pane（本仓库） | 轻量 Web 界面：托管主会话、聊天流、图片占位符、通用插件接口 |
 | pi-agora | 协作引擎：子代理、共享桌面（board）、会议、提问与答复、全量对话存档；可以不装 pi-pane 单独使用 |
 
-pi-pane 不认识“子代理”“会议”，也不依赖 pi-agora。pi-agora 提供一个 pi-pane 插件，通过通用接口把子会话树、board、会议进度、待处理事项等显示出来。两者共用平台相关的小包 `pi-hostkit`（进程管理、锁、路径规范化等），它的定义在 pi-agora 仓库的 `docs/hostkit.md`。
+pi-pane 不认识“子代理”“会议”，也不依赖 pi-agora。pi-agora 提供一个 pi-pane 插件，通过通用接口把子会话树、board、会议进度、待处理事项等显示出来。两者共用平台相关的包 [pi-hostkit](https://github.com/PosvdM/pi-hostkit)（进程管理、锁、路径规范化等）。它是独立仓库，权威设计见其 [docs/design.md](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md)。
 
 - 插件接口（pane 协议）以本仓库的 [docs/plugin-api.md](docs/plugin-api.md) 为准，所有插件共用。
 - agora 后台服务的 HTTP API、agora 数据如何映射到插件接口，以 pi-agora 仓库的 `docs/integration.md` 为准。
@@ -70,4 +70,4 @@ packages/
 | [docs/image-placeholders.md](docs/image-placeholders.md) | 图片占位符：输入框行为、上传与存储、保持图文顺序的做法、P0 验证清单 |
 | [docs/roadmap.md](docs/roadmap.md) | P0、MVP 切分、工程量、明确不做、主要风险 |
 | pi-agora 仓库 `docs/integration.md` | agora 后台服务的 HTTP API 和 agora 到本插件接口的映射 |
-| pi-agora 仓库 `docs/hostkit.md` | 共享包 pi-hostkit：定位 pi、RPC 传输、进程树终止、锁、目录权限、路径规范化 |
+| [pi-hostkit 仓库 `docs/design.md`](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md) | 共享包 pi-hostkit 的权威设计：定位 pi、RPC 传输、进程树终止、锁、目录权限、路径规范化 |
