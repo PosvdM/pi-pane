@@ -18,7 +18,7 @@ pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起
 ## pi 版本与定位
 
 - 支持的 pi 版本：`>=1.5.0 <1.6.0`。本文中“依据”指向的文件以 1.5.0 为准，路径相对于 pi 的包目录。
-- 定位用 hostkit 的 `locatePi`：先看 `~/.pi/pane/config.json` 的 `piPath`（pi 包目录或 `cli.js` 的路径），再看全局 npm 根目录（`npm root -g`）下的 `@earendil-works/pi-coding-agent`。查找顺序、版本检查和 Windows 上调用 `npm` 的方式以 pi-agora 仓库 `docs/hostkit.md` 的“定位 pi”为准。
+- 定位用 hostkit 的 `locatePi`：先看 `~/.pi/pane/config.json` 的 `piPath`（pi 包目录或 `cli.js` 的路径），再看全局 npm 根目录（`npm root -g`）下的 `@earendil-works/pi-coding-agent`。查找顺序、版本检查和 Windows 上调用 `npm` 的方式以 [pi-hostkit 设计文档的“定位 pi”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#定位-pi)为准。
 - 入口是 `package.json` 的 `bin.pi`（1.5.0 中为 `dist/bundle/cli.js`）。版本不在支持范围内或找不到 pi 时，pi-pane 拒绝启动，在终端说明原因和 `piPath` 的用法。
 - pi 1.5.0 要求 Node.js 22.19 及以上（`package.json` 的 `engines`），pi-pane 自己要求 Node.js 24 及以上，用同一个 Node.js（`process.execPath`）运行 pi。
 
@@ -50,12 +50,12 @@ pi-pane 服务端（server）
 
 ## 平台支持
 
-pi-pane 和 pi-agora 的核心都依赖共享包 `pi-hostkit`（暂定名，独立包，两者互不依赖）。**它的权威定义在 pi-agora 仓库的 `docs/hostkit.md`**，本文只说明 pi-pane 用到哪些部分：
+pi-pane 和 pi-agora 的核心都依赖共享包 [pi-hostkit](https://github.com/PosvdM/pi-hostkit)（独立仓库，两者互不依赖）。**它的权威定义是 pi-hostkit 仓库的 [`docs/design.md`](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md)**，本文只说明 pi-pane 用到哪些部分：
 
 | hostkit 功能 | pi-pane 中的用途 |
 | --- | --- |
 | RPC JSONL 传输 | 读写 pi 子进程的 stdin/stdout，按 LF 切分，不用 Node.js `readline`（依据：pi `docs/rpc.md` 的“Framing”） |
-| 进程树终止 | 关闭会话、空闲回收、pi-pane 退出时终止 pi 及其后代进程，流程按 hostkit.md 执行，pi-pane 不另写 |
+| 进程树终止 | 关闭会话、空闲回收、pi-pane 退出时终止 pi 及其后代进程，流程按 [pi-hostkit 设计文档的“进程树终止”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#进程树终止)执行，pi-pane 不另写 |
 | 单实例锁 | 同一个 `PI_PANE_HOME` 只运行一个 pi-pane 服务端 |
 | 会话写锁 | 同一会话文件同时只有一个托管写者，与 pi-agora 共用同一协议，见“会话写锁” |
 | 目录权限 | `~/.pi/pane/plugins/<id>/` 等目录只允许当前用户访问 |
@@ -66,17 +66,17 @@ pi-pane 和 pi-agora 的核心都依赖共享包 `pi-hostkit`（暂定名，独�
 
 ### 拉起
 
-服务端用 `process.execPath` 直接运行 pi 的 JS 入口，不经 shell：
+服务端用 pi-hostkit 的 `spawnWriter` 拉起 pi：以 `process.execPath` 经启动门闩运行 pi 的 JS 入口，不经 shell；pi 的进程身份写入会话写锁的共享记录后才加载（见 [pi-hostkit 设计文档的“启动门闩”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#启动门闩)）。pi 的参数如下：
 
 ```text
 node <pi>/dist/bundle/cli.js --mode rpc
-  --session <sessionFile>          # 已有会话，或 pi-pane 预先分配的新会话路径
+  --session <sessionFile>          # 绝对路径：已有会话，或 pi-pane 预先分配的新会话路径
   -e <pane-bridge 扩展路径>
 ```
 
-- 始终带 `--session <路径>`，不让 pi 自己选文件名：pi-pane 必须在 pi 打开会话文件之前持有它的写锁（见“会话写锁”）。
-- **新建会话**：按 hostkit.md“会话写锁”的情况 ②，pi-pane 在会话目录下预先分配一个新文件路径，取得该路径的写锁后以 `--session <该路径>` 拉起；文件不存在时 pi 新建会话并沿用这个路径。不用 `--session-id` 或不带 `--session` 让 pi 自己生成路径。
-- **Fork 为新会话**（从只读视图）：P0 实测发现 pi 的 `SessionManager.forkFrom()` 会在源文件无尾换行或尾部截断时修改源文件（末尾追加换行，并将截断行永久留在文件中间），违背对源文件的只读承诺。因此只读查看要 fork 时，pi-pane 先将源文件复制到临时目录，再在进程内对临时副本调用 `SessionManager.forkFrom(副本, cwd, sessionDir)` 生成新文件。`forkFrom()` 把传入的路径写进新文件会话头的 `parentSession`，会话列表读取这个字段（依据：`dist/core/session-manager.js` 的 `forkFrom()` 与会话列表读取）；所以在取得新文件的写锁并拉起 pi 之前，将新文件会话头的 `parentSession` 修正为规范化后的原始源文件路径；只修改新生成的文件，原始源文件保持只读。随后取得新文件的写锁，以 `--session <新文件>` 拉起，并清理临时副本。这是 hostkit.md“会话写锁”的情况 ⑤（先写后锁），取锁失败时不拉起并告诉用户。不用 `--fork` 参数。P1 增加测试，验证源文件字节不变，且新会话的父路径指向真实源文件。
+- 始终带 `--session <路径>`，不让 pi 自己选文件名：pi-pane 必须在 pi 打开会话文件之前持有它的写锁（见“会话写锁”）。路径必须是不依赖 pi 环境的绝对路径（不用 `~` 或相对路径），`spawnWriter` 按 pi 的参数规则核对它就是持锁的文件（见 pi-hostkit 设计文档的[“取得锁之后”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁之后)）。
+- **新建会话**：按 pi-hostkit 设计文档[“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ②，pi-pane 在会话目录下预先分配一个新文件路径，取得该路径的写锁后以 `--session <该路径>` 拉起；文件不存在时 pi 新建会话并沿用这个路径。不用 `--session-id` 或不带 `--session` 让 pi 自己生成路径。
+- **Fork 为新会话**（从只读视图）：P0 实测发现 pi 的 `SessionManager.forkFrom()` 会在源文件无尾换行或尾部截断时修改源文件（末尾追加换行，并将截断行永久留在文件中间），违背对源文件的只读承诺。因此只读查看要 fork 时，pi-pane 先将源文件复制到临时目录，再在进程内对临时副本调用 `SessionManager.forkFrom(副本, cwd, sessionDir)` 生成新文件。`forkFrom()` 把传入的路径写进新文件会话头的 `parentSession`，会话列表读取这个字段（依据：`dist/core/session-manager.js` 的 `forkFrom()` 与会话列表读取）；所以在取得新文件的写锁并拉起 pi 之前，将新文件会话头的 `parentSession` 修正为规范化后的原始源文件路径；只修改新生成的文件，原始源文件保持只读。随后取得新文件的写锁，以 `--session <新文件>` 拉起，并清理临时副本。这是 pi-hostkit 设计文档[“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ⑤（先写后锁），取锁失败时不拉起并告诉用户。不用 `--fork` 参数。P1 增加测试，验证源文件字节不变，且新会话的父路径指向真实源文件。
 
 - **不加 `-ne`**：主会话加载用户自己配置的 pi 扩展、技能、MCP，和在终端里运行 pi 一样。pi-agora 的扩展也是这样进入主会话的。
 - **不加 `--approve`**：项目资源是否加载按用户的信任决定，见“项目信任”。
@@ -105,10 +105,10 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 ### 会话写锁
 
-写锁的协议、共享记录 `SessionLockRecord`、取得和释放的时机、取得锁之后的遗留写者清理**以 pi-agora 仓库 `docs/hostkit.md` 的“会话写锁”为准**，本文不重复定义。pi-agora daemon 使用同一协议，所以两者不会同时托管一个会话文件。
+写锁的协议、共享记录 `SessionLockRecord`、取得和释放的时机、取得锁之后的遗留写者清理**以 [pi-hostkit 设计文档的“会话写锁”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#会话写锁)为准**，本文不重复定义。pi-agora daemon 使用同一协议，所以两者不会同时托管一个会话文件。
 
 - pi-pane 使用 hostkit 规定的共享目录 `~/.pi/hostkit/locks/`（三个平台相同；Windows 上锁本身是命名 mutex，目录里只有记录），不在自己的数据目录里另存锁状态。
-- pi-pane 在以下位置调用写锁（编号对应 hostkit.md “取得锁的时机”表中的情况）：
+- pi-pane 在以下位置调用写锁（编号对应 pi-hostkit 设计文档[“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)表中的情况）：
 
 | 场景 | hostkit 情况 | pi-pane 的做法 |
 | --- | --- | --- |
@@ -126,7 +126,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 ### 会话切换
 
-托管中的 pi 进程可能被切换到别的会话文件：pi-pane 自己发出的 RPC `new_session`、`fork`、`clone`，或扩展命令调用的 `newSession`、`fork`、`switchSession`。pane-bridge 监听切换事件，经回连通道请服务端取锁并回报（依据：`dist/core/extensions/types.d.ts` 的 `SessionBeforeSwitchEvent`、`SessionShutdownEvent`、`SessionStartEvent`）。取锁时机按 hostkit.md 的情况 ③ 和 ④。
+托管中的 pi 进程可能被切换到别的会话文件：pi-pane 自己发出的 RPC `new_session`、`fork`、`clone`，或扩展命令调用的 `newSession`、`fork`、`switchSession`。pane-bridge 监听切换事件，经回连通道请服务端取锁并回报（依据：`dist/core/extensions/types.d.ts` 的 `SessionBeforeSwitchEvent`、`SessionShutdownEvent`、`SessionStartEvent`）。取锁时机按 pi-hostkit 设计文档[“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ③ 和 ④。
 
 **切换到已有会话（③）**：pi-pane 的斜杠命令不发 `switch_session`（`/resume` 打开 pi-pane 的会话列表，另起进程打开），所以这种切换只会由扩展命令发起。pane-bridge 在 `session_before_switch`（`reason: "resume"`，带 `targetSessionFile`）里同步请服务端取得目标文件的写锁；拿不到时返回 `{ cancel: true }`，切换不发生，浏览器收到通知“目标会话正被别处托管”。
 
@@ -430,9 +430,9 @@ pane-bridge 是 pi-pane 用 `-e` 加载进每个主会话的 pi 扩展，负责�
 1. **进程级保存连接**：pane-bridge 第一次兑换后，把连接对象（凭证、服务端地址、启动配置）存在 `globalThis[Symbol.for("pi-pane.bridge")]`。后续实例加载时先查这里，有就复用，不再读环境变量。
 2. **重绑定**：新实例在自己的 `session_start` 里向服务端发送 `bridgeReady`，带上递增的实例序号、当前 `sessionFile` 和 `ctx.isProjectTrusted()`。注意：RPC 模式下的会话替换（new、resume、fork、clone）会触发两次 `session_start`（runtimeHost 替换与 RPC rebind 各一次）。pane-bridge 实例必须做幂等处理，复用同一个就绪 Promise，每实例只绑定一次监听、只发一次 `bridgeReady`；服务端也做幂等接收。服务端只接受序号最大的实例，旧实例之后的请求一律拒绝。旧实例在 `session_shutdown` 里注销自己的监听，不关闭进程级连接。
 3. **就绪前不恢复输入**：服务端从收到 `session_shutdown`（含 reload）起暂停该进程的控制队列，直到新实例的 `bridgeReady` 到达。
-4. **未就绪即终止**：新会话的 `session_start` 之后在就绪超时（暂定 10 秒）内没有收到 `bridgeReady`，或重绑定失败（如进程级连接对象不存在，新实例不自行申请凭证），服务端立即按 hostkit 的流程终止该 pi 进程（`clear_queue` → `abort` → 终止进程树），把会话标为 `interrupted`。界面以只读方式显示会话内容，提供“重启”，重启时用新 ticket 重新拉起。不让进程在暂停状态下存活，也不提供“不用 pane-bridge 继续”：会话写锁靠 pane-bridge 在 `session_before_switch`、`session_shutdown` 时请求，没有它的进程只要还活着，扩展命令或扩展自己的定时器就能切换会话，目标文件会在没有取锁的情况下被 `SessionManager.open()` 打开（依据：hostkit.md 情况 ③、`dist/core/agent-session-runtime.js` 第 129–135 行）。
+4. **未就绪即终止**：新会话的 `session_start` 之后在就绪超时（暂定 10 秒）内没有收到 `bridgeReady`，或重绑定失败（如进程级连接对象不存在，新实例不自行申请凭证），服务端立即按 hostkit 的流程终止该 pi 进程（`clear_queue` → `abort` → 终止进程树），把会话标为 `interrupted`。界面以只读方式显示会话内容，提供“重启”，重启时用新 ticket 重新拉起。不让进程在暂停状态下存活，也不提供“不用 pane-bridge 继续”：会话写锁靠 pane-bridge 在 `session_before_switch`、`session_shutdown` 时请求，没有它的进程只要还活着，扩展命令或扩展自己的定时器就能切换会话，目标文件会在没有取锁的情况下被 `SessionManager.open()` 打开（依据：[pi-hostkit 设计文档“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ③、`dist/core/agent-session-runtime.js` 第 129–135 行）。
 5. **首次拉起同样处理**：拉起后 pane-bridge 没有在就绪超时内完成兑换并发出 `bridgeReady`（扩展加载失败、ticket 被抢先兑换、回连失败等）时，服务端不向该进程发送任何输入，按第 4 步终止进程，会话显示原因并提供“重启”。若 ticket 被抢先兑换或非法，pi 直接以退出码 1 退出，服务端遇到启动阶段退出码 1 当成 ticket 或启动失败处理，记下诊断，不自动重试。
-6. **超时窗口内的替换**：就绪超时之内扩展仍可能自行切换会话、打开一个没有取锁的文件。该 pi 的进程身份记录在原会话文件的共享锁记录（`writer`）里；pi-pane 在超时后终止它，即使 pi-pane 在终止前退出，下一个取得该锁的宿主也会按 hostkit.md 的“取得锁之后”先停止这个遗留写者。
+6. **超时窗口内的替换**：就绪超时之内扩展仍可能自行切换会话、打开一个没有取锁的文件。该 pi 的进程身份记录在原会话文件的共享锁记录（`writer`）里；pi-pane 在超时后终止它，即使 pi-pane 在终止前退出，下一个取得该锁的宿主也会按 [pi-hostkit 设计文档的“取得锁之后”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁之后)先停止这个遗留写者。
 
 `globalThis` 上的连接对象对同一进程里的其他扩展可见，风险与环境变量里的 ticket 相同（见“回连通道”），连接能做的都只是 Agent 级操作。
 ## 数据目录
