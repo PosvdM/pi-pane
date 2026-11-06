@@ -223,7 +223,7 @@ Hint: Start without extensions using "pi -ne".
 
 ### harness 使用情况
 
-没有修改共用 harness。`experiment.mjs` 在 B 组测试进程内给 `RpcDriver.stop()` 加本地防护：已退出的 child 不走发信号路径，并发或重复停止复用同一个 Promise，覆盖启动失败的内部清理以及 `stop()` 后再次 `cleanup()` 的路径。两个独立测试断言已退出时底层停止次数为 0、并发和重复停止时底层停止次数为 1。这个包装只作用于本组进程，不表示共用 harness 的文件已修复。
+返工时没有修改共用 harness，使用的是本组防护。`experiment.mjs` 在 B 组测试进程内给 `RpcDriver.stop()` 加本地防护：已退出的 child 不走发信号路径，并发或重复停止复用同一个 Promise，覆盖启动失败的内部清理以及 `stop()` 后再次 `cleanup()` 的路径。两个独立测试断言已退出时底层停止次数为 0、并发和重复停止时底层停止次数为 1。这个包装只作用于本组进程。合并后的共用 harness（`experiments/p0/harness/rpc-driver.mjs` 的 `stop()`）也已修复：发信号前先检查子进程退出状态，并缓存 stop Promise。本组包装仍保留。
 
 以下是测量限制：
 
