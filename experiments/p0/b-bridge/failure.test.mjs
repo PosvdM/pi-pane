@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createExperiment } from '../harness/index.mjs';
+import { createExperiment } from './experiment.mjs';
 import { startBridge } from './server.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
