@@ -76,7 +76,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 - 始终带 `--session <路径>`，不让 pi 自己选文件名：pi-pane 必须在 pi 打开会话文件之前持有它的写锁（见“会话写锁”）。
 - **新建会话**：按 hostkit.md“会话写锁”的情况 ②，pi-pane 在会话目录下预先分配一个新文件路径，取得该路径的写锁后以 `--session <该路径>` 拉起；文件不存在时 pi 新建会话并沿用这个路径。不用 `--session-id` 或不带 `--session` 让 pi 自己生成路径。
-- **Fork 为新会话**（从只读视图）：pi-pane 在自己的进程里调用 pi 导出的 `SessionManager.forkFrom(源文件, cwd, sessionDir)`，它用新的会话 id 生成文件名，以排他方式（`wx`）创建新文件并写入历史（依据：`dist/core/session-manager.js` 第 1408–1425 行）；然后取得新文件的写锁，再以 `--session <新文件>` 拉起。这是 hostkit.md“会话写锁”的情况 ⑤（先写后锁），取锁失败时不拉起并告诉用户。不用 `--fork` 参数，因为那样会先拉起 pi、路径由 pi 决定。
+- **Fork 为新会话**（从只读视图）：P0 实测发现 pi 的 `SessionManager.forkFrom()` 会在源文件无尾换行或尾部截断时修改源文件（末尾追加换行，并将截断行永久留在文件中间），违背对源文件的只读承诺。因此只读查看要 fork 时，pi-pane 先将源文件复制到临时目录，再在进程内对临时副本调用 `SessionManager.forkFrom(副本, cwd, sessionDir)` 生成新文件。`forkFrom()` 把传入的路径写进新文件会话头的 `parentSession`，会话列表读取这个字段（依据：`dist/core/session-manager.js` 的 `forkFrom()` 与会话列表读取）；所以在取得新文件的写锁并拉起 pi 之前，将新文件会话头的 `parentSession` 修正为规范化后的原始源文件路径；只修改新生成的文件，原始源文件保持只读。随后取得新文件的写锁，以 `--session <新文件>` 拉起，并清理临时副本。这是 hostkit.md“会话写锁”的情况 ⑤（先写后锁），取锁失败时不拉起并告诉用户。不用 `--fork` 参数。P1 增加测试，验证源文件字节不变，且新会话的父路径指向真实源文件。
 
 - **不加 `-ne`**：主会话加载用户自己配置的 pi 扩展、技能、MCP，和在终端里运行 pi 一样。pi-agora 的扩展也是这样进入主会话的。
 - **不加 `--approve`**：项目资源是否加载按用户的信任决定，见“项目信任”。
@@ -98,6 +98,8 @@ node <pi>/dist/bundle/cli.js --mode rpc
 打开没有托管的会话时不拉起进程：
 
 - 服务端自己只读解析会话 JSONL，旧版本格式（v1、v2）在内存里迁移到 v3，不改写文件。不能用 `SessionManager.open()`：它在文件为空或需要迁移时会调用 `_rewriteFile()` 改写文件（依据：`dist/core/session-manager.js` 第 666–727 行）。
+- v2/v3 条目 id 来自文件，具有稳定性；v1 在解析/迁移时派生的 id 不可作为跨进程或迁移前后的持久键（见 [plugin-api.md](plugin-api.md#三种投影)）。
+- 末尾未完成的截断行，以及 pi 补换行后留在文件中间的不完整行，跳过并记录诊断，不因此判为文件损坏。在线与离线的叶子计算采用统一规则；P0 的一致性结论限于文件重新打开语义，不保证运行中导航后尚未追加条目时两者叶子相同。
 - 只读视图监视文件的修改时间，变化时发 `resync` 重新解析。
 - 用户第一次在只读视图里发送消息时，服务端按“会话写锁”的规则拉起进程，之后转为托管会话。
 
@@ -112,7 +114,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 | --- | --- | --- |
 | 打开已有会话 | ① | 拉起 pi 之前取得写锁 |
 | 新建会话 | ② | 预先分配路径、取得写锁后以 `--session <路径>` 拉起（见“拉起”） |
-| 从只读视图 Fork | ⑤ | 在 pi-pane 进程里用 `forkFrom()` 创建新文件后取得写锁，再拉起（见“拉起”） |
+| 从只读视图 Fork | ⑤ | 在 pi-pane 进程里对临时副本调用 `forkFrom()` 创建新文件、修正新文件的 `parentSession` 后取得写锁，再拉起（见“拉起”） |
 | 进程内切换到已有会话 | ③ | 见“会话切换” |
 | 进程内 new、fork、clone | ④ | 见“会话切换” |
 | 关闭、回收 | — | 确认 pi 进程树已退出后释放 |
@@ -151,21 +153,21 @@ RPC 模式不显示 pi 内置的信任提示。启动阶段交给 `project_trust
 pi 决定信任的顺序（依据：`dist/core/project-trust.js` 的 `resolveProjectTrusted`、`dist/core/extensions/runner.js` 第 109–136 行的 `emitProjectTrustEvent`）：
 
 1. 命令行 `--approve`/`--no-approve`；
-2. 目录里没有需要信任的项目资源时直接通过；
+2. 目录里没有需要信任的项目资源时，返回 `ProjectTrustStore.get(cwd) ?? true`：已有保存决定时使用该决定（包括父目录继承的决定），否则视为信任；此分支不调用 `project_trust` 处理器；
 3. 按扩展加载顺序调用 `project_trust` 处理器，第一个返回 `"yes"` 或 `"no"` 的生效，`"undecided"` 交给下一个；
 4. `trust.json` 里保存的决定；
 5. `defaultProjectTrust`：`"always"` 加载，`"never"` 不加载，`"ask"` 在 RPC 下因为没有 UI 而不加载。
 
 **主方案：拉起前在浏览器询问**
 
-- 拉起一个会话之前，服务端用 pi 导出的 `hasTrustRequiringProjectResources(cwd)` 和 `ProjectTrustStore`（依据：`dist/index.d.ts` 第 28 行）判断该目录是否有需要信任的资源、是否已有保存的决定。有资源且没有保存的决定时，浏览器显示“是否信任项目 <cwd>？”，选项为“信任”“不信任”和“记住此选择”。这一步发生在用户打开或新建会话的那个标签页里，用户一定在场。
-- 决定不用 `--approve`/`--no-approve` 传给 pi：命令行覆盖对该进程内所有目录生效，进程内切换到别的项目时也会沿用。服务端把“目录 → `{ trusted, remember }`”放进 pane-bridge 的启动配置（随回连通道的兑换响应下发），pane-bridge 的 `project_trust` 处理器只对匹配的目录返回这个决定，返回值按 pi 的类型 `{ trusted: "yes" | "no" | "undecided", remember?: boolean }`（依据：`dist/core/extensions/types.d.ts` 第 558–562 行）；`remember: true` 时由 pi 写入 `trust.json`。
+- 拉起一个会话之前，服务端用 pi 导出的 `hasTrustRequiringProjectResources(cwd)` 和 `ProjectTrustStore`（依据：`dist/index.d.ts` 第 28 行）判断该目录是否有需要信任的资源、是否已有保存的决定。注意：没有资源的目录，如果 `trust.json` 里记的是 false，同样当作不信任。有资源且没有保存的决定时，浏览器显示“是否信任项目 <cwd>？”，选项为“信任”“不信任”和“记住此选择”。这一步发生在用户打开或新建会话的那个标签页里，用户一定在场。
+- 决定不用 `--approve`/`--no-approve` 传给 pi：命令行覆盖对该进程内所有目录生效，进程内切换到别的项目时也会沿用。服务端把“目录 → `{ trusted, remember }`”放进 pane-bridge 的启动配置（随回连通道的兑换响应下发），比较路径前先做 `realpath`（例如 macOS 上系统临时目录 `event.cwd` 在 `/private/var` 与 `/var` 的符号链接差异）；pane-bridge 的 `project_trust` 处理器只对匹配的目录返回这个决定，返回值按 pi 的类型 `{ trusted: "yes" | "no" | "undecided", remember?: boolean }`（依据：`dist/core/extensions/types.d.ts` 第 558–562 行）；`remember: true` 时由 pi 写入 `trust.json`。
 - 用户关闭询问框或没有作答时，处理器返回 `"undecided"`。
 - 同一 pi-pane 运行期间对同一目录的回答缓存在服务端内存里（未勾选“记住”时只对本次运行有效），重新拉起时不再询问。
 
 **补充：进程内切换到新目录**
 
-进程内切换会话进入一个新的工作目录时，pi 会再次触发 `project_trust`，而这个目录事先不知道。pane-bridge 的处理器经回连通道请服务端在浏览器询问，60 秒内没有回应、没有浏览器连接或回连不可用时返回 `"undecided"`。
+进程内切换会话进入一个新的工作目录时，pi 会再次触发 `project_trust`，而这个目录事先不知道。pane-bridge 的处理器经回连通道请服务端在浏览器询问。询问期间会话切换会被阻塞，最长会卡 60 秒（处理器超时）。因此 pane 必须提前预判信任状态、及时弹出询问，不能让用户干等；60 秒内没有回应、没有浏览器连接或回连不可用时返回 `"undecided"`。
 
 **`"undecided"` 不等于不加载**
 
@@ -175,7 +177,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 
 - 不对所有会话统一加 `--approve`。
 - 页面上注明：信任只决定是否加载项目的设置和资源，`AGENTS.md` 等上下文文件不受信任控制，始终加载（依据：pi `docs/security.md`）。
-- **待 P0 验证**：`ProjectTrustStore` 的判断与 pi 实际使用的决定一致（含父目录的决定）；`project_trust` 处理器运行时 pane-bridge 的回连已可用。
+- P0 验证结论：`ProjectTrustStore` 预判、pane-bridge 处理器及 `isProjectTrusted()` 的实测结果完全一致。没有资源的目录在 `trust.json` 记为 false 时同样不加载资源；切换会话时路径两端需 realpath 匹配。
 
 ### 停止与控制队列
 
@@ -189,15 +191,14 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 | 命令 | 必须带 | 冲突（409 `revisionChanged`）后的处理 |
 | --- | --- | --- |
 | 发送（`prompt`/`steer`/`follow_up`） | `expectedEpoch`、`expectedRevision` | 用哪个 RPC 命令取决于用户看到的运行状态。浏览器重新读取状态：会话已开始运行时让用户选择“追加（steer）”“排队（follow-up）”或“取消”；已经停下时询问是否作为新消息发送。草稿保留，不自动重发 |
-| 停止、只停止当前回复 | `expectedEpoch`、`expectedRevision` | 用户看到的那次运行已结束或已在停止时不重复执行，显示当前状态 |
+| 停止 | `expectedEpoch`、`expectedRevision` | 用户看到的那次运行已结束或已在停止时不重复执行，显示当前状态 |
 | 关闭会话 | `expectedEpoch`、`expectedRevision` | 重新显示当前状态和 hold 原因，请用户再次确认 |
 | 切换模型、thinking | `expectedEpoch`、`expectedRevision` | 另一个标签页刚改过时显示新值，由用户决定是否覆盖 |
 | `/compact`、`/new`、`/fork`、`/clone`、`/name`、`/export` | `expectedEpoch`、`expectedRevision` | 重新读取状态后由用户重新发起 |
 | 回应扩展 UI 对话框 | `expectedEpoch` | 以对话框的请求 id 为准，已回应或已超时的返回“已处理” |
 
 服务端在控制队列里串行执行，执行前比较条件，比较和执行之间不会插入其他控制操作。
-- **停止（取消）**：会话视图的“停止”按钮。服务端进入 `stopping` 状态，先发 `clear_queue`，把返回的 steering 和 follow-up 文本按原顺序放回输入框（放在现有草稿之前，用空行分隔），再发 `abort`。这与 pi 文档建议的 Esc 行为一致：只发 `abort` 时 pi 会继续处理仍在队列里的消息（依据：pi `docs/rpc-commands.md` 的 `clear_queue`）。
-- **只停止当前回复**：“停止”按钮旁的菜单项，只发 `abort`，排队的消息继续执行。
+- **停止（取消）**：会话视图的“停止”按钮。服务端进入 `stopping` 状态，先发 `clear_queue`，把返回的 steering 和 follow-up 文本按原顺序放回输入框（放在现有草稿之前，用空行分隔），再发 `abort`。P0 实测证明：只发 `abort` 时排队消息留在队列里、不会自动执行，而且排队的 agora 通知之后会重复落盘，所以 pane 不提供只发 abort 的操作（不提供“只停止当前回复”菜单项）。
 - **队列里的图片**：`clear_queue` 只返回文字。服务端记录每条排队消息的草稿（含图片节点），按文字找回对应草稿后整条放回输入框；带图片的消息文字里有随机标记（见 [image-placeholders.md](image-placeholders.md#做法发送时编码message_end-时还原)），可以唯一对应。
 - **超时**：`abort` 会等会话空闲后才响应。服务端等待 10 秒，超时后显示“停止超时”，提供“强制结束进程”，按 hostkit 的流程终止进程树，会话状态变为 `interrupted`，下次发送时重新拉起。
 - **stopping 期间**：拒绝新的发送（提示“正在停止”），直到收到 `agent_settled` 或进程退出。进入和离开 `stopping` 都会使 `controlRevision` 加 1。
@@ -272,6 +273,7 @@ type ServerMessage =
 - 浏览器打开会话：`GET /api/sessions/:id/snapshot` 取快照，再通过 WebSocket 用快照的 `cursor` 订阅。
 - 快照是对会话模型的一次同步读取，返回的 `entries`、`inFlight` 和 `cursor` 属于同一时刻：游标之前的事件都已反映在快照里，订阅从游标之后的第一条事件开始。因为模型更新和 `seq` 分配在同一次处理中完成，两者之间没有可以插入事件的空隙。
 - 快照只带聊天视图的最后一页（默认 50 条）和历史水位 `historyBefore`。向上滚动时 `GET /api/sessions/:id/history?before=<entryId>` 取更早的页，规则见 [plugin-api.md](plugin-api.md#sessionsnapshot)。
+- **条目与图片分离**：P0 实测表明大图会导致全量 `get_entries` 耗时急剧上升。因此重连和快照**只用 `since` 增量取条目**，不全量取；快照中只放图片的引用（哈希/URL），浏览器显示时再单独异步取图。单张图片的大小上限放到 P1 按实测再定。
 
 ### 游标与重连
 
@@ -318,6 +320,8 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 输入 `/` 时，补全列表包含上表的内置命令和 `get_commands` 返回的命令（显示 `description` 和来源）。会话的扩展重新加载或切换后重新获取。
 
 ## 鉴权
+
+**浏览器支持范围**：pi-pane **只支持 Chrome**。其他浏览器（包括 Edge 等 Chromium 内核的）不测、不承诺。
 
 ### 规范源与监听
 
@@ -424,10 +428,10 @@ pane-bridge 是 pi-pane 用 `-e` 加载进每个主会话的 pi 扩展，负责�
 进程内的 new、resume、fork、clone 和 reload 会拆掉旧的扩展实例、重新实例化扩展；旧实例捕获的 `pi`、`ctx` 在替换后失效（依据：pi `docs/extensions.md` 的“Session replacement lifecycle and footguns”、`dist/core/agent-session-runtime.js`）。pi 以 `moduleCache: false` 加载扩展模块（依据：`dist/core/extensions/loader.js` 第 481–485 行），模块级变量也不能保证保留。此时环境变量里的 ticket 已经删除，新实例不能再兑换。做法：
 
 1. **进程级保存连接**：pane-bridge 第一次兑换后，把连接对象（凭证、服务端地址、启动配置）存在 `globalThis[Symbol.for("pi-pane.bridge")]`。后续实例加载时先查这里，有就复用，不再读环境变量。
-2. **重绑定**：新实例在自己的 `session_start` 里向服务端发送 `bridgeReady`，带上递增的实例序号、当前 `sessionFile` 和 `ctx.isProjectTrusted()`。服务端只接受序号最大的实例，旧实例之后的请求一律拒绝。旧实例在 `session_shutdown` 里注销自己的监听，不关闭进程级连接。
+2. **重绑定**：新实例在自己的 `session_start` 里向服务端发送 `bridgeReady`，带上递增的实例序号、当前 `sessionFile` 和 `ctx.isProjectTrusted()`。注意：RPC 模式下的会话替换（new、resume、fork、clone）会触发两次 `session_start`（runtimeHost 替换与 RPC rebind 各一次）。pane-bridge 实例必须做幂等处理，复用同一个就绪 Promise，每实例只绑定一次监听、只发一次 `bridgeReady`；服务端也做幂等接收。服务端只接受序号最大的实例，旧实例之后的请求一律拒绝。旧实例在 `session_shutdown` 里注销自己的监听，不关闭进程级连接。
 3. **就绪前不恢复输入**：服务端从收到 `session_shutdown`（含 reload）起暂停该进程的控制队列，直到新实例的 `bridgeReady` 到达。
 4. **未就绪即终止**：新会话的 `session_start` 之后在就绪超时（暂定 10 秒）内没有收到 `bridgeReady`，或重绑定失败（如进程级连接对象不存在，新实例不自行申请凭证），服务端立即按 hostkit 的流程终止该 pi 进程（`clear_queue` → `abort` → 终止进程树），把会话标为 `interrupted`。界面以只读方式显示会话内容，提供“重启”，重启时用新 ticket 重新拉起。不让进程在暂停状态下存活，也不提供“不用 pane-bridge 继续”：会话写锁靠 pane-bridge 在 `session_before_switch`、`session_shutdown` 时请求，没有它的进程只要还活着，扩展命令或扩展自己的定时器就能切换会话，目标文件会在没有取锁的情况下被 `SessionManager.open()` 打开（依据：hostkit.md 情况 ③、`dist/core/agent-session-runtime.js` 第 129–135 行）。
-5. **首次拉起同样处理**：拉起后 pane-bridge 没有在就绪超时内完成兑换并发出 `bridgeReady`（扩展加载失败、ticket 被抢先兑换、回连失败等）时，服务端不向该进程发送任何输入，按第 4 步终止进程，会话显示原因并提供“重启”。
+5. **首次拉起同样处理**：拉起后 pane-bridge 没有在就绪超时内完成兑换并发出 `bridgeReady`（扩展加载失败、ticket 被抢先兑换、回连失败等）时，服务端不向该进程发送任何输入，按第 4 步终止进程，会话显示原因并提供“重启”。若 ticket 被抢先兑换或非法，pi 直接以退出码 1 退出，服务端遇到启动阶段退出码 1 当成 ticket 或启动失败处理，记下诊断，不自动重试。
 6. **超时窗口内的替换**：就绪超时之内扩展仍可能自行切换会话、打开一个没有取锁的文件。该 pi 的进程身份记录在原会话文件的共享锁记录（`writer`）里；pi-pane 在超时后终止它，即使 pi-pane 在终止前退出，下一个取得该锁的宿主也会按 hostkit.md 的“取得锁之后”先停止这个遗留写者。
 
 `globalThis` 上的连接对象对同一进程里的其他扩展可见，风险与环境变量里的 ticket 相同（见“回连通道”），连接能做的都只是 Agent 级操作。

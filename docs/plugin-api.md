@@ -359,7 +359,7 @@ pi 的会话文件是一棵只追加的条目树（依据：pi `docs/session-for
 
 | 投影 | 内容 | 在 pi-pane 中的用途 |
 | --- | --- | --- |
-| ① 原始存档 | 全部条目，包括被放弃的分支，条目 id 稳定 | 数据来源；导出 |
+| ① 原始存档 | 全部条目，包括被放弃的分支；v2/v3 条目 id 来自文件，具有稳定性；v1 在解析/迁移时派生的 id 不可作为跨进程或迁移前后的持久键 | 数据来源；导出 |
 | ② 用户聊天视图 | 从当前叶子沿 `parentId` 回到根的整条活动分支，包含压缩前的内容；压缩条目显示为分隔标记，`context_edit` 不改变显示 | 会话视图显示的内容 |
 | ③ 模型当前上下文 | 压缩和 `context_edit` 之后模型实际收到的消息 | 只在“模型上下文”详情里显示（不在 MVP） |
 
@@ -777,6 +777,7 @@ pi 原生扩展 UI 在 RPC 模式下只有 select、confirm、input、editor 四
   ```
 
 - pane-bridge 经回连通道把表单交给 pi-pane 服务端（见 [architecture.md](architecture.md#pane-bridge)），浏览器渲染、用户提交后原路返回。
+- **`session_start` 幂等**：由于 pi RPC 会话替换会触发两次 `session_start`，pane-bridge 与宿主必须对 `session_start` 做幂等处理，复用同一个就绪 Promise，每实例只绑定一次监听、只发起一次重绑定回报，确保表单请求/响应通道严格一一对应，不产生重复提交。
 - 判断是否在 pi-pane 里运行：扩展发 `pane:ping`，100 毫秒内收到 `pane:pong` 即可用；否则退回逐题调用 `ctx.ui.select` / `ctx.ui.input`。
 - 这类表单是临时的，不进待处理区：`spec.expiresAt` 到期时 pane-bridge 返回 `expired`；会话被停止、关闭或切换时返回 `aborted`；子进程退出后浏览器里的表单关闭，不自动重问。
 

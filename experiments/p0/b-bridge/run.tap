@@ -1,0 +1,229 @@
+TAP version 13
+# Subtest: 图片 1/2/3/8：prompt 交错三图，重复三次
+ok 1 - 图片 1/2/3/8：prompt 交错三图，重复三次
+  ---
+  duration_ms: 722.689959
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-jbhCNp
+# {"observation":"prompt","repetition":1,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856956832,"providerAt":1793856956834,"queueUpdates":0}
+# {"observation":"prompt","repetition":2,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856956876,"providerAt":1793856956876,"queueUpdates":0}
+# {"observation":"prompt","repetition":3,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856956915,"providerAt":1793856956916,"queueUpdates":0}
+# {"observation":"cleanup","piPid":49751,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: 图片 1/2/3/8：steer 交错三图，重复三次
+ok 2 - 图片 1/2/3/8：steer 交错三图，重复三次
+  ---
+  duration_ms: 2131.287875
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-7pv2UT
+# {"observation":"steer","repetition":1,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856957923,"providerAt":1793856957924,"queueUpdates":2}
+# {"observation":"steer","repetition":2,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856958470,"providerAt":1793856958471,"queueUpdates":2}
+# {"observation":"steer","repetition":3,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856959021,"providerAt":1793856959026,"queueUpdates":2}
+# {"observation":"cleanup","piPid":49760,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: 图片 1/2/3/8：follow_up 交错三图，重复三次
+ok 3 - 图片 1/2/3/8：follow_up 交错三图，重复三次
+  ---
+  duration_ms: 2131.438334
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-DrIpcx
+# {"observation":"follow_up","repetition":1,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856960047,"providerAt":1793856960048,"queueUpdates":2}
+# {"observation":"follow_up","repetition":2,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856960597,"providerAt":1793856960601,"queueUpdates":2}
+# {"observation":"follow_up","repetition":3,"content":["T:红方块[Image \#1]","I:89","T:蓝圆[Image \#2]","I:149","T:字母C[Image \#3]","I:98","T:结束"],"restoreAt":1793856961158,"providerAt":1793856961163,"queueUpdates":2}
+# {"observation":"cleanup","piPid":49777,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: 图片 4：恢复后的 provider 上下文保留交错图片，重复三次
+ok 4 - 图片 4：恢复后的 provider 上下文保留交错图片，重复三次
+  ---
+  duration_ms: 2311.249709
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-bpUIqX
+# {"observation":"resume","repetition":1,"preserved":["T:段1[Image \#1]","I:89","T:段2[Image \#2]","I:149","T:段3[Image \#3]","I:98","T:末尾"]}
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-17HmWc
+# {"observation":"resume","repetition":2,"preserved":["T:段1[Image \#1]","I:89","T:段2[Image \#2]","I:149","T:段3[Image \#3]","I:98","T:末尾"]}
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-8DGesg
+# {"observation":"resume","repetition":3,"preserved":["T:段1[Image \#1]","I:89","T:段2[Image \#2]","I:149","T:段3[Image \#3]","I:98","T:末尾"]}
+# {"observation":"cleanup","piPid":49805,"exit":{"code":143,"signal":null},"retained":false}
+# {"observation":"cleanup","piPid":49812,"exit":{"code":143,"signal":null},"retained":false}
+# {"observation":"cleanup","piPid":49831,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: 图片 5：export_html 的数据与实际用户渲染分支，重复三次
+ok 5 - 图片 5：export_html 的数据与实际用户渲染分支，重复三次
+  ---
+  duration_ms: 593.283625
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-iuFdTu
+# {"observation":"export","repetition":1,"embedded":["T:段1[Image \#1]","I:89","T:段2[Image \#2]","I:149","T:段3[Image \#3]","I:98","T:末尾"],"rendered":"I1,I2,I3,T1+T2+T3+tail","firstImageOffset":74,"firstTextOffset":736,"designPass":false}
+# {"observation":"export","repetition":2,"embedded":["T:段1[Image \#1]","I:89","T:段2[Image \#2]","I:149","T:段3[Image \#3]","I:98","T:末尾"],"rendered":"I1,I2,I3,T1+T2+T3+tail","firstImageOffset":74,"firstTextOffset":736,"designPass":false}
+# {"observation":"export","repetition":3,"embedded":["T:段1[Image \#1]","I:89","T:段2[Image \#2]","I:149","T:段3[Image \#3]","I:98","T:末尾"],"rendered":"I1,I2,I3,T1+T2+T3+tail","firstImageOffset":74,"firstTextOffset":736,"designPass":false}
+# {"observation":"cleanup","piPid":49840,"exit":{"code":143,"signal":null},"retained":true}
+# Subtest: 图片 6：手动和自动压缩后可以继续，重复三次
+ok 6 - 图片 6：手动和自动压缩后可以继续，重复三次
+  ---
+  duration_ms: 3111.443875
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-CYx8iK
+# {"observation":"compact","automatic":false,"repetition":1,"compactions":1,"requests":4}
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-y3T9IA
+# {"observation":"compact","automatic":false,"repetition":2,"compactions":1,"requests":4}
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-od0hDs
+# {"observation":"compact","automatic":false,"repetition":3,"compactions":1,"requests":4}
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-N1Of8k
+# {"observation":"compact","automatic":true,"repetition":1,"compactions":1,"requests":5}
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-4tuCZ9
+# {"observation":"compact","automatic":true,"repetition":2,"compactions":1,"requests":5}
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-YD2rIE
+# {"observation":"compact","automatic":true,"repetition":3,"compactions":1,"requests":5}
+# {"observation":"cleanup","piPid":49865,"exit":{"code":143,"signal":null},"retained":false}
+# {"observation":"cleanup","piPid":49867,"exit":{"code":143,"signal":null},"retained":false}
+# {"observation":"cleanup","piPid":49883,"exit":{"code":143,"signal":null},"retained":false}
+# {"observation":"cleanup","piPid":49886,"exit":{"code":143,"signal":null},"retained":false}
+# {"observation":"cleanup","piPid":49892,"exit":{"code":143,"signal":null},"retained":false}
+# {"observation":"cleanup","piPid":49895,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: 图片 9/10/11：自动缩放、相邻、纯图片、10 图、相似文字和备用编码，各重复三次
+ok 7 - 图片 9/10/11：自动缩放、相邻、纯图片、10 图、相似文字和备用编码，各重复三次
+  ---
+  duration_ms: 2289.550542
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-9w0fyd
+# {"observation":"only-images","repetition":1,"imageCount":3}
+# {"observation":"adjacent","repetition":1,"imageCount":2}
+# {"observation":"ten-images","repetition":1,"imageCount":10}
+# {"observation":"similar-text","repetition":1,"imageCount":3}
+# {"observation":"auto-resize","repetition":1,"dimensions":[[2000,23],[23,2000]],"mimeTypes":["image/png","image/jpeg"],"referenceHashOrderMatches":true,"types":["text","image","text","image","text"]}
+# {"observation":"fallback","repetition":1,"content":["T:红方块[Image \#1]蓝圆[Image \#2]白底C[Image \#3]","I:89","I:149","I:98"],"semanticModelCheck":"skipped"}
+# {"observation":"only-images","repetition":2,"imageCount":3}
+# {"observation":"adjacent","repetition":2,"imageCount":2}
+# {"observation":"ten-images","repetition":2,"imageCount":10}
+# {"observation":"similar-text","repetition":2,"imageCount":3}
+# {"observation":"auto-resize","repetition":2,"dimensions":[[2000,23],[23,2000]],"mimeTypes":["image/png","image/jpeg"],"referenceHashOrderMatches":true,"types":["text","image","text","image","text"]}
+# {"observation":"fallback","repetition":2,"content":["T:红方块[Image \#1]蓝圆[Image \#2]白底C[Image \#3]","I:89","I:149","I:98"],"semanticModelCheck":"skipped"}
+# {"observation":"only-images","repetition":3,"imageCount":3}
+# {"observation":"adjacent","repetition":3,"imageCount":2}
+# {"observation":"ten-images","repetition":3,"imageCount":10}
+# {"observation":"similar-text","repetition":3,"imageCount":3}
+# {"observation":"auto-resize","repetition":3,"dimensions":[[2000,23],[23,2000]],"mimeTypes":["image/png","image/jpeg"],"referenceHashOrderMatches":true,"types":["text","image","text","image","text"]}
+# {"observation":"fallback","repetition":3,"content":["T:红方块[Image \#1]蓝圆[Image \#2]白底C[Image \#3]","I:89","I:149","I:98"],"semanticModelCheck":"skipped"}
+# {"observation":"cleanup","piPid":49900,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: 图片 10：无效 nonce/数量/编号只告警，不替换
+ok 8 - 图片 10：无效 nonce/数量/编号只告警，不替换
+  ---
+  duration_ms: 459.889791
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-XIopPD
+# {"observation":"cleanup","piPid":49929,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: 图片 12/13：12 MiB 合法负载、JSONL 和 get_entries；三类超限不转发
+ok 9 - 图片 12/13：12 MiB 合法负载、JSONL 和 get_entries；三类超限不转发
+  ---
+  duration_ms: 21386.223417
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-WFZatf
+# {"observation":"max-load","repetition":1,"sampledPeakRss":846631432,"piRss":617401640,"decodedBytes":12582912,"maxLineBytes":16778325,"sendMs":2781.8359999999993,"entriesMs":641.6209170000002,"parseMs":37.17262499999924,"driverRssBefore":145759792,"driverRssAfter":479761648,"driverHeapBefore":19672968,"driverHeapAfter":213793480}
+# {"observation":"limit","name":"single","browserSharedValidator":"单张图片不能超过 4 MiB","server":{"reason":"单张图片不能超过 4 MiB","sentToPi":false}}
+# {"observation":"limit","name":"count","browserSharedValidator":"图片不能超过 10 张","server":{"reason":"图片不能超过 10 张","sentToPi":false}}
+# {"observation":"limit","name":"total","browserSharedValidator":"图片合计不能超过 12 MiB","server":{"reason":"图片合计不能超过 12 MiB","sentToPi":false}}
+# {"observation":"max-load","repetition":2,"sampledPeakRss":1768715712,"piRss":702879704,"decodedBytes":12582912,"maxLineBytes":16778325,"sendMs":2950.638583,"entriesMs":2587.936999999998,"parseMs":74.81045900000026,"driverRssBefore":769598544,"driverRssAfter":1294760248,"driverHeapBefore":365865824,"driverHeapAfter":846906200}
+# {"observation":"limit","name":"single","browserSharedValidator":"单张图片不能超过 4 MiB","server":{"reason":"单张图片不能超过 4 MiB","sentToPi":false}}
+# {"observation":"limit","name":"count","browserSharedValidator":"图片不能超过 10 张","server":{"reason":"图片不能超过 10 张","sentToPi":false}}
+# {"observation":"limit","name":"total","browserSharedValidator":"图片合计不能超过 12 MiB","server":{"reason":"图片合计不能超过 12 MiB","sentToPi":false}}
+# {"observation":"max-load","repetition":3,"sampledPeakRss":1750113760,"piRss":784178144,"decodedBytes":12582912,"maxLineBytes":16778325,"sendMs":3129.4984589999985,"entriesMs":5349.236249999998,"parseMs":109.5570000000007,"driverRssBefore":1283790648,"driverRssAfter":1417450384,"driverHeapBefore":766687608,"driverHeapAfter":1129247392}
+# {"observation":"limit","name":"single","browserSharedValidator":"单张图片不能超过 4 MiB","server":{"reason":"单张图片不能超过 4 MiB","sentToPi":false}}
+# {"observation":"limit","name":"count","browserSharedValidator":"图片不能超过 10 张","server":{"reason":"图片不能超过 10 张","sentToPi":false}}
+# {"observation":"limit","name":"total","browserSharedValidator":"图片合计不能超过 12 MiB","server":{"reason":"图片合计不能超过 12 MiB","sentToPi":false}}
+# {"observation":"cleanup","piPid":49934,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: 图片 14：停止取回两条 steer 的文本，用 nonce 查回原图片草稿，重复三次
+ok 10 - 图片 14：停止取回两条 steer 的文本，用 nonce 查回原图片草稿，重复三次
+  ---
+  duration_ms: 700.571917
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-p5bMvz
+# {"observation":"clear-images","repetition":1,"returnedFields":["steering","followUp"],"imagesInRpc":false,"draftLookupImages":[3,3]}
+# {"observation":"clear-images","repetition":2,"returnedFields":["steering","followUp"],"imagesInRpc":false,"draftLookupImages":[3,3]}
+# {"observation":"clear-images","repetition":3,"returnedFields":["steering","followUp"],"imagesInRpc":false,"draftLookupImages":[3,3]}
+# {"observation":"cleanup","piPid":50073,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: pane \#9：new/resume/fork/clone/reload 连续替换，每次表单/图片/锁和 stale 检查
+ok 11 - pane \#9：new/resume/fork/clone/reload 连续替换，每次表单/图片/锁和 stale 检查
+  ---
+  duration_ms: 1563.380042
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-hqTA7d
+# {"observation":"replacement","repeat":0,"type":"new_session","instance":2,"staleStatus":409,"formInstance":2,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":0,"type":"switch_session","instance":3,"staleStatus":409,"formInstance":3,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":0,"type":"fork","instance":4,"staleStatus":409,"formInstance":4,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":0,"type":"clone","instance":5,"staleStatus":409,"formInstance":5,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":0,"type":"reload","instance":6,"staleStatus":409,"formInstance":6,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":1,"type":"new_session","instance":7,"staleStatus":409,"formInstance":7,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":1,"type":"switch_session","instance":8,"staleStatus":409,"formInstance":8,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":1,"type":"fork","instance":9,"staleStatus":409,"formInstance":9,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":1,"type":"clone","instance":10,"staleStatus":409,"formInstance":10,"peerCredentialUse":200}
+# {"observation":"replacement","repeat":1,"type":"reload","instance":11,"staleStatus":409,"formInstance":11,"peerCredentialUse":200}
+# {"observation":"bridge-scope","factories":11,"child":{"pane":false,"agora":false},"blockedBeforeReady":10,"locks":8,"launches":1}
+# {"observation":"cleanup","piPid":50083,"exit":{"code":143,"signal":null},"retained":false}
+# Subtest: pane \#9：先加载的扩展能看到 ticket；未就绪不发送；stdio input 可往返 JSON
+ok 12 - pane \#9：先加载的扩展能看到 ticket；未就绪不发送；stdio input 可往返 JSON
+  ---
+  duration_ms: 538.984709
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-jcrQi0
+# {"observation":"stdio-and-ticket","earlyPeerTicket":true,"replayStatus":403,"requestMethod":"input","response":{"answers":["A","B"]},"arbitraryRpcEvent":"not implemented by pi"}
+# Subtest: agora \#14：删除扩展位于 first，MCP stdio 与 bash 继承
+ok 13 - agora \#14：删除扩展位于 first，MCP stdio 与 bash 继承
+  ---
+  duration_ms: 696.825166
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-GWOxbH
+# {"observation":"agora-ticket","order":"first","factoryEvents":[{"at":1793856994580,"kind":"agora-delete","visible":true},{"at":1793856994589,"kind":"peer-factory","name":"peer","paneTicket":false,"agoraTicket":false}],"mcp":{"at":1793856994717,"kind":"mcp","pid":50136,"action":"start","agoraTicket":false,"paneTicket":false},"bashTicket":false,"toolDeclared":true}
+# {"observation":"mcp-cleanup","pids":[50136],"remaining":0}
+# Subtest: agora \#14：删除扩展位于 last，MCP stdio 与 bash 继承
+ok 14 - agora \#14：删除扩展位于 last，MCP stdio 与 bash 继承
+  ---
+  duration_ms: 710.522083
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-qlcFlQ
+# {"observation":"agora-ticket","order":"last","factoryEvents":[{"at":1793856995293,"kind":"peer-factory","name":"peer","paneTicket":false,"agoraTicket":true},{"at":1793856995295,"kind":"agora-delete","visible":true}],"mcp":{"at":1793856995424,"kind":"mcp","pid":50151,"action":"start","agoraTicket":false,"paneTicket":false},"bashTicket":false,"toolDeclared":true}
+# {"observation":"mcp-cleanup","pids":[50151],"remaining":0}
+# Subtest: 图片 7：Claude、GPT Sol/Astra、Gemini 的语义识别
+ok 15 - 图片 7：Claude、GPT Sol/Astra、Gemini 的语义识别 # SKIP 需要真模型；本实验只允许假 provider，不发网络请求
+  ---
+  duration_ms: 0.091708
+  type: 'test'
+  ...
+# Subtest: 图片 13：浏览器实际上传/缩放后提示和拒绝
+ok 16 - 图片 13：浏览器实际上传/缩放后提示和拒绝 # SKIP 尚无 pane 浏览器实现；共享校验器和 HTTP 原型已测，实际浏览器交互待测
+  ---
+  duration_ms: 0.024417
+  type: 'test'
+  ...
+# Subtest: Windows / Linux 平台
+ok 17 - Windows / Linux 平台 # SKIP 待测：本机为 macOS
+  ---
+  duration_ms: 0.03175
+  type: 'test'
+  ...
+# Subtest: pane \#9：ticket 已兑换时 bridge 不就绪，任务书未发出，停止自己的 pi
+ok 18 - pane \#9：ticket 已兑换时 bridge 不就绪，任务书未发出，停止自己的 pi
+  ---
+  duration_ms: 580.344333
+  type: 'test'
+  ...
+# fixture: /var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-nvAnwS
+# {"observation":"ticket-rejected","launches":[200,403],"providerRequests":0,"ready":false,"startupExitCode":1}
+1..18
+# tests 18
+# suites 0
+# pass 15
+# fail 0
+# cancelled 0
+# skipped 3
+# todo 0
+# duration_ms 39496.896708
