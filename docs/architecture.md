@@ -189,14 +189,15 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 | 命令 | 必须带 | 冲突（409 `revisionChanged`）后的处理 |
 | --- | --- | --- |
 | 发送（`prompt`/`steer`/`follow_up`） | `expectedEpoch`、`expectedRevision` | 用哪个 RPC 命令取决于用户看到的运行状态。浏览器重新读取状态：会话已开始运行时让用户选择“追加（steer）”“排队（follow-up）”或“取消”；已经停下时询问是否作为新消息发送。草稿保留，不自动重发 |
-| 停止、只停止当前回复 | `expectedEpoch`、`expectedRevision` | 用户看到的那次运行已结束或已在停止时不重复执行，显示当前状态 |
+| 停止 | `expectedEpoch`、`expectedRevision` | 用户看到的那次运行已结束或已在停止时不重复执行，显示当前状态 |
 | 关闭会话 | `expectedEpoch`、`expectedRevision` | 重新显示当前状态和 hold 原因，请用户再次确认 |
 | 切换模型、thinking | `expectedEpoch`、`expectedRevision` | 另一个标签页刚改过时显示新值，由用户决定是否覆盖 |
 | `/compact`、`/new`、`/fork`、`/clone`、`/name`、`/export` | `expectedEpoch`、`expectedRevision` | 重新读取状态后由用户重新发起 |
 | 回应扩展 UI 对话框 | `expectedEpoch` | 以对话框的请求 id 为准，已回应或已超时的返回“已处理” |
 
 服务端在控制队列里串行执行，执行前比较条件，比较和执行之间不会插入其他控制操作。
-- **停止（保留队列）**：会话视图的“停止”按钮行为是**只发 abort**，停止当前正在进行的模型回复。排队的消息（steer、follow-up 及通知）予以保留，在界面“排队中”列表明确展示出来，由用户选择继续发送或清掉。清掉的用户消息放回输入框（草稿），清掉的自定义通知由 agora 按未送达规则重投。这避免了直接 `clear_queue` 导致排队中的自定义通知被 pi 静默丢弃的问题。
+- **停止（取消）**：会话视图的“停止”按钮。服务端进入 `stopping` 状态，先发 `clear_queue`，把返回的 steering 和 follow-up 文本按原顺序放回输入框（放在现有草稿之前，用空行分隔），再发 `abort`。P0 实测证明：只发 `abort` 时排队消息留在队列里、不会自动执行，而且排队的 agora 通知之后会重复落盘，所以 pane 不提供只发 abort 的操作（不提供“只停止当前回复”菜单项）。
+- **队列里的图片**：`clear_queue` 只返回文字。服务端记录每条排队消息的草稿（含图片节点），按文字找回对应草稿后整条放回输入框；带图片的消息文字里有随机标记（见 [image-placeholders.md](image-placeholders.md#做法发送时编码message_end-时还原)），可以唯一对应。
 - **超时**：`abort` 会等会话空闲后才响应。服务端等待 10 秒，超时后显示“停止超时”，提供“强制结束进程”，按 hostkit 的流程终止进程树，会话状态变为 `interrupted`，下次发送时重新拉起。
 - **stopping 期间**：拒绝新的发送（提示“正在停止”），直到收到 `agent_settled` 或进程退出。进入和离开 `stopping` 都会使 `controlRevision` 加 1。
 - 运行结束以 `agent_settled` 为准，不以 `agent_end` 为准：`agent_end` 之后仍可能有重试、压缩恢复或队列消息（依据：pi `docs/json.md`）。
