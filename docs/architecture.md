@@ -18,7 +18,7 @@ pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起
 ## pi 版本与定位
 
 - 支持的 pi 版本：`>=1.5.0 <1.6.0`。本文中“依据”指向的文件以 1.5.0 为准，路径相对于 pi 的包目录。
-- 定位用 hostkit 的 `locatePi`：先看 `~/.pi/pane/config.json` 的 `piPath`（pi 包目录或 `cli.js` 的路径），再看全局 npm 根目录（`npm root -g`）下的 `@earendil-works/pi-coding-agent`。查找顺序、版本检查和 Windows 上调用 `npm` 的方式以 [pi-hostkit 设计文档的“定位 pi”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#定位-pi)为准。
+- 定位用 hostkit 的 `locatePi`：先看 `~/.pi/pane/config.json` 的 `piPath`（pi 包目录或 `cli.js` 的路径），再看 pi 官方安装脚本（`install.sh`、`install.ps1`）的安装目录（默认 `~/.pi/agent/install`，由其中的 `current-version` 指定当前版本），最后看全局 npm 根目录（`npm root -g`）下的 `@earendil-works/pi-coding-agent`。查找顺序、版本检查和 Windows 上调用 `npm` 的方式以 [pi-hostkit 设计文档的“定位 pi”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#定位-pi)为准。
 - 入口是 `package.json` 的 `bin.pi`（1.5.0 中为 `dist/bundle/cli.js`）。版本不在支持范围内或找不到 pi 时，pi-pane 拒绝启动，在终端说明原因和 `piPath` 的用法。
 - pi 1.5.0 要求 Node.js 22.19 及以上（`package.json` 的 `engines`），pi-pane 自己要求 Node.js 24 及以上，用同一个 Node.js（`process.execPath`）运行 pi。
 
