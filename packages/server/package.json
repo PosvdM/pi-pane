@@ -1,0 +1,14 @@
+{
+  "name": "@pi-pane/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./dist/index.js",
+  "bin": {
+    "pi-pane": "./dist/cli.js"
+  },
+  "dependencies": {
+    "@pi-pane/plugin-api": "0.1.0",
+    "@pi-pane/bridge-extension": "0.1.0"
+  }
+}
