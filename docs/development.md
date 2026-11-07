@@ -120,6 +120,8 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 停止判定同时核对覆盖范围、leftovers、快照完整性和写者身份。snapshot cleanup 中的发信号错误（如进程退出竞态中的 EPERM）只在最终 verify 独立确认通过、leftovers 为空时可接受；快照枚举失败、最终复查失败和身份不明仍保留写锁。边界由 stop-report 单元测试和 writer-recovery 集成故障注入固定。恢复报告不完整时保留旧 writer、共享 stopping 记录及内核锁，诊断写入 recovery/ 并阻止自动重试；核查和解除隔离的约束见 [architecture.md 的“会话写锁”](architecture.md#会话写锁)。
 
+固定的 hostkit 版本存在 [#6 路径探测竞态](https://github.com/PosvdM/pi-hostkit/issues/6)：首次落盘可能位于 realpath 的 ENOENT 与 lstat 之间。pane 的 fileKey 只在 ENOTDIR 时立即用 native realpath 复核一次，复核仍失败就拒绝；没有 sleep 或一般错误重试。core 用确定性的文件创建注入覆盖成功复核及持续 ENOTDIR。依赖升级到修复版本后移除该复核。
+
 hostkit #5 尚未关闭：Windows Job 已清空后，独立进程表可能短暂仍见到已退出的后代。测试最多等待两秒确认可见性，不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
 
 M1 没有前端，未验证真实输入框、BroadcastChannel、浏览器设备密钥和持久表单；这些属于 M2/M3。HTML 导出的图片排列仍由 pi 决定。插件接口类型完整导出不表示插件宿主已实现。

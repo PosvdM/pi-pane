@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { realpathSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, writeFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PANE_PROTOCOL, negotiateProtocol } from "../packages/plugin-api/dist/index.js";
 import { SessionModel } from "../packages/server/dist/model.js";
 import { RequestLedger, ControlQueue } from "../packages/server/dist/control.js";
-import { parseSession, readSession, branch } from "../packages/server/dist/store.js";
+import { parseSession, readSession, branch, fileKey } from "../packages/server/dist/store.js";
 import { AssetStore, hashId, imageInfo, MAX_IMAGE_BYTES, MAX_MESSAGE_IMAGES, MAX_MESSAGE_IMAGE_BYTES } from "../packages/server/dist/assets.js";
 import { restoreImages } from "../packages/bridge-extension/dist/images.js";
 import { png, image } from "../experiments/p0/b-bridge/images.mjs";
@@ -223,6 +224,25 @@ test("ControlQueue 串行执行且失败不阻塞后续", async () => {
   await Promise.resolve(); assert.deepEqual(order, ["first:start"]);
   gate.resolve(); assert.equal(await first, 1); await rejection; assert.equal(await third, 3);
   assert.deepEqual(order, ["first:start", "first:end", "second", "third"]);
+});
+
+test("会话首次落盘处于路径探测窗口时复核 realpath，真实非目录仍拒绝", async t => {
+  const { home } = await fixture(t); const file = path.join(home, "materializing.jsonl");
+  const original = realpathSync.native; let injected = false;
+  const mocked = t.mock.method(realpathSync, "native", (target, ...args) => {
+    if (target === file && !injected) {
+      injected = true; writeFileSync(file, "new session");
+      throw Object.assign(new Error("not present at first probe"), { code: "ENOENT" });
+    }
+    return original(target, ...args);
+  });
+  let key;
+  try { key = fileKey(file); } finally { mocked.mock.restore(); }
+  assert.equal(injected, true); assert.equal(key, fileKey(file));
+  const failure = Object.assign(new Error("not a directory"), { code: "ENOTDIR" }); let attempts = 0;
+  const invalid = t.mock.method(realpathSync, "native", () => { attempts++; throw failure; });
+  try { assert.throws(() => fileKey(path.join(file, "child.jsonl")), error => error === failure); assert.equal(attempts, 2); }
+  finally { invalid.mock.restore(); }
 });
 
 for (const version of [1, 2, 3]) test(`parseSession v${version} 内存迁移与截断跳过，不写源文件`, async t => {
