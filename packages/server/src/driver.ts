@@ -160,9 +160,15 @@ class RpcHandle implements DriverHandle {
       throw error;
     }
     if (["prompt", "new_session", "fork", "clone"].includes(command.type) && this.enabled && !this.pendingTarget && this.locks.size > 1) {
-      const state = await this.raw({ type: "get_state" });
-      if (fileKey(state.data.sessionFile) === fileKey(this.current.sessionFile)) {
-        for (const [key, lock] of this.locks) if (lock !== this.current) { await lock.release({ writerSwitchedAway: true }); this.locks.delete(key); }
+      try {
+        const state = await this.raw({ type: "get_state" });
+        if (fileKey(state.data.sessionFile) === fileKey(this.current.sessionFile)) {
+          for (const [key, lock] of this.locks) if (lock !== this.current) { await lock.release({ writerSwitchedAway: true }); this.locks.delete(key); }
+        }
+      } catch (error) {
+        // 控制响应已经确认；清理故障只记录诊断并停止写者，锁在确认进程退出前继续保留。
+        this.callbacks.onRecord({ type: "pane_diagnostic", message: `切换后写锁清理未确认：${String(error)}` });
+        this.fail("切换后写锁清理未确认", error);
       }
     }
     return response;

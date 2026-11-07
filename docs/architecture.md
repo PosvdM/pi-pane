@@ -152,7 +152,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 2. 控制队列等新的 pane-bridge 实例就绪后才恢复（见“会话替换后的重绑定”）。新会话节点变为托管中，进程的事件流更换 epoch；旧文件的写锁按 hostkit 在新会话的 `session_start` 之后释放；旧会话节点变为未托管，保留在树中，可以只读查看。
 3. 正在查看旧会话的标签页收到 `pane_session_replaced`，显示“此会话的进程已切换到 <新会话>”和“打开新会话”按钮，然后转为只读视图。
 
-**切换没有发生**（被扩展取消，没有等到新会话的 `session_start`，且 `get_state` 的 `sessionFile` 仍是旧文件）：服务端释放已取得的目标锁，恢复控制队列。
+**切换没有发生**（被扩展取消，没有等到新会话的 `session_start`，且 `get_state` 的 `sessionFile` 仍是旧文件）：服务端释放已取得的目标锁，恢复控制队列。RPC 已确认的控制结果与这一步清理分别处理；状态查询或释放失败时记录 `pane_diagnostic`，保留尚未释放的锁并停止写者，确认进程退出后才释放。清理故障不覆盖已确认的 RPC 响应，同一 requestId 仍返回真实控制结果。
 
 `reason: "reload"` 不换会话文件，只更换 epoch 并重建模型。
 
