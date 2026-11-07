@@ -5,6 +5,7 @@ export default function(pi) {
   pi.registerCommand("pane-test-hang", { handler: async () => { await new Promise(() => {}); } });
   pi.registerCommand("pane-test-new", { handler: async (_args, ctx) => { await ctx.newSession(); } });
   pi.registerCommand("pane-test-resume", { handler: async (file, ctx) => { await ctx.switchSession(file); } });
+  pi.registerCommand("pane-test-resume-hang", { handler: async (file, ctx) => { await ctx.switchSession(file); await new Promise(() => {}); } });
   pi.registerCommand("pane-test-fork", { handler: async (_args, ctx) => { await ctx.fork(ctx.sessionManager.getLeafId(), { position: "at" }); } });
   pi.registerCommand("pane-test-reload", { handler: async (_args, ctx) => { await ctx.reload(); } });
 }

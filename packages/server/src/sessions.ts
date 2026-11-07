@@ -216,8 +216,9 @@ export class Sessions {
       old.readonly = true; old.readonlyReason = "archived"; old.control("idle", "idle", undefined, true);
       const target = this.files.get(fileKey(state.sessionFile));
       if (target && target !== session) {
-        assert(target.id === state.sessionId && !target.handle, "sessionIdentityConflict", "目标会话身份冲突或已被托管", 409);
-        // 保留目标对象及其模型：订阅退订闭包、clients、holds 和活动时间仍指向同一记录。
+        assert(target.id === state.sessionId && !target.handle && !target.control.busy, "sessionIdentityConflict", "目标会话身份冲突、已被托管或正在处理控制操作", 409);
+        // 保留目标对象及模型；控制队列随写者迁移，切换后仍挂起的 RPC 必须能被目标会话停止。
+        target.control = session.control; session.control = new ControlQueue();
         target.handle = session.handle; session.handle = undefined; session.ui.clear(); session.dirty = false;
         session = target;
       } else {

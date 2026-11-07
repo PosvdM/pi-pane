@@ -148,7 +148,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 **切换成功后**（收到新会话的 `session_start`，带 `previousSessionFile`）：
 
-1. 服务端调用 `get_state` 取新的 `sessionId` 和 `sessionFile`，再用 `get_entries` 重建会话模型。目标已只读打开时，复用目标记录和模型，向已有订阅发 `resync`，保留订阅、客户端计数、保活及活动时间；进程事件与退出回调迁移到该目标记录。
+1. 服务端调用 `get_state` 取新的 `sessionId` 和 `sessionFile`，再用 `get_entries` 重建会话模型。目标已只读打开时，复用目标记录和模型，向已有订阅发 `resync`，保留订阅、客户端计数、保活及活动时间；进程事件、退出回调及活动控制队列随写者迁移到该目标记录，旧会话使用空队列。目标本身正在处理控制操作时拒绝重绑定并停止切换写者，避免两条控制队列并行驱动同一进程。
 2. 控制队列等新的 pane-bridge 实例就绪后才恢复（见“会话替换后的重绑定”）。新会话节点变为托管中，进程的事件流更换 epoch；旧文件的写锁按 hostkit 在新会话的 `session_start` 之后释放；旧会话节点变为未托管，保留在树中，可以只读查看。
 3. 正在查看旧会话的标签页收到 `pane_session_replaced`，显示“此会话的进程已切换到 <新会话>”和“打开新会话”按钮，然后转为只读视图。
 
@@ -211,7 +211,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 - **准入上限**：每会话最多排队 64 项，超过时返回 HTTP 429 `controlQueueLimit`；停止优先通道不占普通队列。全服务最多保留 256 项未完成的普通请求，停止类请求另保留 16 项额度，超过时返回 HTTP 429 `pendingLimit`。达到上限不删除已有 pending 幂等记录，同 requestId 的查询和结果重放仍可使用。停止期间的新操作返回 `controlStopping`。
 - **停止（取消）**：会话视图的“停止”按钮。服务端进入 `stopping` 状态，先发 `clear_queue`，把返回的 steering 和 follow-up 文本按原顺序放回输入框（放在现有草稿之前，用空行分隔），再发 `abort`。P0 实测证明：只发 `abort` 时排队消息留在队列里、不会自动执行，而且排队的 agora 通知之后会重复落盘，所以 pane 不提供只发 abort 的操作（不提供“只停止当前回复”菜单项）。
 - **队列里的图片**：`clear_queue` 只返回文字。服务端记录每条排队消息的草稿（含图片节点），按文字找回对应草稿后整条放回输入框；带图片的消息文字里有随机标记（见 [image-placeholders.md](image-placeholders.md#做法发送时编码message_end-时还原)），可以唯一对应。
-- **超时与抢占**：`abort` 会等会话空闲后才响应。服务端默认等待 10 秒，超时后自动按 hostkit 流程终止进程树。抢占活动控制操作时，即使 `abort` 返回，也停止进程，以结束可能仍挂起的扩展命令及全部 RPC 等待项；停止报告与进程身份复查完成后才释放写锁。
+- **超时与抢占**：`abort` 会等会话空闲后才响应。服务端默认等待 10 秒，超时后自动按 hostkit 流程终止进程树。抢占活动控制操作时，即使 `abort` 返回，也停止进程，以结束可能仍挂起的扩展命令及全部 RPC 等待项；停止报告与进程身份复查完成后才释放写锁。已进入桥接事件的目标取锁若在停止后才返回，不登记新的 running writer，等待该停止确认后释放迟到锁；清理无法确认时保留锁并记录诊断。
 - **stopping 期间**：拒绝新的发送（提示“正在停止”），直到收到 `agent_settled` 或进程退出。进入和离开 `stopping` 都会使 `controlRevision` 加 1。
 - 控制操作受理时递增 `controlRevision`，不因此把阶段推测为 `streaming`。运行阶段由 `agent_start`、工具、压缩等实际事件更新；扩展命令或输入处理器返回 `disposition: "handled"`、prompt 预检被拒绝时，空闲会话仍为空闲。手动压缩的 `compaction_end.reason = "manual"` 表示原回合已中止且不会继续生成，无论成功、扩展取消或 provider 失败均回到空闲，不依赖成功 RPC 响应或后续 `agent_settled`。自动压缩仍保持生成阶段，等待实际 `agent_settled`；手动压缩成功响应后另外用 `get_state` 核对状态。已确认成功的控制响应不会因后续快照查询失败而改记为失败。
 - 运行结束以 `agent_settled` 为准，不以 `agent_end` 为准：`agent_end` 之后仍可能有重试、压缩恢复或队列消息（依据：pi `docs/json.md`）。

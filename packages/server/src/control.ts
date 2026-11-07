@@ -31,6 +31,7 @@ export class ControlQueue {
   private waiting: { action: (signal: AbortSignal) => Promise<any>; resolve: (value: any) => void; reject: (error: unknown) => void }[] = [];
   private active?: AbortController; private priorityActive = false;
   constructor(private readonly maxQueued = 64) {}
+  get busy(): boolean { return this.active !== undefined || this.priorityActive || this.waiting.length > 0; }
   run<T>(action: (signal: AbortSignal) => Promise<T>, priority = false): Promise<T> {
     if (priority) {
       assert(!this.priorityActive, "controlStopping", "停止操作正在执行", 409);

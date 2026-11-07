@@ -91,8 +91,14 @@ class RpcHandle implements DriverHandle {
   private async target(file: string): Promise<boolean> {
     const key = fileKey(file); if (this.locks.has(key)) return true;
     const lock = await acquireRecoveredWriter(file, this.options.home, this.options.instanceId, this.options.stopOptions, this.acquireWriter);
-    // 保留每个已取得的目标锁，直到 session_start 确认切走或写者停止。
+    // 取锁可能晚于停止返回；迟到锁不登记 writer，仍须在停止确认后清理。
     this.locks.set(key, lock);
+    if (this.stopping) {
+      try { await this.stop(); await lock.release(); this.locks.delete(key); }
+      catch (error) { this.callbacks.onRecord({ type: "pane_diagnostic", message: `迟到目标锁清理未确认：${String(error)}` }); throw error; }
+      throw new PaneError("bridgeStopping", "会话正在停止，目标写锁已释放", 409);
+    }
+    // 保留每个已取得的目标锁，直到 session_start 确认切走或写者停止。
     await lock.update({ writer: this.identity, state: "running" }); return true;
   }
   async bridgeEvent(event: any): Promise<any> {
