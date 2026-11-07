@@ -1,12 +1,13 @@
 import { appendFileSync, existsSync } from "node:fs";
 import { probeSessionWriterLock, isSameProcess } from "pi-hostkit";
+import { auditStdin } from "./stdin-audit.mjs";
 const globalKey = Symbol.for("pane-test.bridge-fault");
 export default async function(pi) {
   const mode = process.env.PANE_TEST_FAULT;
   const log = value => appendFileSync(process.env.PANE_TEST_FAULT_LOG, JSON.stringify(value) + "\n");
   if (!globalThis[Symbol.for("pane-test.stdin-audit")]) {
     globalThis[Symbol.for("pane-test.stdin-audit")] = true;
-    process.stdin.on("data", chunk => { for (const line of chunk.toString().split("\n")) { try { log({ rpcInput: JSON.parse(line).type, at: Date.now() }); } catch {} } });
+    auditStdin(process.stdin, command => log({ rpcInput: command.type, at: Date.now() }));
   }
   const ticket = process.env.PANE_BRIDGE_TICKET;
   if (mode === "bad-ticket" && ticket) process.env.PANE_BRIDGE_TICKET = "invalid";
