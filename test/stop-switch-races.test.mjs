@@ -257,6 +257,59 @@ test("只读文件读取迟到于启动、切换和停止，不把旧文件提�
   } finally { gate.resolve(); t.mock.restoreAll(); syncBuiltinESMExports(); await server.close(); await f.cleanup(); }
 });
 
+for (const close of [false, true]) test(`只读打开的 stat 迟到于${close ? "服务关闭，不登记新会话" : "同路径另一请求启动，不覆盖托管记录"}`, { timeout: 30000 }, async (t) => {
+  const { f, server, token } = await setup(); const gate = deferred(); let opening; let hosted;
+  try {
+    const file = f.sessionPath("late-open");
+    await writeFile(file, JSON.stringify({ type: "session", version: 3, id: "late-open", cwd: f.cwd, timestamp: new Date().toISOString() }) + "\n");
+    await utimes(file, new Date(0), new Date(0));
+    const readStat = fs.stat; const entered = deferred(); let injected = false;
+    t.mock.method(fs, "stat", async (...args) => {
+      const value = await readStat(...args);
+      if (!injected && typeof args[0] === "string" && fileKey(args[0]) === fileKey(file)) { injected = true; entered.resolve(); await gate.promise; }
+      return value;
+    });
+    syncBuiltinESMExports(); opening = server.sessions.open({ cwd: f.cwd, sessionFile: file }); await entered.promise;
+    if (close) {
+      await server.sessions.close(); gate.resolve();
+      await assert.rejects(opening, { code: "serverStopping" });
+      assert.equal(server.sessions.records.has("late-open"), false);
+    } else {
+      const other = await open(server, token, f, { sessionFile: file });
+      const route = "/api/sessions/late-open/control";
+      const started = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: other.cursor.epoch, expectedRevision: other.controlRevision, command: { type: "prompt", message: "保留已登记的托管写者" } });
+      assert.equal(started.code, 200, JSON.stringify(started)); hosted = server.sessions.records.get("late-open"); const handle = hosted.handle;
+      assert.ok(handle?.acceptingInput); gate.resolve(); const late = await opening;
+      assert.ok(server.sessions.records.get("late-open") === hosted, "迟到 open 不得覆盖已托管记录");
+      assert.equal(server.sessions.files.get(fileKey(file)).handle, handle); assert.equal(late.readonly, false);
+    }
+  } finally {
+    gate.resolve(); await opening?.catch(() => {}); t.mock.restoreAll(); syncBuiltinESMExports();
+    if (hosted?.handle) await hosted.handle.stop(); await server.close(); await f.cleanup();
+  }
+});
+
+test("服务关闭正在等待较早记录时，后续写者不能重绑定到已关闭目标而漏停", { timeout: 30000 }, async () => {
+  const { f, target, server, token, a, b } = await setup(); const gate = deferred(); let closing; let handle;
+  try {
+    const initialB = await snapshot(server, token, b.ref.id);
+    const hostedB = await final(server, token, "/api/sessions/" + b.ref.id + "/control", { requestId: randomUUID(), expectedEpoch: initialB.cursor.epoch, expectedRevision: initialB.controlRevision, command: { type: "prompt", message: "先托管目标" } });
+    assert.equal(hostedB.code, 200, JSON.stringify(hostedB));
+    const destination = server.sessions.records.get(b.ref.id); const first = destination.handle;
+    const stop = first.stop.bind(first); const entered = deferred();
+    first.stop = async () => { const report = await stop(); entered.resolve(); await gate.promise; return report; };
+    const source = server.sessions.records.get(a.ref.id); handle = source.handle;
+    closing = server.sessions.close(); await entered.promise;
+    assert.equal(destination.closed, true); assert.equal(destination.handle, undefined); assert.equal(source.closed, false);
+    const response = await handle.send({ type: "prompt", message: "/pane-test-resume " + target }); assert.equal(response.success, true);
+    await until(() => fileKey(handle.sessionFile) === fileKey(target) && handle.acceptingInput);
+    assert.ok(destination.handle === undefined, "关闭遍历已经经过的目标不能接收迟到写者");
+    assert.equal(source.handle, handle);
+    gate.resolve(); await closing; await handle.exited;
+    assert.equal(await isSameProcess(handle.identity), "gone");
+  } finally { gate.resolve(); await closing; if (handle) await handle.stop(); await server.close(); await f.cleanup(); }
+});
+
 test("停止完成后目标取锁才返回，不登记运行写者并释放迟到锁", { timeout: 30000 }, async () => {
   const { f, target, server, token, a } = await setup(); const gate = deferred();
   try {

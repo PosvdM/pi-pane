@@ -29,7 +29,7 @@ export class Sessions {
   private state: Record<string, unknown> = {};
   private stateQueue = new ControlQueue();
   private recoveredFiles = new Set<string>();
-  private recovering = true; readonly reports: StopReport[] = [];
+  private recovering = true; private closing = false; readonly reports: StopReport[] = [];
   constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
     private readonly emitUi: (sessionId: string, request: any) => void) {
     this.ledger = new RequestLedger(Date.now, duration(options.rpcTimeoutMs, 30000));
@@ -63,6 +63,7 @@ export class Sessions {
   private record(id: string): HostedSession { const session = this.records.get(id); assert(session, "sessionMissing", "会话不存在", 404); return session; }
   async open(input: { cwd: string; sessionFile?: string; fork?: boolean }): Promise<any> {
     assert(!this.recovering, "recovering", "旧进程尚未完成恢复", 503);
+    assert(!this.closing, "serverStopping", "服务端正在关闭", 503);
     assert(typeof input.cwd === "string" && path.isAbsolute(input.cwd), "invalidCwd", "项目目录必须为绝对路径");
     const cwd = await import("node:fs/promises").then((fs) => fs.realpath(input.cwd));
     this.projects.add(cwd);
@@ -77,12 +78,16 @@ export class Sessions {
     if (input.fork) file = await this.store.fork(file, cwd, directory);
     const known = this.files.get(fileKey(file)); if (known) return this.view(known);
     const parsed = await readSession(file); const id = parsed.header?.id ?? randomUUID();
-    assert(typeof id === "string" && !this.records.has(id), "sessionIdentityConflict", "另一个文件使用了相同的会话标识", 409);
+    assert(typeof id === "string", "sessionIdentityConflict", "会话标识无效", 409);
     const model = new SessionModel({ source: "pane", id }, this.assets); model.reset(parsed.entries, parsed.leafId);
     const busy = await probeSessionWriterLock(file); model.readonlyReason = busy.held ? "externalWriter" : "archived";
     let recentExternal = false;
     try { recentExternal = !input.fork && !this.recoveredFiles.has(fileKey(file)) && Date.now() - (await stat(file)).mtimeMs < 60000; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    // 文件读取和锁探测期间，其他请求可能已打开或托管此路径；登记前重新核对归属。
+    assert(!this.closing, "serverStopping", "服务端正在关闭", 503);
+    const existing = this.files.get(fileKey(file)); if (existing) return this.view(existing);
+    assert(!this.records.has(id), "sessionIdentityConflict", "另一个文件使用了相同的会话标识", 409);
     const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), clients: 0, lastActive: Date.now(), holds: new Map(), ui: new Map(), recentExternal, closed: false };
     this.records.set(id, session); this.files.set(fileKey(file), session);
     this.watch(file);
@@ -180,14 +185,14 @@ export class Sessions {
     await this.trust.request(session.cwd);
     signal?.throwIfAborted();
     const sessionDir = await this.store.sessionDir(session.cwd);
-    signal?.throwIfAborted(); assert(!session.closed, "interrupted", "会话已关闭", 409);
+    signal?.throwIfAborted(); assert(!this.closing && !session.closed, "interrupted", "会话已关闭", 409);
     const owner = Symbol(); session.owner = owner;
     let attached = session; let handle: DriverHandle | undefined;
     try {
       handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir, decisions: this.trust.config(), assumeNoWriter }, {
         onRecord: (event) => { if (attached.owner === owner && !attached.closed) this.receive(attached, event); },
         onReady: (state, data, reason, source) => {
-          if (attached.owner !== owner || attached.closed || attached.handle && attached.handle !== source) return;
+          if (this.closing || attached.owner !== owner || attached.closed || attached.handle && attached.handle !== source) return;
           // bridge 就绪可能先于 start 返回；回调携带来源 handle，绑定不能读取另一代的写者。
           attached.handle = source; attached = this.rebind(attached, source, state, data, reason);
         },
@@ -204,7 +209,7 @@ export class Sessions {
         },
       });
       // 启动跨越取锁、spawn 和 bridge 就绪；停止抢占后，迟到的 handle 必须先结束，不能再发送输入。
-      if (attached.owner !== owner || attached.closed) { await handle.stop(); await handle.ready; throw new PaneError("interrupted", "会话已关闭", 409); }
+      if (this.closing || attached.owner !== owner || attached.closed) { await handle.stop(); await handle.ready; throw new PaneError("interrupted", "会话已关闭", 409); }
       attached.handle = handle;
       const startedHandle = handle;
       const cancel = () => { void startedHandle.stop().catch(() => {}); };
@@ -213,7 +218,7 @@ export class Sessions {
         if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
         await handle.ready;
         if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
-        assert(attached.owner === owner && attached.handle === handle && !attached.closed, "interrupted", "会话写者已停止或更换", 409);
+        assert(!this.closing && attached.owner === owner && attached.handle === handle && !attached.closed, "interrupted", "会话写者已停止或更换", 409);
       } finally { signal?.removeEventListener("abort", cancel); }
     } catch (error) {
       // ready 可以先于停止流程失败；对外返回启动失败前，等待身份复查和写锁处理完成。
@@ -298,7 +303,7 @@ export class Sessions {
     for (const session of this.records.values()) if (session.handle && session.model.status === "idle" && !session.clients && !session.holds.size && !session.ui.size && Date.now() - session.lastActive >= (this.options.idleReclaimMs ?? 1800000)) await this.stop(session, true);
   }
   async close(): Promise<void> {
-    clearInterval(this.timer); this.trust.close(); const errors: unknown[] = [];
+    this.closing = true; clearInterval(this.timer); this.trust.close(); const errors: unknown[] = [];
     for (const session of this.records.values()) {
       session.closed = true; unwatchFile(session.file);
       if (session.handle) try { await session.handle.stop(); } catch (error) { errors.push(error); }
