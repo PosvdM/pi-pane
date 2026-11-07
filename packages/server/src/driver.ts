@@ -108,7 +108,11 @@ class RpcHandle implements DriverHandle {
   }
   private target(file: string): Promise<boolean> {
     const operation = this.acquireTarget(file); this.targets.add(operation);
-    void operation.then(() => this.targets.delete(operation), () => this.targets.delete(operation));
+    void operation.then(() => this.targets.delete(operation), (error) => {
+      this.targets.delete(operation);
+      // 关闭期间恢复失败可能留下隔离锁；不能把失败当作已排空并释放实例锁。
+      if (this.stopping && !(error instanceof PaneError && ["bridgeStopping", "externalWriter"].includes(error.code))) this.cleanupErrors.push(error);
+    });
     return operation;
   }
   private async acquireTarget(file: string): Promise<boolean> {

@@ -113,6 +113,28 @@ for (const reason of ["resume", "reload", "exited-resume"]) test(`关闭排空 $
   } finally { gate.resolve(); await switching; await closing; await server.close(); await f.cleanup(); }
 });
 
+test("关闭期间目标恢复失败时保留隔离锁及实例锁，不报告排空成功", { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); const gate = deferred(); const entered = deferred();
+  let switching; let closing; let lock; let handle;
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
+    await server.sessions.start(source); handle = source.handle;
+    const target = f.sessionPath("failed-target"); const acquire = handle.acquireWriter;
+    handle.acquireWriter = async (...args) => {
+      lock = await acquire(...args); const recover = lock.recoverPreviousWriter.bind(lock);
+      lock.recoverPreviousWriter = async (...args) => { await recover(...args); entered.resolve(); await gate.promise; throw new Error("注入目标恢复未确认"); };
+      return lock;
+    };
+    switching = handle.bridgeEvent({ type: "shutdown", reason: "resume", target }); await entered.promise;
+    let released = false; const release = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { released = true; await release(); };
+    closing = server.close(); const failed = assert.rejects(closing, AggregateError);
+    await handle.exited; gate.resolve(); await switching; await failed;
+    assert.equal(released, false); assert.equal((await probeSessionWriterLock(target)).held, true);
+    assert.equal(await isSameProcess(handle.identity), "gone");
+  } finally { gate.resolve(); await switching; await closing?.catch(() => {}); if (handle) await handle.stop(); if (lock) await lock.release(); await server.lock.release(); await f.cleanup(); }
+});
+
 test("关闭等待 reload 的在途初始化排空，不允许迟到 ready 恢复输入", { timeout: 30000 }, async () => {
   const f = await piFixture(); const server = await startServer(f); const gate = deferred(); const entered = deferred(); let closing; let handle;
   try {
