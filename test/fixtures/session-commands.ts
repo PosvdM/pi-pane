@@ -1,5 +1,6 @@
 export default function(pi) {
   pi.on("input", (event) => event.text === "pane-test-handled-input" ? { action: "handled" } : undefined);
+  pi.on("session_before_compact", (event) => event.customInstructions === "pane-test-cancel" ? { cancel: true } : undefined);
   pi.registerCommand("pane-test-wait", { handler: async (args) => { await new Promise(resolve => setTimeout(resolve, Number(args) || 1000)); } });
   pi.registerCommand("pane-test-hang", { handler: async () => { await new Promise(() => {}); } });
   pi.registerCommand("pane-test-new", { handler: async (_args, ctx) => { await ctx.newSession(); } });

@@ -213,7 +213,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 - **队列里的图片**：`clear_queue` 只返回文字。服务端记录每条排队消息的草稿（含图片节点），按文字找回对应草稿后整条放回输入框；带图片的消息文字里有随机标记（见 [image-placeholders.md](image-placeholders.md#做法发送时编码message_end-时还原)），可以唯一对应。
 - **超时与抢占**：`abort` 会等会话空闲后才响应。服务端默认等待 10 秒，超时后自动按 hostkit 流程终止进程树。抢占活动控制操作时，即使 `abort` 返回，也停止进程，以结束可能仍挂起的扩展命令及全部 RPC 等待项；停止报告与进程身份复查完成后才释放写锁。
 - **stopping 期间**：拒绝新的发送（提示“正在停止”），直到收到 `agent_settled` 或进程退出。进入和离开 `stopping` 都会使 `controlRevision` 加 1。
-- 控制操作受理时递增 `controlRevision`，不因此把阶段推测为 `streaming`。运行阶段由 `agent_start`、工具、压缩等实际事件更新；扩展命令或输入处理器返回 `disposition: "handled"`、prompt 预检被拒绝时，空闲会话仍为空闲。手动压缩响应后用 `get_state` 核对是否回到空闲；已确认成功的控制响应不会因后续快照查询失败而改记为失败。
+- 控制操作受理时递增 `controlRevision`，不因此把阶段推测为 `streaming`。运行阶段由 `agent_start`、工具、压缩等实际事件更新；扩展命令或输入处理器返回 `disposition: "handled"`、prompt 预检被拒绝时，空闲会话仍为空闲。手动压缩的 `compaction_end.reason = "manual"` 表示原回合已中止且不会继续生成，无论成功、扩展取消或 provider 失败均回到空闲，不依赖成功 RPC 响应或后续 `agent_settled`。自动压缩仍保持生成阶段，等待实际 `agent_settled`；手动压缩成功响应后另外用 `get_state` 核对状态。已确认成功的控制响应不会因后续快照查询失败而改记为失败。
 - 运行结束以 `agent_settled` 为准，不以 `agent_end` 为准：`agent_end` 之后仍可能有重试、压缩恢复或队列消息（依据：pi `docs/json.md`）。
 
 ### 关闭与回收

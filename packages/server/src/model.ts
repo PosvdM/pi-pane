@@ -40,7 +40,11 @@ export class SessionModel {
       case "agent_start": this.control("running", "streaming"); break;
       case "agent_settled": this.control("idle", "idle"); this.inFlight.tools = []; break;
       case "compaction_start": this.control("running", "compacting"); break;
-      case "compaction_end": this.control("running", "streaming"); break;
+      case "compaction_end":
+        // 手动压缩先中止原回合，成功、取消和失败均不会继续生成；自动压缩仍由 agent_settled 收尾。
+        if (event.reason === "manual") this.control("idle", "idle");
+        else this.control("running", "streaming");
+        break;
       case "auto_retry_start": this.inFlight.retry = { attempt: event.attempt, maxAttempts: event.maxAttempts, delayMs: event.delayMs, errorMessage: event.errorMessage }; this.control("running", "retrying"); break;
       case "auto_retry_end": this.inFlight.retry = undefined; break;
       case "message_start":
