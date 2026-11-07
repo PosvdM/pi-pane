@@ -222,27 +222,33 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 - 用户在界面上关闭会话：按“停止”的顺序先 `clear_queue` 再 `abort`（清出的文本存入该会话的浏览器草稿），等运行结束后关闭 stdin，宽限 5 秒后按 hostkit 的流程终止进程树，释放写锁。会话文件不受影响。
 - 空闲回收：会话已 settled、没有待回应的扩展 UI 对话框、没有浏览器连接、没有插件 hold，持续 30 分钟后按上一条停止子进程（`mainIdleReclaimMs`，默认 1800000）。再次打开时只读显示，发送时重新拉起。
 - 插件 hold：被 hold 的会话不做空闲回收，树节点和会话视图底部显示原因（如“等待子代理”）；用户主动关闭时先列出原因请用户确认。接口见 [plugin-api.md](plugin-api.md#保活)。
-- pi-pane 退出时先设置关闭门禁，再按同样顺序关闭所有托管会话。关闭期间拒绝打开会话，未完成的打开请求也在登记前复查；就绪回调不能把写者迁入关闭遍历已经经过的记录。pi-pane 被强杀时子进程的清理由 hostkit 负责。
+- pi-pane 退出时先设置关闭门禁，再按同样顺序关闭所有托管会话。关闭期间拒绝打开会话，未完成的打开请求也在登记前复查；就绪回调不能把写者迁入关闭遍历已经经过的记录。首次发送和 restart 在信任询问及目录读取之前登记在途启动，关闭取消并等待其清理。driver 在取锁及恢复结束后检查取消，取消时释放锁且不 spawn；spawn 已开始时，创建 handle 后立即交给会话管理器，停止无需等待首次持久化或就绪。
+- 服务关闭在进程停止后另外排空在途目标取锁及初始化，包括退出回调已经摘下 handle 的写者；目标锁在停止确认后释放。单个 handle 的 stop 不等待整个初始化，避免与目标锁清理形成循环等待。全部启动和写者排空后才关闭 HTTP、释放实例锁；清理未确认时关闭返回失败并保留实例锁。并发关闭调用等待同一结果。pi-pane 被强杀时子进程的清理由 hostkit 负责。
 
 ### 会话驱动接口
 
-```ts
-// 草案，P0 后冻结
-interface SessionDriver {
-  start(spec: {
-    cwd: string;
-    sessionFile: string;           // 已有会话，或预先分配的新路径；调用前已持有写锁
-    extraExtensions: string[];
-    env?: Record<string, string>;
-  }): Promise<DriverHandle>;
-}
+实现位于 `packages/server/src/driver.ts`。`DriverSpec` 包含 cwd、sessionFile、sessionDir、信任决定和可选 assumeNoWriter；driver 负责取得并恢复写锁。扩展、环境和停止期限由 DriverOptions 配置。
 
+```ts
+interface SessionDriver {
+  start(spec: DriverSpec, callbacks: DriverCallbacks, signal?: AbortSignal): Promise<DriverHandle>;
+}
+interface DriverCallbacks {
+  onHandle?(handle: DriverHandle): void; // 创建后、首次持久化前交付。
+  onRecord(event: any): void;
+  onReady(state: any, entries: any, reason: string, handle: DriverHandle): void;
+  onExit(reason: string, report?: StopReport, error?: unknown): void;
+}
 interface DriverHandle {
-  readonly identity: ProcessIdentity;      // 来自 hostkit：PID + 创建时间等
-  send(cmd: RpcCommand, opts?: { timeoutMs?: number }): Promise<RpcResponse>;
-  onRecord(listener: (rec: RpcEvent | ExtensionUiRequest) => void): () => void;  // 按 stdout 顺序
+  readonly identity: ProcessIdentity;
+  readonly ready: Promise<void>;
+  readonly exited: Promise<void>;
+  readonly sessionFile: string;
+  readonly acceptingInput: boolean;
+  send(cmd: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse>;
   respondUi(res: ExtensionUiResponse): void;
-  stop(opts: { graceMs: number }): Promise<ExitInfo>;
+  stop(): Promise<StopReport>;
+  drain(): Promise<void>; // stop 完成后等待在途目标取锁及初始化。
 }
 ```
 
@@ -280,6 +286,7 @@ type ServerMessage =
 - 收到 `message_end`、`entry_appended`、`compaction_end`、`session_info_changed`、`agent_settled`，以及 `fork`、`compact` 等改变条目的命令响应后，服务端调用 `get_entries` 并带上已知最后一个条目 id 作为 `since`，把新条目作为 `pane_entries` 事件发出。返回的 `leafId` 不在已知叶子的后代上时，说明活动分支变了，服务端重建模型并发 `resync`。
 - `message_end` 在 pi 写入会话文件之前发出（依据：`dist/core/agent-session.js` 第 760–779 行），这段时间里消息放在 `inFlight.completed`，等 `pane_entries` 到达后替换。
 - 用户聊天视图（② 投影）由模型从叶子沿父链算出；会话视图不用 `get_messages`。三种投影的定义见 [plugin-api.md](plugin-api.md#三种投影)。
+- 重绑定为旧文件复制只读记录时清空 syncing、重置 dirty；旧记录重新托管后独立发起条目同步，不复用迁走对象的同步 Promise。
 
 ### 快照与切点
 
