@@ -477,9 +477,11 @@ export interface BannerState extends PaneBanner {
 export interface ExtensionUiRequest { type: "extension_ui_request"; id: string; method: string; [key: string]: unknown }
 export const PANE_PROTOCOL = 1;
 export function negotiateProtocol(peer: readonly [number, number], supported: readonly [number, number] = [1, 1]): number {
-  if (!peer.every(Number.isSafeInteger) || peer[0] < 1 || peer[0] > peer[1]) throw new Error("协议版本范围无效");
+  for (const range of [peer, supported]) {
+    if (!Array.isArray(range) || range.length !== 2 || !Number.isSafeInteger(range[0]) || !Number.isSafeInteger(range[1]) || range[0] < 1 || range[0] > range[1]) throw new Error("协议版本范围无效");
+  }
   const version = Math.min(peer[1], supported[1]);
-  if (version < Math.max(peer[0], supported[0])) throw new Error("pane 协议版本不兼容");
+  if (!Number.isSafeInteger(version) || version < Math.max(peer[0], supported[0])) throw new Error("pane 协议版本不兼容");
   return version;
 }
 export type DraftNode = { type: "text"; text: string } | { type: "image"; assetId: string };

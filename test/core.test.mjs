@@ -40,9 +40,10 @@ test("pane 协商选择交集最高版本并拒绝不兼容范围", () => {
   assert.equal(negotiateProtocol([1, 9]), 1);
   assert.equal(negotiateProtocol([2, 5], [1, 3]), 3);
   assert.equal(negotiateProtocol([3, 3], [3, 8]), 3);
-  for (const range of [[0, 1], [2, 1], [-1, 4], [1.5, 2], [1, Infinity], [NaN, 1], [1, Number.MAX_SAFE_INTEGER + 1]]) {
+  for (const range of [[], [2], [1, 1, 1], null, "1,1", {}, new Array(2), [0, 1], [2, 1], [-1, 4], [1.5, 2], [1, Infinity], [NaN, 1], [1, Number.MAX_SAFE_INTEGER + 1]]) {
     assert.throws(() => negotiateProtocol(range), /范围无效/);
   }
+  for (const range of [[], [1], [1, 1, 2], [1, NaN], [0, 1]]) assert.throws(() => negotiateProtocol([1, 1], range), /范围无效/);
   assert.throws(() => negotiateProtocol([2, 3]), /不兼容/);
   assert.throws(() => negotiateProtocol([1, 2], [3, 5]), /不兼容/);
 });

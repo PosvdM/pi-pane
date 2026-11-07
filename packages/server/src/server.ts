@@ -179,9 +179,9 @@ export class PaneServer {
         assert(!binary, "invalidFrame", "只接受 JSON 文本帧"); const message = JSON.parse(raw.toString());
         if (client.state === "pending") {
           assert(message.type === "auth" && typeof message.ticket === "string", "invalidFirstFrame", "第一帧必须是 ticket 鉴权");
-          const credential = this.auth.redeemTicket(message.ticket); negotiateProtocol(message.paneProtocol ?? [1, 1]);
+          const credential = this.auth.redeemTicket(message.ticket); const paneProtocol = negotiateProtocol(message.paneProtocol === undefined ? [1, 1] : message.paneProtocol);
           client.credential = credential; client.state = "authed"; clearTimeout(timeout);
-          this.push(client, { type: "banners", banners: [], paneProtocol: 1, connectionId: client.id }); return;
+          this.push(client, { type: "banners", banners: [], paneProtocol, connectionId: client.id }); return;
         }
         assert(this.auth.useCredential(client.credential!), "unauthorized", "凭证已失效");
         if (message.type === "subscribe") {
