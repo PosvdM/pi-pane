@@ -31,7 +31,7 @@
 | `packages/server/src/trust.ts` | 启动前及进程内切换时的信任预判与询问 |
 | `packages/bridge-extension/src/` | 会话替换和写锁回报、信任决定、就绪握手、图片顺序还原 |
 
-不建立 `packages/web`。多题表单通道保留事件名称，但返回明确的不可用结果；完整适配在 M2 联调。设备签名和插件运行时不在 M1。
+不建立 `packages/web`。多题表单通道保留事件名称和 BridgeFormOutcome 类型，未启用时返回协议已有的 aborted；完整适配在 M2 联调。设备签名和插件运行时不在 M1。
 
 ## M1 HTTP 接口
 

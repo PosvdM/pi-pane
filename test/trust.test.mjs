@@ -4,7 +4,8 @@ import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { piFixture, until, providerPath } from "./fixtures/helpers.mjs";
+import { probeSessionWriterLock, isSameProcess } from "pi-hostkit";
+import { piFixture, until, providerPath, delay } from "./fixtures/helpers.mjs";
 import { startServer, pair, open, control, snapshot, request } from "./fixtures/client.mjs";
 import { connect } from "./fixtures/ws-client.mjs";
 import { TrustDecisions } from "../packages/server/dist/trust.js";
@@ -48,6 +49,8 @@ test("进程内 resume 到新项目时及时询问信任，回连实例复用并
   const id = first.value.snapshot.ref.id; await until(async () => (await snapshot(server, token, id)).status === "idle"); const state = await snapshot(server, token, id); connection.subscribe(state);
    const switching = control(server, token, state, { type: "prompt", message: "/pane-test-resume " + target });
   const prompt = await until(() => connection.messages.find(m => m.type === "project_trust")); assert.equal(path.resolve(prompt.request.cwd), path.resolve(cwd));
+  // 用户等待超过默认十秒的 bridge 就绪时间时，信任弹窗仍须有效，不能提前终止写者。
+  await delay(11000); const held = await probeSessionWriterLock(state.sessionFile); assert.equal(held.held, true); assert.equal(await isSameProcess(held.record.writer), "alive");
   await request(server, token, "/api/trust/" + prompt.request.id, { requestId: randomUUID(), decision: { trusted: false, remember: false } });
   const result = await switching; assert.equal(result.code, 200, JSON.stringify(result));
   const after = await until(async () => { const s = await snapshot(server, token, "other"); return s.ref && !s.readonly && s; }); assert.equal(after.projectTrusted, false);

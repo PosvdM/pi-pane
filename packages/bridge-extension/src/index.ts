@@ -50,8 +50,8 @@ export default async function bridge(pi: ExtensionApi): Promise<void> {
   pi.on("session_start", async (event, ctx) => {
     if (!start) {
       unsubscribe.push(pi.events.on("pane:form:request", (data) => {
-        // 多题表单由 M2 接入；通道保留明确的不可用结果，不能默认为用户取消。
-        pi.events.emit("pane:form:response", { requestId: data.requestId, outcome: { status: "unsupported" } });
+        // 多题表单由 M2 接入；未启用的通道以 aborted 结束，不能伪造用户取消。
+        pi.events.emit("pane:form:response", { requestId: data.requestId, outcome: { status: "aborted" } });
       }));
       start = call("bridgeReady", { reason: event.reason, sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, trusted: ctx.isProjectTrusted() });
     }

@@ -34,8 +34,17 @@ test("4 MiB 图片及 10 图 12 MiB 上限实测，快照用引用、since 增�
   const image = user.content.find(b => b.blob); let response = await fetch(server.origin + "/api/blobs/" + image.blob, { headers: { Authorization: "Bearer " + token } }); assert.equal(response.status, 200); assert.deepEqual(Buffer.from(await response.arrayBuffer()), maxImage);
   await unlink(path.join(f.root, "pane/cache/blobs", image.blob.slice(7))); response = await fetch(server.origin + "/api/blobs/" + image.blob, { headers: { Authorization: "Bearer " + token } }); assert.equal(response.status, 200); assert.deepEqual(Buffer.from(await response.arrayBuffer()), maxImage);
   const secondStart = performance.now(); const next = await control(server, token, done, { type: "prompt", message: "不重发历史图片" }); assert.equal(next.code, 200); await until(async () => (await snapshot(server, token, id)).status === "idle");
+  const nextSendMs = Math.round(performance.now() - secondStart);
   const audit = (await readFile(f.env.PANE_RPC_AUDIT, "utf8")).trim().split("\n").map(JSON.parse).filter(c => c.type === "get_entries"); assert.equal(audit.filter(c => !c.since).length, 1); assert.ok(audit.filter(c => c.since).length >= 2);
   const disk = await readFile(done.sessionFile, "utf8"); const maxLine = Math.max(...disk.split("\n").map(line => Buffer.byteLength(line))); assert.ok((await readSession(done.sessionFile)).entries.some(e => e.message?.role === "user"));
-  t.diagnostic(JSON.stringify({ singleImageBytes: maxImage.length, messageImageBytes: 12 * 1024 * 1024, imageCount: 10, maxJsonlLineBytes: maxLine, sendToSettledMs: Math.round(elapsed), nextSendMs: Math.round(performance.now() - secondStart), serverPeakRssBytes: peak, snapshotBytes: Buffer.byteLength(JSON.stringify(done)), getEntriesFull: audit.filter(c => !c.since).length, getEntriesIncremental: audit.filter(c => c.since).length }));
+  await f.setScript({ fallback: { ignoreAbort: true, segments: [{ type: "text", text: "停止前的输出" }, { type: "hang" }] } });
+  const busy = await control(server, token, await snapshot(server, token, id), { type: "prompt", message: "阻塞后排队图片" }); assert.equal(busy.code, 200);
+  await until(async () => JSON.stringify((await snapshot(server, token, id)).inFlight).includes("停止前的输出"));
+  const drafts = [1, 2].map(i => [{ type: "text", text: "图片队列" + i }, { type: "image", assetId: little.value.assetId }]);
+  for (const draft of drafts) {
+    const queued = await control(server, token, await snapshot(server, token, id), { type: "steer" }, { draft }); assert.equal(queued.code, 200, JSON.stringify(queued).slice(0, 300));
+  }
+  const stopped = await control(server, token, await snapshot(server, token, id), { type: "stop" }); assert.equal(stopped.code, 200); assert.deepEqual(stopped.value.clearedDrafts, drafts);
+  t.diagnostic(JSON.stringify({ singleImageBytes: maxImage.length, messageImageBytes: 12 * 1024 * 1024, imageCount: 10, maxJsonlLineBytes: maxLine, sendToSettledMs: Math.round(elapsed), nextSendMs, serverPeakRssBytes: peak, snapshotBytes: Buffer.byteLength(JSON.stringify(done)), getEntriesFull: audit.filter(c => !c.since).length, getEntriesIncremental: audit.filter(c => c.since).length }));
  } finally { clearInterval(sampler); await server.close(); await f.cleanup(); }
 });

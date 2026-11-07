@@ -36,6 +36,7 @@ export interface PanePlugin {
 }
 
 export type PanePluginFactory = () => PanePlugin;
+export type BridgeFormOutcome = FormOutcome | { status: "expired" } | { status: "aborted" };
 
 // 草案，P0 后冻结
 export interface PaneHostContext {

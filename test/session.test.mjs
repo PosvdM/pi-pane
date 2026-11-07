@@ -19,5 +19,6 @@ test("真实 pi 的首次发送、since 条目与只读重连快照", { timeout:
     assert.equal(again.code, 200, JSON.stringify(again));
     await until(async () => (await snapshot(server, token, id)).status === "idle");
     const stopped = await control(server, token, await snapshot(server, token, id), { type: "close" }); assert.equal(stopped.code, 200, JSON.stringify(stopped));
+    assert.equal((await snapshot(server, token, id)).status, "idle"); assert.equal((await snapshot(server, token, id)).readonly, true);
   } finally { await server.close(); await fixture.cleanup(); }
 });

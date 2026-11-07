@@ -160,7 +160,12 @@ export class Sessions {
         onReady: (state, data, reason) => this.rebind(session, state, data, reason),
         onExit: (reason, report, error) => {
           if (report) this.reports.push(report);
-          session.handle = undefined; session.ui.clear(); session.model.interrupt("pi", `${reason}${error ? `：${String(error)}` : ""}`); session.lastActive = Date.now(); session.recentExternal = false;
+          session.handle = undefined; session.ui.clear();
+          if (reason === "会话已关闭" && !error) {
+            session.model.readonly = true; session.model.readonlyReason = "archived"; session.model.inFlight.assistant = undefined; session.model.inFlight.tools = [];
+            session.model.control("idle", "idle", reason, true);
+          } else session.model.interrupt("pi", `${reason}${error ? `：${String(error)}` : ""}`);
+          session.lastActive = Date.now(); session.recentExternal = false;
         },
       });
       await session.handle.ready;

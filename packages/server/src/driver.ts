@@ -12,7 +12,7 @@ export interface DriverSpec { cwd: string; sessionFile: string; sessionDir: stri
 export interface DriverOptions {
   home: string; instanceId: string; pi: PiInstall; bridgeUrl: string; extensionPath: string;
   env?: Record<string, string>; extraExtensions?: string[]; containment?: Containment;
-  readyTimeoutMs?: number; rpcTimeoutMs?: number; stopOptions?: StopOptions;
+  readyTimeoutMs?: number; rpcTimeoutMs?: number; stopOptions?: StopOptions; snapshotIntervalMs?: number;
   onTrust?: (cwd: string) => Promise<TrustChoice | undefined>;
 }
 export interface DriverCallbacks {
@@ -53,7 +53,7 @@ export class RpcSubprocessDriver implements SessionDriver {
     for (const extension of this.options.extraExtensions ?? []) argv.push("-e", extension);
     let proc: ManagedProcess;
     try {
-      proc = await lock.spawnWriter({ argv, cwd: spec.cwd, env, runId: randomUUID(), instanceId: this.options.instanceId, containment: this.options.containment });
+      proc = await lock.spawnWriter({ argv, cwd: spec.cwd, env, runId: randomUUID(), instanceId: this.options.instanceId, containment: this.options.containment, snapshotIntervalMs: this.options.snapshotIntervalMs });
       launch.attach(proc.identity);
     } catch (error) {
       launch.close(); await lock.release(); throw error;
@@ -192,7 +192,8 @@ class RpcHandle implements DriverHandle {
     finally {
       for (const off of this.listeners.splice(0)) off();
       this.rejectReady(new PaneError("interrupted", this.fatalReason ?? "会话已关闭", 409));
-      this.callbacks.onExit(this.fatalReason ?? "会话已关闭", report, failure); this.resolveExit();
+      const reason = this.fatalReason ?? (report?.steps.some((step) => step.step === "abort" && !step.ok) ? "停止超时，已强制结束进程" : "会话已关闭");
+      this.callbacks.onExit(reason, report, failure); this.resolveExit();
     }
   }
 }
