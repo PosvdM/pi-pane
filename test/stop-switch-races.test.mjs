@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { writeFile, utimes } from "node:fs/promises";
+import { writeFile, utimes, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { probeSessionWriterLock, isSameProcess } from "pi-hostkit";
 import { RequestLedger } from "../packages/server/dist/control.js";
@@ -47,6 +47,38 @@ test("A resume 已打开的 B 后扩展永久等待，控制队列随写者迁�
     assert.equal((await final(server, token, bRoute, queued)).value.error, "controlPreempted");
     assert.equal((await snapshot(server, token, b.ref.id)).readonly, true);
   } finally { await server.close(); await f.cleanup(); }
+});
+
+for (const restart of [false, true]) test(`切换持久化迟到于停止${restart ? "并重新启动 A" : ""}，不重绑定 B 或重建旧运行记录`, { timeout: 30000 }, async () => {
+  const { f, target, server, token, a, b } = await setup(); const gate = deferred();
+  let handle;
+  try {
+    const source = server.sessions.records.get(a.ref.id); const destination = server.sessions.records.get(b.ref.id);
+    handle = source.handle; const entered = deferred(); const persist = handle.persist.bind(handle);
+    handle.persist = async () => { entered.resolve(); await gate.promise; await persist(); };
+    const route = "/api/sessions/" + a.ref.id + "/control";
+    const body = { requestId: randomUUID(), expectedEpoch: a.cursor.epoch, expectedRevision: a.controlRevision, command: { type: "prompt", message: "/pane-test-resume-hang " + target } };
+    assert.deepEqual((await request(server, token, route, body)).value, { status: "pending" });
+    await entered.promise;
+    const current = await snapshot(server, token, a.ref.id);
+    const stopped = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: current.cursor.epoch, expectedRevision: current.controlRevision, command: { type: "stop" } });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped)); await handle.exited;
+    assert.equal(await isSameProcess(handle.identity), "gone"); assert.equal(source.handle, undefined);
+    await assert.rejects(stat(handle.recordFile), { code: "ENOENT" });
+    let replacement;
+    if (restart) {
+      const fresh = await snapshot(server, token, a.ref.id);
+      const started = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: fresh.cursor.epoch, expectedRevision: fresh.controlRevision, command: { type: "prompt", message: "重新启动源会话" } });
+      assert.equal(started.code, 200, JSON.stringify(started)); replacement = source.handle;
+      assert.ok(replacement); assert.notEqual(replacement, handle); assert.equal(replacement.acceptingInput, true);
+    }
+    gate.resolve(); await handle.initialization;
+    if (restart) assert.equal(source.handle, replacement, "旧回调不能把 A 的新 handle 迁到 B");
+    await assert.rejects(stat(handle.recordFile), { code: "ENOENT" });
+    assert.equal(destination.handle, undefined); assert.equal(destination.model.readonly, true);
+    assert.equal((await snapshot(server, token, b.ref.id)).readonly, true);
+    assert.equal(handle.acceptingInput, false);
+  } finally { gate.resolve(); if (handle) await handle.initialization; await server.close(); await f.cleanup(); }
 });
 
 test("停止完成后目标取锁才返回，不登记运行写者并释放迟到锁", { timeout: 30000 }, async () => {
