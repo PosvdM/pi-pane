@@ -51,7 +51,11 @@ test("pane 协商选择交集最高版本并拒绝不兼容范围", () => {
 
 test("通用插件类型声明不导出 pi 原生 RPC 信封", async () => {
   const declarations = await readFile(new URL("../packages/plugin-api/dist/index.d.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(declarations, /\\b(?:ExtensionUiRequest|ControlRequest)\\b/);
+  const nativeEnvelope = /\b(?:ExtensionUiRequest|ControlRequest)\b/;
+  assert.doesNotMatch(declarations, nativeEnvelope);
+  for (const name of ["ExtensionUiRequest", "ControlRequest"]) {
+    assert.throws(() => assert.doesNotMatch(declarations + `\nexport interface ${name} {}\n`, nativeEnvelope), assert.AssertionError);
+  }
   const adapter = await readFile(new URL("../packages/server/dist/pi-rpc.d.ts", import.meta.url), "utf8");
   assert.match(adapter, /interface ExtensionUiRequest/); assert.match(adapter, /interface ControlRequest/);
 });
