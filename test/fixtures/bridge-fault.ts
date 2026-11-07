@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { probeSessionWriterLock, isSameProcess } from "pi-hostkit";
 const globalKey = Symbol.for("pane-test.bridge-fault");
 export default async function(pi) {
@@ -23,8 +23,9 @@ export default async function(pi) {
         const lock = await probeSessionWriterLock(body.sessionFile);
         log({ readyAttempt: body.instance, reason: body.reason, file: body.sessionFile, held: lock.held, state: lock.record?.state,
           writerAlive: lock.record?.writer ? await isSameProcess(lock.record.writer) : "missing" });
-        if (mode === "no-ready" || mode === "timer-switch" || mode === "timer-offline" || mode === "reload-no-ready" && body.instance > 1 || mode === "switch-no-ready" && body.instance > 1) return new Response(JSON.stringify({ accepted: true }), { status: 200 });
-        if (mode === "reload-disconnect" && body.instance > 1 || mode === "switch-disconnect" && body.instance > 1) throw new Error("测试注入回连中断");
+        const armed = existsSync(process.env.PANE_TEST_FAULT_ARMED);
+        if (mode === "no-ready" || mode === "timer-switch" || mode === "timer-offline" || ["reload-no-ready", "switch-no-ready"].includes(mode) && armed) return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+        if (["reload-disconnect", "switch-disconnect"].includes(mode) && armed) throw new Error("测试注入回连中断");
       }
       if (mode === "timer-offline" && ["beforeSwitch", "lock", "beforeFork"].includes(body?.type)) {
         const file = globalThis[globalKey].file; const lock = await probeSessionWriterLock(file);

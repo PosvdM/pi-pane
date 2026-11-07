@@ -10,6 +10,7 @@ const faultPath = fileURLToPath(new URL("./fixtures/bridge-fault.ts", import.met
 async function records(file) { try { return (await readFile(file, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse); } catch (e) { if (e.code === "ENOENT") return []; throw e; } }
 async function faultFixture(mode) {
   const f = await piFixture({ fallback: { segments: [{ type: "text", text: "回复" }] } });
+  f.env.PANE_TEST_FAULT_ARMED = path.join(f.root, "fault-armed");
   f.env.PANE_TEST_FAULT = mode; f.env.PANE_TEST_FAULT_LOG = path.join(f.root, "fault.jsonl"); f.env.PANE_TEST_TARGET = f.sessionPath("target");
   await writeFile(f.env.PANE_TEST_TARGET, JSON.stringify({ type: "session", version: 3, id: "target", cwd: f.cwd, timestamp: new Date().toISOString() }) + "\n" + JSON.stringify({ type: "message", id: "target-user", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "目标消息", timestamp: Date.now() } }) + "\n");
   await utimes(f.env.PANE_TEST_TARGET, new Date(0), new Date(0));
@@ -65,12 +66,14 @@ for (const mode of ["reload-no-ready", "reload-disconnect", "switch-no-ready", "
     // 正常首次启动使用生产默认期限，只有故障替换使用缩短期限。
     const f = await faultFixture(mode); const server = await startServer(f);
     try {
-      const token = await pair(server); const initial = await open(server, token, f); const first = await control(server, token, initial, { type: "prompt", message: "正常输入" }); assert.equal(first.code, 200, JSON.stringify(first));
+      const token = await pair(server); const initial = await open(server, token, f); const first = await control(server, token, initial, { type: "prompt", message: "正常输入" }); assert.equal(first.code, 200, JSON.stringify({ first, audit: await records(f.env.PANE_TEST_FAULT_LOG) }));
       const id = first.value.snapshot.ref.id; await until(async () => (await snapshot(server, token, id)).status === "idle");
+      const baselineInstance = Math.max(...(await records(f.env.PANE_TEST_FAULT_LOG)).map(r => r.readyAttempt ?? 0));
+      await writeFile(f.env.PANE_TEST_FAULT_ARMED, "armed");
       server.sessions.driver.options.readyTimeoutMs = 3000;
       const state = await snapshot(server, token, id); const command = mode.startsWith("reload") ? "/pane-test-reload" : "/pane-test-new";
       const result = await control(server, token, state, { type: "prompt", message: command }); assert.equal(result.code, 200, JSON.stringify(result));
-      await until(async () => (await records(f.env.PANE_TEST_FAULT_LOG)).some(r => r.readyAttempt > 1));
+      await until(async () => (await records(f.env.PANE_TEST_FAULT_LOG)).some(r => r.readyAttempt > baselineInstance));
       const record = await probeSessionWriterLock(state.sessionFile); assert.equal(record.held, true); assert.ok(record.record.writer);
       const during = await control(server, token, await snapshot(server, token, id), { type: "prompt", message: "不能送入未就绪实例" }); assert.equal(during.code, 409);
       const done = await until(async () => { const s = await snapshot(server, token, id); return s.status === "interrupted" && s; }, 10000);
