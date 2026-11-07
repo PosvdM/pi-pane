@@ -100,7 +100,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 - 服务端自己只读解析会话 JSONL，旧版本格式（v1、v2）在内存里迁移到 v3，不改写文件。不能用 `SessionManager.open()`：它在文件为空或需要迁移时会调用 `_rewriteFile()` 改写文件（依据：`dist/core/session-manager.js` 第 666–727 行）。
 - v2/v3 条目 id 来自文件，具有稳定性；v1 在解析/迁移时派生的 id 不可作为跨进程或迁移前后的持久键（见 [plugin-api.md](plugin-api.md#三种投影)）。
 - 末尾未完成的截断行，以及 pi 补换行后留在文件中间的不完整行，跳过并记录诊断，不因此判为文件损坏。在线与离线的叶子计算采用统一规则；P0 的一致性结论限于文件重新打开语义，不保证运行中导航后尚未追加条目时两者叶子相同。
-- 只读视图监视文件的修改时间，变化时发 `resync` 重新解析。
+- 只读视图监视文件的修改时间，变化时发 `resync` 重新解析。异步读取提交前核对文件映射、模型及 epoch、启动归属，并确认仍未托管且未关闭；跨越启动或切换的旧读取不能重置新绑定的模型。
 - 用户第一次在只读视图里发送消息时，服务端按“会话写锁”的规则拉起进程，之后转为托管会话。
 
 ### 会话写锁
@@ -212,6 +212,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 - **停止（取消）**：会话视图的“停止”按钮。服务端进入 `stopping` 状态，先发 `clear_queue`，把返回的 steering 和 follow-up 文本按原顺序放回输入框（放在现有草稿之前，用空行分隔），再发 `abort`。P0 实测证明：只发 `abort` 时排队消息留在队列里、不会自动执行，而且排队的 agora 通知之后会重复落盘，所以 pane 不提供只发 abort 的操作（不提供“只停止当前回复”菜单项）。
 - **队列里的图片**：`clear_queue` 只返回文字。服务端记录每条排队消息的草稿（含图片节点），按文字找回对应草稿后整条放回输入框；带图片的消息文字里有随机标记（见 [image-placeholders.md](image-placeholders.md#做法发送时编码message_end-时还原)），可以唯一对应。
 - **超时与抢占**：`abort` 会等会话空闲后才响应。服务端默认等待 10 秒，超时后自动按 hostkit 流程终止进程树。抢占活动控制操作时，即使 `abort` 返回，也停止进程，以结束可能仍挂起的扩展命令及全部 RPC 等待项；停止报告与进程身份复查完成后才释放写锁。已进入桥接事件的目标取锁若在停止后才返回，不登记新的 running writer，等待该停止确认后释放迟到锁；清理无法确认时保留锁并记录诊断。
+- **运行记录清理**：每个 handle 的运行记录写入串行执行。停止后才进入持久化队列的写入直接跳过；已进入的写入（包括临时文件 rename）结束后，停止才删除临时文件和运行记录。不等待尚未进入持久化的初始化收尾，迟到初始化也不能重新创建运行记录。
 - **stopping 期间**：拒绝新的发送（提示“正在停止”），直到收到 `agent_settled` 或进程退出。进入和离开 `stopping` 都会使 `controlRevision` 加 1。
 - 控制操作受理时递增 `controlRevision`，不因此把阶段推测为 `streaming`。运行阶段由 `agent_start`、工具、压缩等实际事件更新；扩展命令或输入处理器返回 `disposition: "handled"`、prompt 预检被拒绝时，空闲会话仍为空闲。手动压缩的 `compaction_end.reason = "manual"` 表示原回合已中止且不会继续生成，无论成功、扩展取消或 provider 失败均回到空闲，不依赖成功 RPC 响应或后续 `agent_settled`。自动压缩仍保持生成阶段，等待实际 `agent_settled`；手动压缩成功响应后另外用 `get_state` 核对状态。已确认成功的控制响应不会因后续快照查询失败而改记为失败。
 - 运行结束以 `agent_settled` 为准，不以 `agent_end` 为准：`agent_end` 之后仍可能有重试、压缩恢复或队列消息（依据：pi `docs/json.md`）。
@@ -441,7 +442,7 @@ pane-bridge 是 pi-pane 用 `-e` 加载进每个主会话的 pi 扩展，负责�
 
 1. **进程级保存连接**：pane-bridge 第一次兑换后，把连接对象（凭证、服务端地址、启动配置）存在 `globalThis[Symbol.for("pi-pane.bridge")]`。后续实例加载时先查这里，有就复用，不再读环境变量。
 2. **实例认证与重绑定**：新实例加载时先用进程级凭证和递增序号认证，服务端立即拒绝旧实例的回连。已认证但未就绪的实例可以协调写锁和查询信任决定，不能接收会话输入。新实例在自己的 `session_start` 里向服务端发送 `bridgeReady`，带上实例序号、当前 `sessionFile` 和 `ctx.isProjectTrusted()`。注意：RPC 模式下的会话替换（new、resume、fork、clone）会触发两次 `session_start`（runtimeHost 替换与 RPC rebind 各一次）。pane-bridge 实例必须做幂等处理，复用同一个就绪 Promise，每实例只绑定一次监听、只发一次 `bridgeReady`；服务端也做幂等接收。服务端只接受序号最大的实例，旧实例之后的请求一律拒绝。旧实例在 `session_shutdown` 里注销自己的监听，不关闭进程级连接。
-3. **就绪前不恢复输入**：服务端从收到 `session_shutdown`（含 reload）起暂停该进程的控制队列，直到新实例的 `bridgeReady` 到达。
+3. **就绪前不恢复输入**：服务端从收到 `session_shutdown`（含 reload）起暂停该进程的控制队列。初始化在状态和条目读取、旧锁释放及持久化之后复查 stopping 与切换代次，只有仍有效的初始化才能提交重绑定并恢复输入。每次拉起都有独立的启动归属标记，随 handle 迁移；就绪回调显式携带来源 handle，事件和退出回调也核对启动归属，旧写者不能修改后来启动的写者。就绪回调早于 start 返回时同样按来源 handle 绑定。
 4. **未就绪即终止**：新会话的 `session_start` 之后在就绪超时（暂定 10 秒）内没有收到 `bridgeReady`，或重绑定失败（如进程级连接对象不存在，新实例不自行申请凭证），服务端立即按 hostkit 的流程终止该 pi 进程（`clear_queue` → `abort` → 终止进程树），把会话标为 `interrupted`。界面以只读方式显示会话内容，提供“重启”，重启时用新 ticket 重新拉起。不让进程在暂停状态下存活，也不提供“不用 pane-bridge 继续”：会话写锁靠 pane-bridge 在 `session_before_switch`、`session_shutdown` 时请求，没有它的进程只要还活着，扩展命令或扩展自己的定时器就能切换会话，目标文件会在没有取锁的情况下被 `SessionManager.open()` 打开（依据：[pi-hostkit 设计文档“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ③、`dist/core/agent-session-runtime.js` 第 129–135 行）。
 5. **首次拉起同样处理**：拉起后 pane-bridge 没有在就绪超时内完成兑换并发出 `bridgeReady`（扩展加载失败、ticket 被抢先兑换、回连失败等）时，服务端不向该进程发送任何输入，按第 4 步终止进程，会话显示原因并提供“重启”。若 ticket 被抢先兑换或非法，pi 直接以退出码 1 退出，服务端遇到启动阶段退出码 1 当成 ticket 或启动失败处理，记下诊断，不自动重试。
 6. **超时窗口内的替换**：已认证实例在就绪前仍可协调每个目标的写锁。`session_before_switch` 对 new、resume 均检查回连，`session_before_fork` 同样检查；协调不可用时在可取消的事件中返回 `{ cancel: true }`。new/fork 的实际目标路径在 `session_shutdown` 中登记当前 writer 并持锁，直到切换确认或进程停止。未就绪期间不发送 RPC 输入，就绪超时仍终止写者。
