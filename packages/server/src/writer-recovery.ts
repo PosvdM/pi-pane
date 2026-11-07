@@ -3,10 +3,10 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { acquireSessionWriterLock, currentProcessIdentity, isSessionWriterLock, type RecoverOptions, type SessionWriterLock } from "pi-hostkit";
 import { checkStopReport } from "./stop-report.js";
-import { assert } from "./errors.js";
+import { assert, PaneError } from "./errors.js";
 import { fileKey } from "./store.js";
 
-// 不完整停止不能证明整棵进程树退出；保留内核锁，直到宿主退出，不走普通 release。
+// pane 拒绝已恢复的报告时保留内核锁；hostkit failed/throw 已自行解锁，隔离依赖持久标记和旧共享记录。
 const quarantined = new Map<string, { lock: SessionWriterLock; error: unknown }>();
 export async function acquireRecoveredWriter(file: string, home: string, instanceId: string, opts: RecoverOptions | undefined,
   acquire: typeof acquireSessionWriterLock = acquireSessionWriterLock): Promise<SessionWriterLock> {
@@ -17,18 +17,23 @@ export async function acquireRecoveredWriter(file: string, home: string, instanc
   assert(!blocked, "stopIncomplete", "上一次恢复报告不完整，请核查遗留进程及恢复记录", 503);
   const lock = await acquire(file, { app: "pi-pane", identity: currentProcessIdentity(instanceId) });
   assert(isSessionWriterLock(lock), "externalWriter", "会话已由其他宿主托管，只能只读打开", 409);
-  const result = await lock.recoverPreviousWriter(opts);
-  try { for (const report of lock.recoveryReports) checkStopReport(report); }
-  catch (error) {
+  let recovered = false;
+  try {
+    const result = await lock.recoverPreviousWriter(opts);
+    assert(result !== "failed", "stopIncomplete", "上一个写者恢复失败，请核查遗留进程及恢复记录", 503);
+    recovered = true;
+    for (const report of lock.recoveryReports) checkStopReport(report);
+  } catch (error) {
     quarantined.set(fileKey(file), { lock, error });
-    // hostkit 在恢复返回成功后写入 starting；补回旧 writer 身份，不能登记新 writer。
-    if (result !== "failed") await lock.update({ state: "stopping", writer: lock.previous?.writer });
+    let recordError: unknown;
+    // 仅成功返回的恢复仍持锁并写入 starting；failed/throw 保留 hostkit 未改写的旧记录。
+    if (recovered) try { await lock.update({ state: "stopping", writer: lock.previous?.writer }); } catch (failure) { recordError = failure; }
     await mkdir(path.dirname(diagnostic), { recursive: true });
     const temporary = diagnostic + ".tmp";
-    await writeFile(temporary, JSON.stringify({ sessionFile: lock.sessionFile, previous: lock.previous, reports: lock.recoveryReports, error: String(error) }), { mode: 0o600 });
+    await writeFile(temporary, JSON.stringify({ sessionFile: lock.sessionFile, previous: lock.previous, reports: lock.recoveryReports,
+      error: String(error), ...(recordError ? { recordError: String(recordError) } : {}) }), { mode: 0o600 });
     await rename(temporary, diagnostic);
-    throw error;
+    throw new PaneError("stopIncomplete", "写者恢复未完成，请核查遗留进程及恢复记录", 503);
   }
-  assert(result !== "failed", "recoveryFailed", "上一个写者状态不明，请确认没有遗留的 pi 后重试", 409);
   return lock;
 }
