@@ -14,6 +14,7 @@ import { assert, PaneError } from "./errors.js";
 import { Sessions, type SessionManagerOptions } from "./sessions.js";
 import { PiStore } from "./store.js";
 import { TrustDecisions } from "./trust.js";
+import { observeHostkit } from "./hostkit-cleanup.js";
 
 export interface PaneServerOptions extends Partial<Omit<SessionManagerOptions, "pi" | "bridgeUrl" | "instanceId" | "extensionPath">> {
   home: string; piPath?: string; port?: number; agentDir?: string; extensionPath?: string; webRoot?: string;
@@ -78,7 +79,7 @@ export class PaneServer {
     const agentDir = options.agentDir ?? options.env?.PI_CODING_AGENT_DIR ?? process.env.PI_CODING_AGENT_DIR ?? path.join(home, ".pi/agent");
     const server = new PaneServer(options, new PiStore(pi, agentDir, path.join(options.home, "tmp"), options.env ?? process.env));
     try {
-      const lock = await acquireInstanceLock("pi-pane", options.home); assert(lock, "instanceBusy", "同一数据目录已有 pi-pane 服务端", 409); server.lock = lock;
+      const lock = await observeHostkit(() => acquireInstanceLock("pi-pane", options.home), (error) => server.sessions.recordCleanupFailure(error)); assert(lock, "instanceBusy", "同一数据目录已有 pi-pane 服务端", 409); server.lock = lock;
       await server.sessions.recover();
       await new Promise<void>((resolve, reject) => { server.http.once("error", reject); server.http.listen(options.port ?? 4319, "127.0.0.1", () => { server.http.off("error", reject); resolve(); }); });
       server.port = (server.http.address() as { port: number }).port;
@@ -231,6 +232,6 @@ export class PaneServer {
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     if (this.http.listening) { this.http.closeAllConnections(); await new Promise<void>((resolve) => this.http.close(() => resolve())); }
     if (error) throw error;
-    await this.lock?.release();
+    await observeHostkit(async () => { await this.lock?.release(); }, (error) => this.sessions.recordCleanupFailure(error), true);
   }
 }

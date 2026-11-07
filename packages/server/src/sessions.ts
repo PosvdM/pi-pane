@@ -13,6 +13,7 @@ import { assert, duration, PaneError } from "./errors.js";
 import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
+import { observeHostkit } from "./hostkit-cleanup.js";
 
 interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
@@ -39,6 +40,7 @@ export class Sessions {
     this.driver = new RpcSubprocessDriver(broker, { ...options, onTrust: (cwd) => trust.request(cwd) });
     this.timer = setInterval(() => { void this.reclaim().catch(() => {}); }, 10000); this.timer.unref();
   }
+  recordCleanupFailure(error: unknown): void { this.cleanupErrors.push(error); }
   async recover(): Promise<void> {
     try {
       this.state = JSON.parse(await readFile(path.join(this.options.home, "state.json"), "utf8"));
@@ -89,7 +91,8 @@ export class Sessions {
     const parsed = await readSession(file); const id = parsed.header?.id ?? randomUUID();
     assert(typeof id === "string", "sessionIdentityConflict", "会话标识无效", 409);
     const model = new SessionModel({ source: "pane", id }, this.assets); model.reset(parsed.entries, parsed.leafId);
-    const busy = await probeSessionWriterLock(file); model.readonlyReason = busy.held ? "externalWriter" : "archived";
+    // probe 内部短暂持锁，固定 hostkit 的 finally 释放失败没有独立标识；拒绝时保守保留。
+    const busy = await observeHostkit(() => probeSessionWriterLock(file), (error) => this.recordCleanupFailure(error), true); model.readonlyReason = busy.held ? "externalWriter" : "archived";
     let recentExternal = false;
     try { recentExternal = !input.fork && !this.recoveredFiles.has(fileKey(file)) && Date.now() - (await stat(file)).mtimeMs < 60000; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }

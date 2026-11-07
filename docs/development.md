@@ -25,6 +25,7 @@
 | `packages/server/src/sessions.ts` | 会话登记、控制队列、增量取条目、切换路由、只读文件监视和回收 |
 | `packages/server/src/driver.ts` | hostkit 写锁、启动门闩、RPC、就绪超时、进程停止和运行身份记录 |
 | `packages/server/src/writer-recovery.ts`、`stop-report.ts` | 首次拉起与目标切换的共同恢复检查、不完整报告隔离和停止报告判定 |
+| `packages/server/src/hostkit-cleanup.ts` | hostkit 拒绝中的清理事实识别及同步、异步调用观察 |
 | `packages/server/src/pi-rpc.ts` | pi 主会话的原生 RPC 信封；不属于通用插件契约 |
 | `packages/server/src/model.ts` | 活动分支、inFlight、同步快照切点、事件缓冲和游标 |
 | `packages/server/src/store.ts` | 只读 v1/v2/v3 解析、pi 会话目录和列表、临时副本 fork |
@@ -66,6 +67,8 @@
 
 服务关闭取消并等待全部在途启动，包括首次发送、restart 的信任询问、目录读取、取锁、spawn 和就绪等待；取消后的取锁不能继续 spawn。已创建的 handle 在首次持久化前交付。关闭还排空 resume 目标取锁及 bridge 重连初始化，即使退出回调已经摘下 handle，也等待其迟到锁释放；完成后才关闭 HTTP 和释放实例锁。清理未确认时保留实例锁并返回失败，并发关闭调用等待同一结果。停止失败由 handle 缓存，退出回调摘下 handle 或其他写者成功重启不能清除失败；独立登记须等停止及排空均成功才删除。本实例新产生的恢复隔离和创建 handle 前的清理失败由实例登记保存，关闭时汇总；启动前已有的隔离标记保留为 `Sessions.recoveryDiagnostics`，CLI 输出诊断，正常关闭照常成功。具体生命周期见 [architecture.md 的“关闭与回收”](architecture.md#关闭与回收)。
 
+hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清理失败消息或多错误聚合，调用边界立即通知本实例，后续 release、stop 或 drain 成功不能清除登记。完整报告随拒绝交付也保留，因为拒绝可能来自独立身份查询失败。固定依赖的 `spawnManaged` 启动回收没有专用错误码，多错误聚合按清理未确认保守处理；判定器仅用于 hostkit 调用边界，并防止循环上下文导致无限遍历。普通未启动错误、参数错误及业务拒绝不单独登记。取得 handle 前的 release、实际停止和迟到目标清理的拒绝仍全部保留。锁探测会短暂持有原生锁，其 finally 释放失败没有独立标识，因此 probe 的所有拒绝均保守登记。
+
 ## WebSocket
 
 连接 `/ws` 后，第一帧为 `{type:"auth",ticket,paneProtocol:[1,1]}`。五秒内没有有效首帧即关闭，拒绝后不再处理任何帧。鉴权后第一条消息为 `banners`，M1 的数组为空，并附上协商版本和 connectionId。
@@ -89,7 +92,7 @@
 | 9. 扩展命令切换会话 | switches：替换事件、旧视图只读、旧状态拒绝、reload 后持锁；A resume 到已订阅 B 时保留模型、客户端及 hold，B 收到 resync 和后续输出；stop-switch-races：persist 入口 gate 固定停止完成后才放行，覆盖停止和停止后重启 A 两种顺序，B 保持只读、旧记录不重建、新 handle 不迁移；另覆盖旧锁释放等待、切换代次变化、旧 shutdown 失败、旧回调、start 迟到返回及原始启动故障、控制后状态查询及只读文件读取的生命周期隔离；stat gate 验证迟到 open 不覆盖已托管记录、服务关闭后不登记，以及关闭遍历期间禁止迟到重绑定而漏停写者；trust：跨目录 resume |
 | 10. agora 与 pane 写锁互斥 | switches：独立进程用 hostkit 以 pi-agora 身份持锁，pane 只读且拒绝发送 |
 | 11. pane-bridge 未就绪 | bridge-failures：无效/抢先兑换 ticket、服务端拒绝、无就绪、新实例 reload/new 不就绪或断开；在每个定时 new/resume/fork 的 shutdown 及实际 session_start 窗口核对目标共享记录、持锁及存活 writer；协调离线时三种操作均取消；输入审计、停止和再次取锁 |
-| 关闭与在途启动 | shutdown-start-races：真实写锁 acquire 与真实 spawn 返回 gate 均位于 start 返回且 ready 之前；关闭不能提前成功或释放实例锁，放行后无存活写者、运行记录或持有写锁，取消后的取锁不 spawn；信任询问、目录读取、restart 同样登记；resume、reload、已退出 handle 的迟到目标锁及重连初始化均排空；真实 performStop 内注入停止、核查、锁更新、锁释放及运行记录清理失败，等 onExit 和独立登记收尾后再关闭，断言失败及保留实例锁；成功重启不能清除旧失败；启动/切换恢复失败、spawn 后释放失败由实例登记保留，旧隔离只诊断且不阻止下一实例正常关闭；并发关闭共享结果；单元级重绑定同步测试验证旧记录重新托管后真正执行 get_entries |
+| 关闭与在途启动 | shutdown-start-races：真实写锁 acquire 与真实 spawn 返回 gate 均位于 start 返回且 ready 之前；关闭不能提前成功或释放实例锁，放行后无存活写者、运行记录或持有写锁，取消后的取锁不 spawn；信任询问、目录读取、restart 同样登记；resume、reload、已退出 handle 的迟到目标锁及重连初始化均排空；真实 performStop 内注入停止、核查、锁更新、锁释放及运行记录清理失败，等 onExit 和独立登记收尾后再关闭，断言失败及保留实例锁；成功重启不能清除旧失败；启动/切换恢复失败、spawn 后释放失败由实例登记保留；经过真实 spawnWriter → stopFailedWriter 注入 running 记录提交失败及不完整报告或无报告停止拒绝，根进程退出且 release 成功后仍须拒绝关闭，完整清理报告则允许关闭；acquire、目标 update、被忽略的 clear_queue 以及切换后 release 携带报告的拒绝，即使后续清理成功也保留实例锁；旧隔离只诊断且不阻止下一实例正常关闭；并发关闭共享结果；单元级重绑定同步测试验证旧记录重新托管后真正执行 get_entries |
 | 恢复报告隔离 | writer-recovery：真实存活旧 pi 被按身份恢复后，在真实报告上注入 snapshot 不完整；首次拉起和目标切换均拒绝该报告，保留旧身份、stopping 锁和诊断；recovery-failure：在真实停止报告后注入故障，执行 hostkit 原有 failed/throw 解锁分支，检查旧共享记录、存档、重启隔离，另一宿主未恢复不能 spawnWriter 且必须再查旧写者 |
 | handled 与拒绝 | input-state：无模型扩展命令、handled 输入、prompt 预检拒绝保持 idle；compaction-state：空会话 compact 拒绝、扩展取消、provider 失败均由手动结束事件恢复 idle，可按空闲规则回收；自动压缩仍等待 settled |
 | 协议边界 | core、http：空、单元素、多元素、非整数及非数组版本范围均拒绝，首帧带实际协商版本；通用类型声明不导出 pi 原生信封，任一原生信封重新导出的负向断言必须失败 |
@@ -98,7 +101,7 @@
 | 项目信任 | trust：启动前询问、记住选择、保存 false、跨项目切换时及时询问、等待用户超过默认十秒仍保持写锁、无连接和超时返回 undecided |
 | 列表与回收边界 | store：环境/项目/全局目录优先级、默认项目分目录、已知项目在重启后保留；backpressure：慢连接合并与 resync，不阻塞其他连接 |
 
-测试的 RPC 输入审计通过观察已有 data 事件记录命令，不添加 stdin 的 data listener，也不调用 resume/read，避免在 pi RPC reader 注册前开启 flowing 并吞掉初始化输入。fixture-audit 验证 reader 注册前缓冲保留、JSONL/UTF-8 分块及字节原样转交；bridge-broker 验证最新实例 fencing 和就绪幂等。
+测试的 RPC 输入审计通过观察已有 data 事件记录命令，不添加 stdin 的 data listener，也不调用 resume/read，避免在 pi RPC reader 注册前开启 flowing 并吞掉初始化输入。fixture-audit 验证 reader 注册前缓冲保留、JSONL/UTF-8 分块及字节原样转交；bridge-broker 验证最新实例 fencing 和就绪幂等；hostkit-cleanup 验证嵌套报告、无报告清理错误、多错误聚合、循环上下文、普通拒绝及观察器的原样传播。
 
 测试文件路径均为 `test/<名称>.test.mjs`。三平台都运行服务端测试，不用模拟进程替代真实 pi。Chrome 路径由本机安装或 CHROME_PATH/CHROME_BIN 定位；本机不存在时明确跳过。CI 的 Linux auto 任务设置 PANE_TEST_REQUIRE_CHROME=1，找不到 Chrome 必须失败。
 

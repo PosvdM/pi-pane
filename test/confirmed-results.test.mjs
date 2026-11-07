@@ -7,7 +7,7 @@ import { fileKey } from "../packages/server/dist/store.js";
 import { piFixture, providerPath, until } from "./fixtures/helpers.mjs";
 import { startServer, pair, open, control, snapshot } from "./fixtures/client.mjs";
 
-for (const fault of ["query", "release"]) test(`取消切换后的 ${fault} 清理失败不覆盖已确认响应与幂等结果`, { timeout: 30000 }, async () => {
+for (const fault of ["query", "release", "cleanup-release"]) test(`取消切换后的 ${fault} 清理失败不覆盖已确认响应与幂等结果`, { timeout: 30000 }, async () => {
   const f = await piFixture({ fallback: { segments: [{ type: "text", text: "完成" }] } });
   const target = f.sessionPath("cancel-target");
   await writeFile(target, JSON.stringify({ type: "session", version: 3, id: "cancel-target", cwd: f.cwd, timestamp: new Date().toISOString() }) + "\n");
@@ -30,7 +30,8 @@ for (const fault of ["query", "release"]) test(`取消切换后的 ${fault} 清�
         const lock = handle.locks.get(fileKey(target)); const release = lock.release.bind(lock);
         lock.release = async options => {
           lock.release = release;
-          assert.equal(options.writerSwitchedAway, true); throw new Error("injected cleanup release failure");
+          assert.equal(options.writerSwitchedAway, true);
+          throw new Error("injected cleanup release failure", fault === "cleanup-release" ? { cause: { coverage: "snapshot_visible", steps: [{ step: "snapshot", ok: false }], leftovers: [] } } : undefined);
         };
       }
       const response = await raw(...args);
@@ -47,5 +48,12 @@ for (const fault of ["query", "release"]) test(`取消切换后的 ${fault} 清�
     const repeated = await control(server, token, state, { type: "prompt", message: "/pane-test-resume " + target }, { requestId: "confirmed-cancel" });
     assert.equal(repeated.code, 200); assert.deepEqual(repeated.value, result.value, "同 requestId 重复返回已确认的真实响应，不缓存清理错误");
     assert.equal(server.sessions.reports.at(-1).leftovers.length, 0); off();
-  } finally { await server.close(); await f.cleanup(); }
+    if (fault === "cleanup-release") {
+      await handle.drain(); await server.sessions.handles.get(handle); await new Promise(setImmediate);
+      assert.equal(server.sessions.handles.size, 0, "随后成功的 stop/drain 不保留失败 handle");
+      let released = false; const release = server.lock.release.bind(server.lock);
+      server.lock.release = async () => { released = true; await release(); };
+      await assert.rejects(server.close(), AggregateError); assert.equal(released, false, "原错误携带的清理事实由实例保留");
+    }
+  } finally { await server.close().catch(error => { if (fault !== "cleanup-release") throw error; }); await server.lock.release(); await f.cleanup(); }
 });

@@ -259,7 +259,7 @@ test("spawn 失败后的写锁释放拒绝先于关闭完成，仍保留实例�
   } finally { await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
 });
 
-test("spawn 真实提交失败及停止报告不完整，即使 release 成功也阻止关闭", { timeout: 30000 }, async () => {
+for (const phase of ["report", "stop", "complete"]) test(`spawn 真实提交失败的 ${phase} 清理结果不被 release 成功覆盖`, { timeout: 30000 }, async () => {
   const f = await piFixture(); const server = await startServer(f); let releasedWriter = false; let failedReport; let identity;
   try {
     const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
@@ -276,6 +276,8 @@ test("spawn 真实提交失败及停止报告不完整，即使 release 成功�
         proc.stop = async (...args) => {
           const report = await stop(...args);
           assert.equal(await isSameProcess(proc.identity), "gone", "根进程真实退出后才注入核查失败");
+          if (phase === "stop") throw new Error("注入 hostkit 停止拒绝且没有报告");
+          if (phase === "complete") return report;
           failedReport = { ...report, steps: [...report.steps, { step: "snapshot", ok: false, at: new Date().toISOString(), detail: "注入快照核查失败" }] };
           return failedReport;
         };
@@ -285,9 +287,12 @@ test("spawn 真实提交失败及停止报告不完整，即使 release 成功�
       return lock;
     };
     await assert.rejects(server.sessions.start(source), error => {
+      if (phase === "complete") { assert.match(error.message, /注入 running 记录提交失败/); return true; }
       assert.ok(error instanceof AggregateError); assert.match(error.message, /Cannot stop failed session writer/);
       assert.match(error.errors[0].message, /注入 running 记录提交失败/);
-      assert.equal(error.errors[1].cause, failedReport); return true;
+      if (phase === "report") assert.equal(error.errors[1].cause, failedReport);
+      else assert.match(error.errors[1].message, /注入 hostkit 停止拒绝且没有报告/);
+      return true;
     });
     await new Promise(setImmediate);
     assert.equal(await isSameProcess(identity), "gone"); assert.equal(releasedWriter, true);
@@ -295,10 +300,48 @@ test("spawn 真实提交失败及停止报告不完整，即使 release 成功�
     assert.equal(server.sessions.starts.size, 0); assert.equal(server.sessions.handles.size, 0);
     let releasedInstance = false; const release = server.lock.release.bind(server.lock);
     server.lock.release = async () => { releasedInstance = true; await release(); };
-    await assert.rejects(server.close(), AggregateError);
-    await assert.rejects(server.close(), AggregateError);
-    assert.equal(releasedInstance, false, "成功释放写锁不能清除 spawn 已报告的清理未确认");
+    if (phase === "complete") {
+      await server.close(); assert.equal(releasedInstance, true, "普通启动拒绝在清理确认后允许关闭成功");
+    } else {
+      await assert.rejects(server.close(), AggregateError);
+      await assert.rejects(server.close(), AggregateError);
+      assert.equal(releasedInstance, false, "成功释放写锁不能清除 spawn 已报告的清理未确认");
+    }
   } finally { await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
+});
+
+for (const phase of ["acquire", "target-update", "clear-queue"]) test(`hostkit ${phase} 的报告错误在后续清理成功后仍由实例保留`, { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); let handle;
+  const failure = new Error("注入携带清理报告的 hostkit 拒绝", { cause: { coverage: "snapshot_visible", steps: [{ step: "snapshot", ok: false }], leftovers: [] } });
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
+    if (phase === "acquire") {
+      const acquire = server.sessions.driver.acquireWriter;
+      server.sessions.driver.acquireWriter = async (...args) => { const lock = await acquire(...args); await lock.release(); throw failure; };
+      await assert.rejects(server.sessions.start(source), error => error === failure);
+    } else {
+      await server.sessions.start(source); handle = source.handle;
+      if (phase === "target-update") {
+        const acquire = handle.acquireWriter;
+        handle.acquireWriter = async (...args) => {
+          const lock = await acquire(...args); const update = lock.update.bind(lock);
+          lock.update = async patch => { await update(patch); if (patch.state === "running") throw failure; };
+          return lock;
+        };
+        await assert.rejects(handle.bridgeEvent({ type: "lock", target: f.sessionPath("cleanup-update") }), error => error === failure);
+      } else {
+        const send = handle.proc.rpc.send.bind(handle.proc.rpc);
+        handle.proc.rpc.send = (...args) => { if (args[0].type === "clear_queue") throw failure; return send(...args); };
+      }
+      await handle.stop(); await handle.drain(); await server.sessions.handles.get(handle);
+    }
+    await new Promise(setImmediate);
+    assert.equal(server.sessions.starts.size, 0); assert.equal(server.sessions.handles.size, 0);
+    assert.ok(server.sessions.cleanupErrors.includes(failure));
+    let released = false; const release = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { released = true; await release(); };
+    await assert.rejects(server.close(), AggregateError); assert.equal(released, false);
+  } finally { await handle?.stop(); await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
 });
 
 test("运行记录恢复失败由本实例保存，随后关闭不能报告成功", { timeout: 30000 }, async () => {

@@ -7,6 +7,7 @@ import { acquireSessionWriterLock,
 import { BridgeBroker, type TrustChoice } from "./bridge.js";
 import { assert, duration, PaneError } from "./errors.js";
 import { fileKey } from "./store.js";
+import { carriesUnconfirmedCleanup, observeHostkit, observeHostkitSync } from "./hostkit-cleanup.js";
 import { acquireRecoveredWriter } from "./writer-recovery.js";
 import { verifyStopped } from "./stop-report.js";
 export { checkStopReport, verifyStopped } from "./stop-report.js";
@@ -41,12 +42,10 @@ export class RpcSubprocessDriver implements SessionDriver {
     signal?.throwIfAborted();
     const lock = await acquireRecoveredWriter(spec.sessionFile, this.options.home, this.options.instanceId,
       { ...this.options.stopOptions, assumeNoWriter: spec.assumeNoWriter }, this.acquireWriter, callbacks.onCleanupFailure);
-    const release = async () => {
-      try { await lock.release(); } catch (error) { callbacks.onCleanupFailure?.(error); throw error; }
-    };
+    const release = () => observeHostkit(() => lock.release(), callbacks.onCleanupFailure, true);
     if (signal?.aborted) { await release(); signal.throwIfAborted(); }
     let handle!: RpcHandle; let attachHandle!: () => void; const available = new Promise<void>((resolve) => { attachHandle = resolve; });
-    const launch = this.broker.issue(spec.decisions, async (event) => { await available; return handle.bridgeEvent(event); });
+    const launch = this.broker.issue(spec.decisions, async (event) => { await available; return handle.bridgeEvent(event); }, callbacks.onCleanupFailure);
     const env = { ...process.env, ...this.options.env, PANE_BRIDGE_URL: this.options.bridgeUrl, PANE_BRIDGE_TICKET: launch.ticket } as Record<string, string>;
     // 调用方传入完整隔离环境时不能从宿主补入模型凭证或用户配置。
     if (this.options.env) for (const name of Object.keys(env)) if (!(name in this.options.env) && !["PANE_BRIDGE_URL", "PANE_BRIDGE_TICKET"].includes(name)) delete env[name];
@@ -55,7 +54,7 @@ export class RpcSubprocessDriver implements SessionDriver {
     for (const extension of this.options.extraExtensions ?? []) argv.push("-e", extension);
     let proc: ManagedProcess;
     try {
-      proc = await lock.spawnWriter({ argv, cwd: spec.cwd, env, runId: randomUUID(), instanceId: this.options.instanceId, containment: this.options.containment, snapshotIntervalMs: this.options.snapshotIntervalMs });
+      proc = await observeHostkit(() => lock.spawnWriter({ argv, cwd: spec.cwd, env, runId: randomUUID(), instanceId: this.options.instanceId, containment: this.options.containment, snapshotIntervalMs: this.options.snapshotIntervalMs }), callbacks.onCleanupFailure);
       launch.attach(proc.identity);
     } catch (error) {
       launch.close(); await release(); throw error;
@@ -86,10 +85,16 @@ class RpcHandle implements DriverHandle {
     this.recordFile = path.join(options.home, "run", `${proc.identity.runId}.json`);
     this.ready = new Promise((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; }); this.ready.catch(() => {});
     this.exited = new Promise((resolve) => { this.resolveExit = resolve; });
-    this.listeners.push(proc.rpc.onEvent((event) => callbacks.onRecord(event)), proc.rpc.onUiRequest((event) => callbacks.onRecord(event)), proc.rpc.onError((error) => this.fail("RPC 传输故障", error)));
+    this.listeners.push(proc.rpc.onEvent((event) => callbacks.onRecord(event)), proc.rpc.onUiRequest((event) => callbacks.onRecord(event)), proc.rpc.onError((error) => {
+      if (carriesUnconfirmedCleanup(error)) callbacks.onCleanupFailure?.(error);
+      this.fail("RPC 传输故障", error);
+    }));
     this.armTimeout();
     void proc.rpc.closed.then(() => { if (!this.stopping) this.fail("RPC 输出管道关闭"); });
     void proc.exited.then((info) => { if (!this.stopping) this.fail(this.started ? "pi 进程意外退出" : `pane-bridge 就绪前退出（${info.code}）：${proc.stderrTail()}`); });
+  }
+  private hostkit<T>(operation: () => Promise<T>, cleanup = false): Promise<T> {
+    return observeHostkit(operation, this.callbacks.onCleanupFailure, cleanup);
   }
   get sessionFile(): string { return this.current.sessionFile; }
   get acceptingInput(): boolean { return this.enabled && !this.stopping; }
@@ -125,12 +130,12 @@ class RpcHandle implements DriverHandle {
     // 取锁可能晚于停止返回；迟到锁不登记 writer，仍须在停止确认后清理。
     this.locks.set(key, lock);
     if (this.stopping) {
-      try { await this.stop(); await lock.release(); this.locks.delete(key); }
+      try { await this.stop(); await this.hostkit(() => lock.release(), true); this.locks.delete(key); }
       catch (error) { this.cleanupErrors.push(error); this.callbacks.onRecord({ type: "pane_diagnostic", message: `迟到目标锁清理未确认：${String(error)}` }); throw error; }
       throw new PaneError("bridgeStopping", "会话正在停止，目标写锁已释放", 409);
     }
     // 保留每个已取得的目标锁，直到 session_start 确认切走或写者停止。
-    await lock.update({ writer: this.identity, state: "running" });
+    await this.hostkit(() => lock.update({ writer: this.identity, state: "running" }));
     assert(!this.stopping, "bridgeStopping", "会话正在停止", 409); return true;
   }
   async bridgeEvent(event: any): Promise<any> {
@@ -175,7 +180,7 @@ class RpcHandle implements DriverHandle {
             const entries = await this.raw({ type: "get_entries" });
             if (this.stopping || generation !== this.generation) return;
             for (const [key, lock] of this.locks) if (lock !== destination) {
-              await lock.release({ writerSwitchedAway: true }); this.locks.delete(key);
+              await this.hostkit(() => lock.release({ writerSwitchedAway: true })); this.locks.delete(key);
               if (this.stopping || generation !== this.generation) return;
             }
             this.current = destination; this.pendingTarget = undefined;
@@ -192,7 +197,7 @@ class RpcHandle implements DriverHandle {
     }
   }
   private raw(command: RpcCommand, timeoutMs = this.options.rpcTimeoutMs ?? 30000, trackResult = false): Promise<any> {
-    return this.proc.rpc.send(command, trackResult ? {} : { timeoutMs }).then((response) => { assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409); return response; });
+    return this.hostkit(() => this.proc.rpc.send(command, trackResult ? {} : { timeoutMs })).then((response) => { assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409); return response; });
   }
   async send(command: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse> {
     assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪或会话正在停止", 409);
@@ -209,7 +214,7 @@ class RpcHandle implements DriverHandle {
         const state = await this.raw({ type: "get_state" });
         if (!this.stopping && generation === this.generation && this.enabled && !this.pendingTarget && fileKey(state.data.sessionFile) === fileKey(this.current.sessionFile)) {
           for (const [key, lock] of this.locks) if (lock !== this.current) {
-            await lock.release({ writerSwitchedAway: true }); this.locks.delete(key);
+            await this.hostkit(() => lock.release({ writerSwitchedAway: true })); this.locks.delete(key);
             if (this.stopping || generation !== this.generation) break;
           }
         }
@@ -221,7 +226,7 @@ class RpcHandle implements DriverHandle {
     }
     return response;
   }
-  respondUi(response: ExtensionUiResponse): void { assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪", 409); this.proc.rpc.respondUi(response); }
+  respondUi(response: ExtensionUiResponse): void { assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪", 409); observeHostkitSync(() => this.proc.rpc.respondUi(response), this.callbacks.onCleanupFailure); }
   private fail(reason: string, error?: unknown): void {
     if (this.stopping) return;
     this.fatalReason = `${reason}${error ? `：${String(error)}` : ""}`;
@@ -245,11 +250,11 @@ class RpcHandle implements DriverHandle {
   private async performStop(): Promise<StopReport> {
     let report: StopReport | undefined; let failure: unknown;
     try {
-      for (const lock of this.locks.values()) { try { await lock.update({ state: "stopping" }); } catch (error) { failure ??= error; } }
-      try { await this.proc.rpc.send({ type: "clear_queue" }, { timeoutMs: 2000 }); } catch { /* 管道已关闭时仍执行 hostkit 的停止和身份复查。 */ }
-      report = await this.proc.stop(this.options.stopOptions); await verifyStopped(this.identity, report);
+      for (const lock of this.locks.values()) { try { await this.hostkit(() => lock.update({ state: "stopping" })); } catch (error) { failure ??= error; } }
+      try { await this.hostkit(() => this.proc.rpc.send({ type: "clear_queue" }, { timeoutMs: 2000 })); } catch { /* 管道已关闭时仍执行 hostkit 的停止和身份复查。 */ }
+      report = await this.hostkit(() => this.proc.stop(this.options.stopOptions), true); await this.hostkit(() => verifyStopped(this.identity, report!));
       if (failure) throw failure;
-      for (const lock of this.locks.values()) await lock.release(); this.locks.clear();
+      for (const lock of this.locks.values()) await this.hostkit(() => lock.release(), true); this.locks.clear();
       await this.persistence;
       await rm(this.recordFile + ".tmp", { force: true }); await rm(this.recordFile, { force: true });
       return report;

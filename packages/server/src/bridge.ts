@@ -1,16 +1,18 @@
 import { randomBytes } from "node:crypto";
 import { isSameProcess, type ProcessIdentity } from "pi-hostkit";
 import { assert } from "./errors.js";
+import { observeHostkit } from "./hostkit-cleanup.js";
 export type TrustChoice = { trusted: boolean; remember: boolean };
 interface BridgeRun {
   ticket: string; token?: string; expires: number; instance: number; identity?: ProcessIdentity;
   decisions: Record<string, TrustChoice>; handler: (event: any) => Promise<any>; readyPayload?: string; closed: boolean;
+  onCleanupFailure?: (error: unknown) => void;
 }
 export class BridgeBroker {
   private tickets = new Map<string, BridgeRun>(); private tokens = new Map<string, BridgeRun>();
   constructor(private readonly now = Date.now) {}
-  issue(decisions: Record<string, TrustChoice>, handler: (event: any) => Promise<any>): { ticket: string; attach(identity: ProcessIdentity): void; close(): void } {
-    const run: BridgeRun = { ticket: randomBytes(24).toString("base64url"), expires: this.now() + 30000, instance: 0, decisions, handler, closed: false };
+  issue(decisions: Record<string, TrustChoice>, handler: (event: any) => Promise<any>, onCleanupFailure?: (error: unknown) => void): { ticket: string; attach(identity: ProcessIdentity): void; close(): void } {
+    const run: BridgeRun = { ticket: randomBytes(24).toString("base64url"), expires: this.now() + 30000, instance: 0, decisions, handler, onCleanupFailure, closed: false };
     this.tickets.set(run.ticket, run);
     return { ticket: run.ticket, attach: (identity) => { run.identity = identity; }, close: () => {
       run.closed = true; this.tickets.delete(run.ticket); if (run.token) this.tokens.delete(run.token);
@@ -26,7 +28,7 @@ export class BridgeBroker {
     const run = this.tokens.get(token);
     assert(run && !run.closed, "invalidBridgeCredential", "pane-bridge 凭证已失效", 403);
     assert(Number.isSafeInteger(event.instance) && event.instance > 0, "invalidBridgeInstance", "pane-bridge 实例号无效");
-    if (run.identity) assert(await isSameProcess(run.identity) === "alive", "bridgeProcessGone", "pane-bridge 所属进程已退出", 403);
+    if (run.identity) assert(await observeHostkit(() => isSameProcess(run.identity!), run.onCleanupFailure) === "alive", "bridgeProcessGone", "pane-bridge 所属进程已退出", 403);
     if (event.type === "instance") {
       assert(event.instance === run.instance + 1, "staleBridgeInstance", "pane-bridge 实例已被替换", 409);
       run.instance = event.instance; run.readyPayload = undefined;
