@@ -62,13 +62,15 @@ for (const mode of ["bad-ticket", "stolen-ticket", "reject-callback", "no-ready"
   });
 }
 for (const mode of ["reload-no-ready", "reload-disconnect", "switch-no-ready", "switch-disconnect"]) {
-  test(`替换中的 pane-bridge 故障 ${mode}：新实例未就绪时停止并保留只读视图`, { timeout: 45000 }, async () => {
+  test(`替换中的 pane-bridge 故障 ${mode}：新实例未就绪时停止并保留只读视图`, { timeout: 45000 }, async (t) => {
     // 正常首次启动使用生产默认期限，只有故障替换使用缩短期限。
     const f = await faultFixture(mode); const server = await startServer(f);
     try {
       const token = await pair(server); const initial = await open(server, token, f); const first = await control(server, token, initial, { type: "prompt", message: "正常输入" }); assert.equal(first.code, 200, JSON.stringify({ first, audit: await records(f.env.PANE_TEST_FAULT_LOG) }));
       const id = first.value.snapshot.ref.id; await until(async () => (await snapshot(server, token, id)).status === "idle");
-      const baselineInstance = Math.max(...(await records(f.env.PANE_TEST_FAULT_LOG)).map(r => r.readyAttempt ?? 0));
+      const startupAudit = await records(f.env.PANE_TEST_FAULT_LOG);
+      const baselineInstance = Math.max(...startupAudit.map(r => r.readyAttempt ?? 0));
+      t.diagnostic(JSON.stringify({ mode, baselineInstance, startup: startupAudit.filter(r => r.bridgeEvent || r.readyAttempt) }));
       await writeFile(f.env.PANE_TEST_FAULT_ARMED, "armed");
       server.sessions.driver.options.readyTimeoutMs = 3000;
       const state = await snapshot(server, token, id); const command = mode.startsWith("reload") ? "/pane-test-reload" : "/pane-test-new";

@@ -19,6 +19,7 @@ export default async function(pi) {
     globalThis.fetch = async (url, options) => {
       let body;
       try { body = JSON.parse(options?.body); } catch {}
+      if (String(url).endsWith("/bridge/event")) log({ bridgeEvent: body?.type, instance: body?.instance, at: Date.now() });
       if (String(url).endsWith("/bridge/event") && body?.type === "bridgeReady") {
         const lock = await probeSessionWriterLock(body.sessionFile);
         log({ readyAttempt: body.instance, reason: body.reason, file: body.sessionFile, held: lock.held, state: lock.record?.state,
