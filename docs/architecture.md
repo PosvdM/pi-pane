@@ -191,7 +191,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 
 ### 停止与控制队列
 
-每个托管会话有一个串行的控制队列，发送、停止、关闭、切换模型、斜杠命令等改变会话状态的操作依次执行。
+每个托管会话的普通控制操作串行执行，包括发送、切换模型和斜杠命令。`stop`、`close`、`restart` 使用停止优先通道，不等待队首 RPC 的 Promise；同一会话同时只执行一个停止类操作。
 
 两个条件检查各管一件事：
 
@@ -207,10 +207,11 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 | `/compact`、`/new`、`/fork`、`/clone`、`/name`、`/export` | `expectedEpoch`、`expectedRevision` | 重新读取状态后由用户重新发起 |
 | 回应扩展 UI 对话框 | `expectedEpoch` | 以对话框的请求 id 为准，已回应或已超时的返回“已处理” |
 
-服务端在控制队列里串行执行，执行前比较条件，比较和执行之间不会插入其他控制操作。
+普通操作在控制队列中执行前比较条件。停止类操作也先检查 epoch、revision 和关闭确认，再取消尚未执行的排队操作（`controlPreempted`）；启动中的操作收到取消信号，迟到的进程在发送输入前被停止。已发送的 RPC 不伪造取消结果，仍记录真实响应；进程停止而未收到响应时记为 `rpcResultUnknown`。
+- **准入上限**：每会话最多排队 64 项，超过时返回 HTTP 429 `controlQueueLimit`；停止优先通道不占普通队列。全服务最多保留 256 项未完成的普通请求，停止类请求另保留 16 项额度，超过时返回 HTTP 429 `pendingLimit`。达到上限不删除已有 pending 幂等记录，同 requestId 的查询和结果重放仍可使用。停止期间的新操作返回 `controlStopping`。
 - **停止（取消）**：会话视图的“停止”按钮。服务端进入 `stopping` 状态，先发 `clear_queue`，把返回的 steering 和 follow-up 文本按原顺序放回输入框（放在现有草稿之前，用空行分隔），再发 `abort`。P0 实测证明：只发 `abort` 时排队消息留在队列里、不会自动执行，而且排队的 agora 通知之后会重复落盘，所以 pane 不提供只发 abort 的操作（不提供“只停止当前回复”菜单项）。
 - **队列里的图片**：`clear_queue` 只返回文字。服务端记录每条排队消息的草稿（含图片节点），按文字找回对应草稿后整条放回输入框；带图片的消息文字里有随机标记（见 [image-placeholders.md](image-placeholders.md#做法发送时编码message_end-时还原)），可以唯一对应。
-- **超时**：`abort` 会等会话空闲后才响应。服务端等待 10 秒，超时后显示“停止超时”，提供“强制结束进程”，按 hostkit 的流程终止进程树，会话状态变为 `interrupted`，下次发送时重新拉起。
+- **超时与抢占**：`abort` 会等会话空闲后才响应。服务端默认等待 10 秒，超时后自动按 hostkit 流程终止进程树。抢占活动控制操作时，即使 `abort` 返回，也停止进程，以结束可能仍挂起的扩展命令及全部 RPC 等待项；停止报告与进程身份复查完成后才释放写锁。
 - **stopping 期间**：拒绝新的发送（提示“正在停止”），直到收到 `agent_settled` 或进程退出。进入和离开 `stopping` 都会使 `controlRevision` 加 1。
 - 控制操作受理时递增 `controlRevision`，不因此把阶段推测为 `streaming`。运行阶段由 `agent_start`、工具、压缩等实际事件更新；扩展命令或输入处理器返回 `disposition: "handled"`、prompt 预检被拒绝时，空闲会话仍为空闲。手动压缩响应后用 `get_state` 核对是否回到空闲；已确认成功的控制响应不会因后续快照查询失败而改记为失败。
 - 运行结束以 `agent_settled` 为准，不以 `agent_end` 为准：`agent_end` 之后仍可能有重试、压缩恢复或队列消息（依据：pi `docs/json.md`）。

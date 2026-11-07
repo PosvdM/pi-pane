@@ -111,20 +111,24 @@ export class Sessions {
     return () => { session.holds.delete(key); session.lastActive = Date.now(); };
   }
   command(id: string, request: ControlRequest): Promise<any> {
-    return this.ledger.execute(request.requestId, { sessionId: id, ...request }, () => this.record(id).control.run(async () => {
+    const priority = ["stop", "close", "restart"].includes(request.command?.type);
+    return this.ledger.execute(request.requestId, { sessionId: id, ...request }, () => this.record(id).control.run(async (signal) => {
       let session = this.record(id); const model = session.model; const command = request.command;
       assert(command && mutations.has(command.type), "unsupportedCommand", "不支持此会话控制命令");
       assert(request.expectedEpoch === model.epoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
       assert(request.expectedRevision === model.controlRevision, "revisionChanged", "会话状态已变化，请重新确认", 409);
       session.lastActive = Date.now(); const requestedFile = fileKey(session.file);
-      if (command.type === "restart") { assert(session.model.status === "interrupted", "restartNotAvailable", "只有中断的会话可以重启", 409); if (session.handle) await session.handle.stop(); session.recentExternal = false; await this.start(session, command.assumeNoWriter === true); return { status: "accepted", snapshot: this.view(session) }; }
+      if (command.type === "restart") { assert(session.model.status === "interrupted", "restartNotAvailable", "只有中断的会话可以重启", 409); session.control.preempt(); if (session.handle) await session.handle.stop(); session.recentExternal = false; await this.start(session, command.assumeNoWriter === true, signal); return { status: "accepted", snapshot: this.view(session) }; }
       if (command.type === "close") {
         assert(!session.holds.size || command.confirmHolds === true, "holdsConfirmation", "会话仍有保活原因，请确认关闭", 409);
-        const result = await this.stop(session, true); session.holds.clear(); return result;
+        const preempted = session.control.preempt();
+        const result = await this.stop(session, true, preempted); session.holds.clear(); return result;
       }
-      if (command.type === "stop") return this.stop(session, false);
+      if (command.type === "stop") return this.stop(session, false, session.control.preempt());
       assert(model.inFlight.phase !== "stopping", "stopping", "正在停止，请稍后重试", 409);
-      if (!session.handle) await this.start(session);
+      signal.throwIfAborted();
+      if (!session.handle) await this.start(session, false, signal);
+      signal.throwIfAborted();
       assert(fileKey(session.file) === requestedFile, "epochChanged", "会话启动期间已切换，请重新确认目标会话", 409);
       assert(session.handle?.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪，不能发送输入", 409);
       let rpc = { ...command };
@@ -156,7 +160,7 @@ export class Sessions {
         session.model.emit({ type: "pane_diagnostic", message: String(error) });
       }
       return { status: "accepted", response, snapshot: this.view(session) };
-    }));
+    }, priority), priority);
   }
   async query(id: string, type: string): Promise<any> {
     assert(queries.has(type), "unsupportedQuery", "不支持此会话查询"); const session = this.record(id);
@@ -167,9 +171,10 @@ export class Sessions {
     if (!session.ui.has(body.id)) return { status: "alreadyHandled" };
     session.handle!.respondUi(body.response ? { ...body.response, id: body.id } : { id: body.id, cancelled: true }); session.ui.delete(body.id); return { status: "done" };
   }
-  private async start(session: HostedSession, assumeNoWriter = false): Promise<void> {
+  private async start(session: HostedSession, assumeNoWriter = false, signal?: AbortSignal): Promise<void> {
     assert(!session.recentExternal, "recentModification", "该会话可能正在别处运行，请只读查看或 Fork 为新会话", 409);
     await this.trust.request(session.cwd);
+    signal?.throwIfAborted();
     let attached = session;
     try {
       session.handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir: await this.store.sessionDir(session.cwd), decisions: this.trust.config(), assumeNoWriter }, {
@@ -186,7 +191,15 @@ export class Sessions {
           session.lastActive = Date.now(); session.recentExternal = false;
         },
       });
-      await session.handle.ready;
+      // 启动跨越取锁、spawn 和 bridge 就绪；停止抢占后，迟到的 handle 必须先结束，不能再发送输入。
+      const handle = session.handle;
+      const cancel = () => { void handle.stop().catch(() => {}); };
+      signal?.addEventListener("abort", cancel, { once: true });
+      try {
+        if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
+        await handle.ready;
+        if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
+      } finally { signal?.removeEventListener("abort", cancel); }
     } catch (error) {
       // ready 可以先于停止流程失败；对外返回启动失败前，等待身份复查和写锁处理完成。
       const failedHandle = session.handle;
@@ -240,7 +253,7 @@ export class Sessions {
     })().finally(() => { session.syncing = undefined; });
     return session.syncing;
   }
-  private async stop(session: HostedSession, close: boolean): Promise<any> {
+  private async stop(session: HostedSession, close: boolean, preempted = false): Promise<any> {
     if (!session.handle) return { status: "nothingToStop" };
     const handle = session.handle;
     session.model.control("running", "stopping", undefined, true);
@@ -249,7 +262,12 @@ export class Sessions {
       const response = await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 }); cleared = response.data;
       if (close) report = await handle.stop();
       else {
-        try { await handle.send({ type: "abort" }, { timeoutMs: this.options.stopOptions?.abortTimeoutMs ?? 10000 }); session.model.control("idle", "idle"); await this.sync(session); }
+        try {
+          await handle.send({ type: "abort" }, { timeoutMs: this.options.stopOptions?.abortTimeoutMs ?? 10000 });
+          // abort 的响应不能证明挂起的扩展命令已结束；抢占时关闭进程才能结束全部底层等待项。
+          if (preempted) report = await handle.stop();
+          else { session.model.control("idle", "idle"); await this.sync(session); }
+        }
         catch { report = await handle.stop(); }
       }
     } catch { report = await handle.stop(); }
