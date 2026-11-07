@@ -259,6 +259,48 @@ test("spawn 失败后的写锁释放拒绝先于关闭完成，仍保留实例�
   } finally { await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
 });
 
+test("spawn 真实提交失败及停止报告不完整，即使 release 成功也阻止关闭", { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); let releasedWriter = false; let failedReport; let identity;
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
+    const acquire = server.sessions.driver.acquireWriter;
+    server.sessions.driver.acquireWriter = async (...args) => {
+      const lock = await acquire(...args); const writeUpdate = lock.writeUpdate.bind(lock);
+      const stopFailedWriter = lock.stopFailedWriter.bind(lock); const release = lock.release.bind(lock);
+      lock.writeUpdate = patch => {
+        if (patch.state === "running") throw new Error("注入 running 记录提交失败");
+        return writeUpdate(patch);
+      };
+      lock.stopFailedWriter = async (proc, error) => {
+        identity = proc.identity; const stop = proc.stop.bind(proc);
+        proc.stop = async (...args) => {
+          const report = await stop(...args);
+          assert.equal(await isSameProcess(proc.identity), "gone", "根进程真实退出后才注入核查失败");
+          failedReport = { ...report, steps: [...report.steps, { step: "snapshot", ok: false, at: new Date().toISOString(), detail: "注入快照核查失败" }] };
+          return failedReport;
+        };
+        return stopFailedWriter(proc, error);
+      };
+      lock.release = async (...args) => { await release(...args); releasedWriter = true; };
+      return lock;
+    };
+    await assert.rejects(server.sessions.start(source), error => {
+      assert.ok(error instanceof AggregateError); assert.match(error.message, /Cannot stop failed session writer/);
+      assert.match(error.errors[0].message, /注入 running 记录提交失败/);
+      assert.equal(error.errors[1].cause, failedReport); return true;
+    });
+    await new Promise(setImmediate);
+    assert.equal(await isSameProcess(identity), "gone"); assert.equal(releasedWriter, true);
+    assert.equal((await probeSessionWriterLock(source.file)).held, false);
+    assert.equal(server.sessions.starts.size, 0); assert.equal(server.sessions.handles.size, 0);
+    let releasedInstance = false; const release = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { releasedInstance = true; await release(); };
+    await assert.rejects(server.close(), AggregateError);
+    await assert.rejects(server.close(), AggregateError);
+    assert.equal(releasedInstance, false, "成功释放写锁不能清除 spawn 已报告的清理未确认");
+  } finally { await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
+});
+
 test("运行记录恢复失败由本实例保存，随后关闭不能报告成功", { timeout: 30000 }, async () => {
   const f = await piFixture(); const server = await startServer(f);
   try {
