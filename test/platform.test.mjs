@@ -15,7 +15,9 @@ test("忽略 abort 的工具启动真实 shell 与脱离进程组后代，StopRe
  try {
   const token = await pair(server); const initial = await open(server, token, f); const sent = await control(server, token, initial, { type: "prompt", message: "阻塞工具进程树" }); assert.equal(sent.code, 200);
   const id = sent.value.snapshot.ref.id; identities = await until(async () => { const rows = await records(oracle); return rows.length >= 2 && rows; }, 15000);
-  await delay(200); const stopped = await control(server, token, await snapshot(server, token, id), { type: "stop" }); assert.equal(stopped.code, 200, JSON.stringify(stopped));
+  await delay(200); const stopped = await control(server, token, await snapshot(server, token, id), { type: "stop" });
+  if (stopped.code !== 200) t.diagnostic(JSON.stringify({ response: stopped, stopReports: server.sessions.reports, identities }));
+  assert.equal(stopped.code, 200, JSON.stringify(stopped));
   const report = stopped.value.stopReport; assert.equal(report.leftovers.length, 0); assert.ok(report.steps.some(s => s.step === "abort" && !s.ok));
   const began = performance.now(); const observations = [];
   async function gone() { const states = await Promise.all(identities.map(identity => isSameProcess(identity))); observations.push({ elapsedMs: Math.round(performance.now() - began), states }); return states.every(state => state === "gone"); }
