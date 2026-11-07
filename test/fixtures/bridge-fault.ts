@@ -23,8 +23,13 @@ export default async function(pi) {
         const lock = await probeSessionWriterLock(body.sessionFile);
         log({ readyAttempt: body.instance, reason: body.reason, file: body.sessionFile, held: lock.held, state: lock.record?.state,
           writerAlive: lock.record?.writer ? await isSameProcess(lock.record.writer) : "missing" });
-        if (mode === "no-ready" || mode === "timer-switch" || mode === "reload-no-ready" && body.instance > 1 || mode === "switch-no-ready" && body.instance > 1) return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+        if (mode === "no-ready" || mode === "timer-switch" || mode === "timer-offline" || mode === "reload-no-ready" && body.instance > 1 || mode === "switch-no-ready" && body.instance > 1) return new Response(JSON.stringify({ accepted: true }), { status: 200 });
         if (mode === "reload-disconnect" && body.instance > 1 || mode === "switch-disconnect" && body.instance > 1) throw new Error("测试注入回连中断");
+      }
+      if (mode === "timer-offline" && ["beforeSwitch", "lock", "beforeFork"].includes(body?.type)) {
+        const file = globalThis[globalKey].file; const lock = await probeSessionWriterLock(file);
+        log({ deniedWindow: body.type, file, held: lock.held, writerAlive: lock.record?.writer ? await isSameProcess(lock.record.writer) : "missing" });
+        throw new Error("测试注入切换协调离线");
       }
       const response = await original(url, options);
       if (String(url).endsWith("/bridge/event") && body?.type === "shutdown" && body.target) {
@@ -36,10 +41,13 @@ export default async function(pi) {
     };
   }
   globalThis[globalKey].currentApi = pi;
-  pi.registerCommand("pane-test-new", { handler: async (_args, ctx) => { const result = await ctx.newSession(); log({ command: "new", result }); } });
+  pi.registerCommand("pane-test-new", { handler: async (_args, ctx) => {
+    const result = await ctx.newSession(); log({ command: "new", result });
+    if (mode === "timer-offline" && result.cancelled) setTimeout(() => { log({ timer: "resume", file: ctx.sessionManager.getSessionFile() }); globalThis[globalKey].currentApi.sendUserMessage("/pane-test-resume", { expandPromptTemplates: true }); }, 100);
+  } });
   pi.registerCommand("pane-test-resume", { handler: async (_args, ctx) => {
     const result = await ctx.switchSession(process.env.PANE_TEST_TARGET); log({ command: "resume", result });
-    if (mode === "timer-switch" && result.cancelled) setTimeout(() => {
+    if (["timer-switch", "timer-offline"].includes(mode) && result.cancelled) setTimeout(() => {
       globalThis[globalKey].switched.add("fork"); log({ timer: "fork", file: ctx.sessionManager.getSessionFile() });
       globalThis[globalKey].currentApi.sendUserMessage("/pane-test-fork", { expandPromptTemplates: true });
     }, 100);
@@ -47,8 +55,8 @@ export default async function(pi) {
   pi.registerCommand("pane-test-fork", { handler: async (_args, ctx) => { const result = await ctx.fork(ctx.sessionManager.getLeafId(), { position: "at" }); log({ command: "fork", result }); } });
   pi.registerCommand("pane-test-reload", { handler: async (_args, ctx) => { await ctx.reload(); } });
   pi.on("session_start", (_event, ctx) => {
-    const memory = globalThis[globalKey]; const instance = ++memory.instances;
-    if (mode !== "timer-switch") return;
+    const memory = globalThis[globalKey]; const instance = ++memory.instances; memory.file = ctx.sessionManager.getSessionFile();
+    if (!["timer-switch", "timer-offline"].includes(mode)) return;
     const action = ["new", "resume", "fork"].find(action => !memory.switched.has(action));
     if (!action) return;
     setTimeout(() => { memory.switched.add(action); log({ timer: action, file: ctx.sessionManager.getSessionFile() }); memory.currentApi.sendUserMessage("/pane-test-" + action, { expandPromptTemplates: true }); }, 100);

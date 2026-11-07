@@ -15,14 +15,14 @@ async function faultFixture(mode) {
   await utimes(f.env.PANE_TEST_TARGET, new Date(0), new Date(0));
   const settings = JSON.parse(await readFile(path.join(f.agentDir, "settings.json"), "utf8")); settings.extensions = [faultPath]; await writeFile(path.join(f.agentDir, "settings.json"), JSON.stringify(settings)); return f;
 }
-for (const mode of ["bad-ticket", "stolen-ticket", "reject-callback", "no-ready", "timer-switch"]) {
+for (const mode of ["bad-ticket", "stolen-ticket", "reject-callback", "no-ready", "timer-switch", "timer-offline"]) {
   test(`首次 pane-bridge 故障 ${mode}：输入门禁、超时清理和遗留锁恢复`, { timeout: 45000 }, async () => {
     const f = await faultFixture(mode); const server = await startServer(f, { readyTimeoutMs: 3000, ...(["bad-ticket", "stolen-ticket"].includes(mode) ? { extensionPath: fileURLToPath(new URL("./fixtures/bridge-wrapper.ts", import.meta.url)) } : {}) });
     if (mode === "reject-callback") server.broker.event = async () => { throw Object.assign(new Error("测试拒绝回连"), { status: 403 }); };
     try {
       const token = await pair(server); const initial = await open(server, token, f); const result = control(server, token, initial, { type: "prompt", message: "不允许发送" });
       const lock = await until(async () => { const p = await probeSessionWriterLock(initial.sessionFile); return p.held && p.record?.writer && p; }); const writer = lock.record.writer;
-      if (["no-ready", "timer-switch"].includes(mode)) {
+      if (["no-ready", "timer-switch", "timer-offline"].includes(mode)) {
         await until(async () => (await records(f.env.PANE_TEST_FAULT_LOG)).some(r => r.readyAttempt));
         if (mode === "timer-switch") {
           const windows = await until(async () => { const rows = (await records(f.env.PANE_TEST_FAULT_LOG)).filter(r => r.switchWindow); return rows.length === 3 && rows; });
@@ -30,6 +30,14 @@ for (const mode of ["bad-ticket", "stolen-ticket", "reject-callback", "no-ready"
           for (const row of windows) { assert.equal(row.held, true, JSON.stringify(row)); assert.equal(row.writerAlive, "alive", JSON.stringify(row)); assert.equal(row.state, "running"); }
           const starts = (await records(f.env.PANE_TEST_FAULT_LOG)).filter(r => r.readyAttempt);
           for (const row of starts) { assert.equal(row.held, true, JSON.stringify(row)); assert.equal(row.writerAlive, "alive", JSON.stringify(row)); }
+        }
+        if (mode === "timer-offline") {
+          const cancelled = await until(async () => { const rows = (await records(f.env.PANE_TEST_FAULT_LOG)).filter(r => r.command); return rows.length === 3 && rows; });
+          assert.deepEqual(cancelled.map(r => r.command), ["new", "resume", "fork"]); assert.ok(cancelled.every(r => r.result.cancelled));
+          const denied = (await records(f.env.PANE_TEST_FAULT_LOG)).filter(r => r.deniedWindow);
+          assert.equal(denied.length, 3); for (const row of denied) { assert.equal(row.held, true); assert.equal(row.writerAlive, "alive"); assert.equal(row.file, initial.sessionFile); }
+          assert.equal((await records(f.env.PANE_TEST_FAULT_LOG)).some(r => r.switchWindow), false);
+          assert.equal((await probeSessionWriterLock(f.env.PANE_TEST_TARGET)).held, false);
         }
         const before = await records(f.env.PANE_TEST_FAULT_LOG); assert.equal(before.some(r => r.rpcInput), false);
         assert.equal((await probeSessionWriterLock(initial.sessionFile)).held, true);

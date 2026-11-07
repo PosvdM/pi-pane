@@ -24,6 +24,8 @@
 | `packages/server/src/server.ts` | 规范源 HTTP、WebSocket 首帧鉴权、订阅与背压、multipart 图片上传 |
 | `packages/server/src/sessions.ts` | 会话登记、控制队列、增量取条目、切换路由、只读文件监视和回收 |
 | `packages/server/src/driver.ts` | hostkit 写锁、启动门闩、RPC、就绪超时、进程停止和运行身份记录 |
+| `packages/server/src/writer-recovery.ts`、`stop-report.ts` | 首次拉起与目标切换的共同恢复检查、不完整报告隔离和停止报告判定 |
+| `packages/server/src/pi-rpc.ts` | pi 主会话的原生 RPC 信封；不属于通用插件契约 |
 | `packages/server/src/model.ts` | 活动分支、inFlight、同步快照切点、事件缓冲和游标 |
 | `packages/server/src/store.ts` | 只读 v1/v2/v3 解析、pi 会话目录和列表、临时副本 fork |
 | `packages/server/src/assets.ts` | 上传资源、草稿编码、历史图片引用、缓存与清理 |
@@ -58,6 +60,8 @@
 
 `/bridge/launch` 和 `/bridge/event` 是独立的进程级 Agent 通道，不能使用浏览器凭证；其 token 也不能调用 `/api/*`。
 
+控制命令的 HTTP 等待默认 30 秒，超时返回 pending；底层 RPC 继续跟踪实际响应，同一 requestId 不会因等待到期而固定成失败。传输中断导致无法确认结果时返回 rpcResultUnknown，客户端须读取状态核对。命令受理只递增 revision，生成阶段按实际事件更新；handled 输入和预检拒绝不会把空闲会话改为 running。
+
 首次发送才启动 pi。服务端暂停输入直到 bridgeReady 和初次 RPC 状态/条目读取完成。启动就绪失败的响应在停止、身份复查和写锁处理完成后返回；停止失败时保留锁及运行记录，不因失败响应提前解锁。新会话的真实 pi id 在首次启动时确定；调用方使用响应快照或 pane_session_replaced 的 newRef 更新引用。
 
 ## WebSocket
@@ -74,15 +78,18 @@
 | --- | --- |
 | 1. 流式输出中 pi 被杀 | failures：保留 unfinishedPartials、interrupted、再次发送恢复 |
 | 2. 流式输出中服务端被杀 | failures：真实子服务端被强杀；重启先按身份停止；旧凭证与 ticket 拒绝；重新配对与磁盘一致 |
-| 3. 断电截断尾行 | failures：只读读取和临时副本 fork 后拉起；core：v1/v2/v3 迁移与源文件哈希 |
+| 3. 断电截断尾行 | failures：旧 mtime 的截断原文件直接托管并 settled，原完整条目及新消息保留、重新解析只诊断原截断行；另测只读 fork 不改源；core：v1/v2/v3 迁移与源文件哈希 |
 | 4. 流式输出断网重连 | reconnect：Node 和真实 headless Chrome 的游标连续、无重复、最终条目与磁盘一致 |
-| 5. requestId 幂等 | trust：首次发送在信任询问期间重复提交返回 pending，完成后返回最终结果，内容冲突拒绝且 provider 只调用一次；failures：stop 幂等；core：保留期限与序列化 |
-| 6. 并发控制 | failures：两个凭证同时发消息、发送与停止、模型与发送，落后一方 revisionChanged |
+| 5. requestId 幂等 | trust：首次发送的 pending、最终结果与内容冲突；resume 信任回答晚于缩短的 RPC 等待期限仍能得到真实最终结果；rpc-results：连接中断时结果未知；failures：stop 幂等；core：等待超时、保留期限与序列化 |
+| 6. 并发控制 | failures：send/send、send/stop、model/send 三组均断言 revisionChanged、败方无副作用；新快照和新 requestId 重试只执行一次，重复重试复用结果 |
 | 7. 重启后的旧凭证 | failures、auth、http：实例变化、旧凭证和 ticket 拒绝、吊销关闭旧连接 |
 | 8. abort 不响应 | failures：真实假 provider 忽略 abort；platform：忽略取消的工具启动真实 shell 和脱离进程组后代，强制终止后独立核对身份、coverage 和 leftovers |
-| 9. 扩展命令切换会话 | switches：替换事件、旧视图只读、旧状态拒绝、reload 后持锁；trust：跨目录 resume |
+| 9. 扩展命令切换会话 | switches：替换事件、旧视图只读、旧状态拒绝、reload 后持锁；A resume 到已订阅 B 时保留模型、客户端及 hold，B 收到 resync 和后续输出；trust：跨目录 resume |
 | 10. agora 与 pane 写锁互斥 | switches：独立进程用 hostkit 以 pi-agora 身份持锁，pane 只读且拒绝发送 |
-| 11. pane-bridge 未就绪 | bridge-failures：无效/抢先兑换 ticket、服务端拒绝、无就绪、新实例 reload/new 不就绪或断开、定时器切换窗口、输入审计、按身份清理和下一次取锁 |
+| 11. pane-bridge 未就绪 | bridge-failures：无效/抢先兑换 ticket、服务端拒绝、无就绪、新实例 reload/new 不就绪或断开；在每个定时 new/resume/fork 的 shutdown 及实际 session_start 窗口核对目标共享记录、持锁及存活 writer；协调离线时三种操作均取消；输入审计、停止和再次取锁 |
+| 恢复报告隔离 | writer-recovery：真实写锁与 RPC 的集成故障注入，首次拉起和目标切换均拒绝 snapshot 不完整报告，保留旧身份、stopping 锁和诊断，下一写者不能进入 |
+| handled 与拒绝 | input-state：空闲会话的无模型扩展命令、handled 输入、prompt 预检拒绝均不留下 running，revision 增加且可回收 |
+| 协议边界 | core、http：空、单元素、多元素、非整数及非数组版本范围均拒绝，首帧带实际协商版本；通用类型声明不导出 pi 原生信封 |
 | 鉴权边界 | auth、http：Host/Origin、错误与过期配对码、ticket 一次性与过期、首帧、无 Cookie、安全响应头 |
 | 图片与快照 | images：4 MiB 单图、10 图 12 MiB 实测、MIME 和超限拒绝、get_entries since、引用无 base64、缓存缺失重建、停止时取回两条带图片的草稿；core：全部大小边界、顺序与清理 |
 | 项目信任 | trust：启动前询问、记住选择、保存 false、跨项目切换时及时询问、等待用户超过默认十秒仍保持写锁、无连接和超时返回 undecided |
@@ -111,7 +118,7 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 矩阵为 ubuntu-latest auto/snapshot、macos-latest auto、windows-latest auto，安装 pi 1.5.0。Linux auto 启动用户 systemd 实例并要求 cgroup 支持。其他平台的停止保证以 StopReport.coverage 为准；snapshot_visible 只覆盖快照见过的进程，空 leftovers 不能证明整棵进程树没有残留。
 
-停止判定同时核对覆盖范围、leftovers、快照完整性和写者身份。snapshot cleanup 中的发信号错误（如进程退出竞态中的 EPERM）只在最终 verify 独立确认通过、leftovers 为空时可接受；快照枚举失败、最终复查失败和身份不明仍保留写锁。对应边界由 stop-report 单元测试固定。
+停止判定同时核对覆盖范围、leftovers、快照完整性和写者身份。snapshot cleanup 中的发信号错误（如进程退出竞态中的 EPERM）只在最终 verify 独立确认通过、leftovers 为空时可接受；快照枚举失败、最终复查失败和身份不明仍保留写锁。边界由 stop-report 单元测试和 writer-recovery 集成故障注入固定。恢复报告不完整时保留旧 writer、共享 stopping 记录及内核锁，诊断写入 recovery/ 并阻止自动重试；核查和解除隔离的约束见 [architecture.md 的“会话写锁”](architecture.md#会话写锁)。
 
 hostkit #5 尚未关闭：Windows Job 已清空后，独立进程表可能短暂仍见到已退出的后代。测试最多等待两秒确认可见性，不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
 
