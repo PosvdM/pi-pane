@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID, createHash } from "node:crypto";
-import { readFile, readdir, writeFile } from "node:fs/promises";
+import { readFile, readdir, stat, utimes, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { fork } from "node:child_process";
 import path from "node:path";
 import { isSameProcess, linuxCgroupSupport } from "pi-hostkit";
@@ -28,7 +29,13 @@ test("流式输出中 pi 被杀：保留中断内容，再次发送恢复", { ti
     process.kill(writer.pid, "SIGKILL");
     const interrupted = await until(async () => { const s = await snapshot(server, token, id); return s.status === "interrupted" && s; }, 15000);
     assert.equal(interrupted.readonly, true); assert.match(JSON.stringify(interrupted.unfinishedPartials), /保留的流式内容/);
-    await f.setScript(quick); const resumed = await control(server, token, interrupted, { type: "prompt", message: "继续" });
+    await f.setScript(quick);
+    // 只读 watcher 可能先于重启读取最后一批落盘内容并更换 epoch；明确拒绝后按新快照重新确认。
+    let resumed = await control(server, token, interrupted, { type: "prompt", message: "继续" });
+    if (resumed.code === 409) {
+      assert.equal(resumed.value.error, "epochChanged");
+      resumed = await control(server, token, await snapshot(server, token, id), { type: "prompt", message: "继续" });
+    }
     assert.equal(resumed.code, 200, JSON.stringify(resumed));
     await until(async () => { const s = await snapshot(server, token, id); return s.status === "idle" && JSON.stringify(s.entries).includes("恢复完成"); });
     assert.equal(await isSameProcess(writer), "gone");
@@ -51,20 +58,50 @@ test("停止不响应 abort 的 pi：清空含图片草稿队列并按覆盖范�
   } finally { await server.close(); await f.cleanup(); }
 });
 
-test("两个标签页的发送、停止和模型切换均检查 revision，重复 requestId 只执行一次", { timeout: 60000 }, async () => {
+for (const { name, commands, rpcTypes } of [
+  { name: "send/send", commands: [{ type: "steer", message: "第一方" }, { type: "follow_up", message: "第二方" }], rpcTypes: ["steer", "follow_up"] },
+  { name: "send/stop", commands: [{ type: "follow_up", message: "发送方" }, { type: "stop" }], rpcTypes: ["follow_up", "stop"] },
+  { name: "model/send", commands: [{ type: "set_model", provider: "p0-fake", modelId: "scripted" }, { type: "follow_up", message: "模型竞态" }], rpcTypes: ["set_model", "follow_up"] },
+]) test(`两个标签页 ${name} 竞争：revision 败方未执行，更新快照后只执行一次`, { timeout: 60000 }, async () => {
+  const f = await piFixture(hung); f.env.PANE_RPC_AUDIT = path.join(f.root, "rpc.jsonl");
+  const server = await startServer(f, { extraExtensions: [providerPath, fileURLToPath(new URL("./fixtures/rpc-audit.ts", import.meta.url))] });
+  const stopping = []; let unsubscribe;
+  const executionCounts = async () => {
+    const log = (await readFile(f.env.PANE_RPC_AUDIT, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+    // 强停会在驱动清理时再次发送 clear_queue；停止命令按进入 stopping 的次数计数。
+    return rpcTypes.map(type => type === "stop" ? stopping.length : log.filter(record => record.type === type).length);
+  };
+  try {
+    const tokens = [await pair(server), await pair(server)]; const id = await started(server, tokens[0], f);
+    const state = await snapshot(server, tokens[0], id);
+    unsubscribe = server.sessions.subscribe(id, state.cursor, ({ event }) => { if (event.type === "pane_status" && event.phase === "stopping") stopping.push(event); });
+    const before = await executionCounts();
+    const requestIds = commands.map(() => randomUUID());
+    const results = await Promise.all(commands.map((command, i) => control(server, tokens[i], state, command, { requestId: requestIds[i] })));
+    assert.deepEqual(results.map(r => r.code).sort(), [200, 409], JSON.stringify(results));
+    const loser = results.findIndex(r => r.code === 409); const winner = 1 - loser;
+    assert.equal(results[loser].value.error, "revisionChanged");
+    const after = await executionCounts();
+    assert.equal(after[loser], before[loser], `${name} 败方命令不应执行`);
+    assert.equal(after[winner], before[winner] + 1, `${name} 胜方命令应执行一次`);
+    const fresh = await snapshot(server, tokens[loser], id); assert.notEqual(fresh.controlRevision, state.controlRevision);
+    const retryId = randomUUID(); assert.ok(!requestIds.includes(retryId));
+    const retried = await control(server, tokens[loser], fresh, commands[loser], { requestId: retryId });
+    assert.equal(retried.code, 200, JSON.stringify(retried));
+    assert.equal((await executionCounts())[loser], before[loser] + 1, `${name} 败方重试应执行一次`);
+    const duplicate = await control(server, tokens[winner], fresh, commands[loser], { requestId: retryId });
+    assert.deepEqual(duplicate, retried);
+    const final = await executionCounts();
+    assert.equal(final[loser], before[loser] + 1, `${name} 重复重试不应再次执行`);
+    assert.equal(final[winner], before[winner] + 1);
+  } finally { unsubscribe?.(); await server.close(); await f.cleanup(); }
+});
+
+test("重复 requestId 在执行中返回 pending，完成后复用结果且只执行一次", { timeout: 60000 }, async () => {
   const f = await piFixture(hung); const server = await startServer(f);
   try {
     const token = await pair(server); const second = await pair(server); const id = await started(server, token, f);
-    let state = await snapshot(server, token, id);
-    let results = await Promise.all([control(server, token, state, { type: "steer", message: "第一方" }), control(server, second, state, { type: "follow_up", message: "第二方" })]);
-    assert.deepEqual(results.map(r => r.code).sort(), [200, 409]); assert.equal(results.find(r => r.code === 409).value.error, "revisionChanged");
-    state = await snapshot(server, token, id);
-    results = await Promise.all([control(server, token, state, { type: "follow_up", message: "发送方" }), control(server, second, state, { type: "stop" })]);
-    assert.deepEqual(results.map(r => r.code).sort(), [200, 409]);
-    state = await snapshot(server, token, id);
-    results = await Promise.all([control(server, token, state, { type: "set_model", provider: "p0-fake", modelId: "scripted" }), control(server, second, state, { type: "follow_up", message: "模型竞态" })]);
-    assert.deepEqual(results.map(r => r.code).sort(), [200, 409]);
-    state = await snapshot(server, token, id); const requestId = randomUUID();
+    const state = await snapshot(server, token, id); const requestId = randomUUID();
     const body = { requestId, expectedEpoch: state.cursor.epoch, expectedRevision: state.controlRevision, command: { type: "stop" } };
     const route = "/api/sessions/" + id + "/control"; const first = request(server, token, route, body);
     await until(async () => (await snapshot(server, token, id)).inFlight.phase === "stopping");
@@ -89,6 +126,40 @@ test("断电截断文件可只读打开和临时副本 fork，源字节不变且
     await until(async () => (await snapshot(server, token, result.value.snapshot.ref.id)).status === "idle");
     assert.equal(createHash("sha256").update(await readFile(file)).digest("hex"), hash);
   } finally { await server.close(); await f.cleanup(); }
+});
+
+test("尾行截断的旧文件直接托管：保留完整条目，发送 settled 后原文件可重新解析", { timeout: 60000 }, async () => {
+  const f = await piFixture(quick); const file = f.sessionPath("truncated-recovery"); const server = await startServer(f);
+  let unsubscribe;
+  try {
+    const header = { type: "session", id: randomUUID(), version: 3, cwd: f.cwd, timestamp: new Date().toISOString() };
+    const preserved = { type: "message", id: "preserved", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "原完整条目", timestamp: Date.now() } };
+    const incomplete = '{"type":"message","id":"broken';
+    await writeFile(file, JSON.stringify(header) + "\n" + JSON.stringify(preserved) + "\n" + incomplete);
+    const old = new Date(Date.now() - 120000); await utimes(file, old, old);
+    assert.ok(Date.now() - (await stat(file)).mtimeMs > 60000);
+    const token = await pair(server); const opened = await open(server, token, f, { sessionFile: file });
+    assert.equal(path.resolve(opened.sessionFile), path.resolve(file)); assert.equal(opened.warning, undefined);
+    assert.deepEqual(opened.entries, [preserved]); assert.equal(opened.diagnostics.length, 1);
+    const events = []; unsubscribe = server.sessions.subscribe(opened.ref.id, opened.cursor, event => events.push(event.event));
+    const result = await control(server, token, opened, { type: "prompt", message: "原文件继续" });
+    assert.equal(result.code, 200, JSON.stringify(result)); assert.equal(result.value.snapshot.ref.id, header.id);
+    assert.equal(path.resolve(result.value.snapshot.sessionFile), path.resolve(file));
+    const settled = await until(async () => {
+      const state = await snapshot(server, token, opened.ref.id);
+      return events.some(event => event.type === "agent_settled") && state.status === "idle" && state.inFlight.phase === "idle" && JSON.stringify(state.entries).includes("恢复完成") && state;
+    }, 20000);
+    assert.deepEqual(settled.entries.find(entry => entry.id === preserved.id), preserved);
+    const parsed = await readSession(file);
+    assert.deepEqual(parsed.diagnostics, opened.diagnostics); assert.deepEqual(parsed.header, header);
+    assert.deepEqual(parsed.entries.find(entry => entry.id === preserved.id), preserved);
+    assert.equal(parsed.entries.filter(entry => entry.type === "message" && entry.message?.role === "user" && JSON.stringify(entry.message.content).includes("原文件继续")).length, 1);
+    assert.equal(parsed.entries.filter(entry => entry.type === "message" && entry.message?.role === "assistant" && JSON.stringify(entry.message.content).includes("恢复完成")).length, 1);
+    assert.deepEqual(parsed.entries, settled.entries); assert.equal(parsed.leafId, settled.leafId);
+    const lines = (await readFile(file, "utf8")).split("\n").filter(line => line.trim());
+    assert.equal(lines[2], incomplete);
+    for (const [index, line] of lines.entries()) if (index !== 2) assert.doesNotThrow(() => JSON.parse(line));
+  } finally { unsubscribe?.(); await server.close(); await f.cleanup(); }
 });
 
 test("流式输出中服务端被强杀：重启先恢复旧身份，旧凭证和 ticket 无效，重新配对与磁盘一致", { timeout: 90000 }, async () => {
