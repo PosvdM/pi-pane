@@ -76,7 +76,7 @@ export class PaneServer {
     const pi = await locatePi(options.piPath ? { piPath: options.piPath } : {}); assert(pi.supported, "piVersion", `不支持的 pi 版本：${pi.version}`);
     const home = options.env?.HOME ?? process.env.HOME ?? process.env.USERPROFILE ?? "";
     const agentDir = options.agentDir ?? options.env?.PI_CODING_AGENT_DIR ?? process.env.PI_CODING_AGENT_DIR ?? path.join(home, ".pi/agent");
-    const server = new PaneServer(options, new PiStore(pi, agentDir, path.join(options.home, "tmp")));
+    const server = new PaneServer(options, new PiStore(pi, agentDir, path.join(options.home, "tmp"), options.env ?? process.env));
     try {
       const lock = await acquireInstanceLock("pi-pane", options.home); assert(lock, "instanceBusy", "同一数据目录已有 pi-pane 服务端", 409); server.lock = lock;
       await server.sessions.recover();

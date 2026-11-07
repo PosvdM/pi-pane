@@ -32,7 +32,13 @@ for (const mode of ["bad-ticket", "stolen-ticket", "reject-callback", "no-ready"
       assert.equal(interrupted.readonly, true); await until(async () => await isSameProcess(writer) === "gone", 2000);
       const audit = await records(f.env.PANE_TEST_FAULT_LOG); assert.equal(audit.some(r => r.rpcInput && !["clear_queue", "abort"].includes(r.rpcInput)), false, JSON.stringify(audit));
       assert.equal((await records(f.env.FAKE_REQUEST_LOG)).filter(r => r.kind === "request").length, 0);
-      if (mode === "timer-switch") assert.ok(audit.some(r => r.timer), JSON.stringify(audit));
+      if (mode === "timer-switch") {
+        assert.deepEqual(audit.filter(r => r.timer).map(r => r.timer), ["new", "resume", "fork"], JSON.stringify(audit));
+        for (const name of (await readdir(path.join(f.home, ".pi/hostkit/locks"))).filter(f => f.endsWith(".json"))) {
+          const shared = JSON.parse(await readFile(path.join(f.home, ".pi/hostkit/locks", name), "utf8"));
+          if (shared.writer) assert.equal(await isSameProcess(shared.writer), "gone");
+        }
+      }
       const recovered = await acquireSessionWriterLock(initial.sessionFile, { app: "pi-pane", identity: currentProcessIdentity("test-next") }); assert.ok(isSessionWriterLock(recovered));
       assert.equal(await recovered.recoverPreviousWriter(), "none"); await recovered.release();
     } finally { await server.close(); await f.cleanup(); }

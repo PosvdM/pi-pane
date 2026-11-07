@@ -105,7 +105,12 @@ class RpcHandle implements DriverHandle {
   async bridgeEvent(event: any): Promise<any> {
     assert(!this.stopping, "bridgeStopping", "会话正在停止", 409);
     switch (event.type) {
-      case "trust": return { decision: await this.options.onTrust?.(event.cwd) };
+      case "trust": {
+        // 新目录的信任决定可以等待用户；就绪截止时间从决定返回后计算，不能在弹窗期间杀掉写者。
+        clearTimeout(this.timer);
+        try { return { decision: await this.options.onTrust?.(event.cwd) }; }
+        finally { if (!this.stopping && !this.enabled) this.armTimeout(); }
+      }
       case "beforeFork": return { accepted: true };
       case "lock": {
         assert(typeof event.target === "string" && path.isAbsolute(event.target), "invalidTarget", "会话目标必须是绝对路径");

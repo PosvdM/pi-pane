@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, copyFile, mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { readFile, copyFile, mkdtemp, rm, writeFile, mkdir, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { comparisonKey, realPathOrPending, type PiInstall } from "pi-hostkit";
@@ -50,25 +50,31 @@ export function branch(entries: readonly Entry[], leafId: string | null): Entry[
 export function fileKey(file: string): string { return comparisonKey(realPathOrPending(file)); }
 export class PiStore {
   private modules?: Promise<any>;
-  constructor(readonly install: PiInstall, readonly agentDir: string, readonly tmpDir: string) {}
+  constructor(readonly install: PiInstall, readonly agentDir: string, readonly tmpDir: string, private readonly env: NodeJS.ProcessEnv = process.env) {}
   private api(): Promise<any> { return this.modules ??= import(pathToFileURL(path.join(this.install.packageDir, "dist/index.js")).href); }
   async trust(cwd: string): Promise<{ resources: boolean; saved?: boolean }> {
     const pi = await this.api();
     return { resources: pi.hasTrustRequiringProjectResources(cwd), saved: new pi.ProjectTrustStore(this.agentDir).get(cwd) };
   }
   async sessionDir(cwd?: string): Promise<string> {
-    if (process.env.PI_CODING_AGENT_SESSION_DIR) return path.resolve(process.env.PI_CODING_AGENT_SESSION_DIR);
+    if (this.env.PI_CODING_AGENT_SESSION_DIR) return path.resolve(cwd ?? process.cwd(), this.env.PI_CODING_AGENT_SESSION_DIR.replace(/^~(?=[/\\\\])/, this.env.HOME ?? ""));
     let setting: string | undefined;
     for (const file of [path.join(this.agentDir, "settings.json"), ...(cwd ? [path.join(cwd, ".pi/settings.json")] : [])]) {
-      try { const value = JSON.parse(await readFile(file, "utf8")); if (typeof value.sessionDir === "string") setting = value.sessionDir; }
+      try { const value = JSON.parse((await readFile(file, "utf8")).replace(/^\uFEFF/, "")); if (typeof value.sessionDir === "string") setting = value.sessionDir; }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
-    return setting ? path.resolve(cwd ?? this.agentDir, setting.replace(/^~(?=[/\\])/, process.env.HOME ?? "")) : path.join(this.agentDir, "sessions");
+    return setting ? path.resolve(cwd ?? this.agentDir, setting.replace(/^~(?=[/\\])/, this.env.HOME ?? "")) : path.join(this.agentDir, "sessions");
   }
   async list(cwds: string[] = []): Promise<any[]> {
     const pi = await this.api(); const unique = new Map<string, any>();
     const add = (rows: any[]) => { for (const row of rows) unique.set(fileKey(row.path), row); };
-    add(await pi.SessionManager.listAll(await this.sessionDir()));
+    const root = await this.sessionDir();
+    add(await pi.SessionManager.listAll(root));
+    // pi 默认存储按编码后的 cwd 分目录；显式传入根目录的 listAll 只读取该目录本身。
+    if (fileKey(root) === fileKey(path.join(this.agentDir, "sessions")) && !this.env.PI_CODING_AGENT_SESSION_DIR) {
+      try { for (const entry of await readdir(root, { withFileTypes: true })) if (entry.isDirectory()) add(await pi.SessionManager.listAll(path.join(root, entry.name))); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
     for (const cwd of cwds) add(await pi.SessionManager.list(cwd, await this.sessionDir(cwd)));
     return [...unique.values()];
   }

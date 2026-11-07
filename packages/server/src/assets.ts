@@ -24,6 +24,10 @@ export class AssetStore {
   private readonly blobs = new Map<string, { mimeType: string; used: number; size: number }>();
   constructor(readonly home: string, readonly maxCacheBytes = 1024 ** 3, private readonly now = Date.now) {
     for (const directory of ["assets", "cache/blobs"]) mkdirSync(path.join(home, directory), { recursive: true, mode: 0o700 });
+    for (const hex of readdirSync(path.join(home, "cache/blobs"))) if (/^[a-f0-9]{64}$/.test(hex)) {
+      const info = statSync(path.join(home, "cache/blobs", hex));
+      if (info.isFile()) this.blobs.set("sha256-" + hex, { mimeType: "application/octet-stream", size: info.size, used: info.mtimeMs });
+    }
   }
   private hex(id: string): string { assert(/^sha256-[a-f0-9]{64}$/.test(id), "invalidAssetId", "图片标识格式无效"); return id.slice(7); }
   private metaPath(id: string): string { const hex = this.hex(id); return path.join(this.home, "assets", hex.slice(0, 2), hex + ".json"); }
@@ -64,7 +68,9 @@ export class AssetStore {
       if (node.type === "text") { assert(typeof node.text === "string", "invalidDraft", "草稿文本无效"); message += node.text; }
       else {
         assert(node.type === "image" && imageSupported, "imageUnsupported", "当前模型不支持图片，请切换模型");
+        assert(images.length < MAX_MESSAGE_IMAGES, "imagesTooLarge", "一条消息最多 10 张图片", 413);
         const asset = this.asset(node.assetId); bytes += asset.data.length;
+        assert(bytes <= MAX_MESSAGE_IMAGE_BYTES, "imagesTooLarge", "图片合计不能超过 12 MiB", 413);
         assert(asset.data.length <= MAX_IMAGE_BYTES, "imageTooLarge", "单张图片不能超过 4 MiB", 413);
         images.push({ type: "image", data: asset.data.toString("base64"), mimeType: asset.mimeType });
         message += `⟦pane-img:${nonce}:${images.length}⟧`;

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { watchFile, unwatchFile } from "node:fs";
-import { readFile, readdir, rm, mkdir, stat } from "node:fs/promises";
+import { readFile, readdir, rm, mkdir, stat, writeFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { stopByIdentity, probeSessionWriterLock, type ProcessIdentity, type StopReport } from "pi-hostkit";
 import type { ControlRequest, DraftNode, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
@@ -25,6 +25,8 @@ export class Sessions {
   readonly ledger = new RequestLedger();
   private records = new Map<string, HostedSession>(); private files = new Map<string, HostedSession>();
   private driver: RpcSubprocessDriver; private timer: ReturnType<typeof setInterval>; private projects = new Set<string>();
+  private state: Record<string, unknown> = {};
+  private stateQueue = new ControlQueue();
   private recoveredFiles = new Set<string>();
   private recovering = true; readonly reports: StopReport[] = [];
   constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
@@ -33,11 +35,16 @@ export class Sessions {
     this.timer = setInterval(() => { void this.reclaim().catch(() => {}); }, 10000); this.timer.unref();
   }
   async recover(): Promise<void> {
+    try {
+      this.state = JSON.parse(await readFile(path.join(this.options.home, "state.json"), "utf8"));
+      assert(this.state && typeof this.state === "object" && !Array.isArray(this.state), "invalidState", "服务端状态文件无效", 503);
+      if (Array.isArray(this.state.knownProjects)) for (const cwd of this.state.knownProjects) if (typeof cwd === "string" && path.isAbsolute(cwd)) this.projects.add(cwd);
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const directory = path.join(this.options.home, "run"); await mkdir(directory, { recursive: true });
     for (const file of await readdir(directory)) {
       if (!file.endsWith(".json")) continue;
       const record = JSON.parse(await readFile(path.join(directory, file), "utf8")) as { identity: ProcessIdentity; sessionFile: string };
-      assert(record.identity && typeof record.sessionFile === "string", "invalidRunRecord", "运行记录损坏，不能重新打开会话", 503);
+      assert(record.identity && Number.isSafeInteger(record.identity.pid) && record.identity.pid > 0 && typeof record.identity.startTime === "string" && record.identity.startTime.length > 0 && typeof record.identity.runId === "string" && typeof record.identity.instanceId === "string" && typeof record.sessionFile === "string", "invalidRunRecord", "运行记录损坏，不能重新打开会话", 503);
       // 在所有恢复完成前不接受会话打开；身份查询不明或 StopReport 不完整时保留现场。
       const report = await stopByIdentity(record.identity, this.options.stopOptions); await verifyStopped(record.identity, report); this.reports.push(report);
       this.recoveredFiles.add(fileKey(record.sessionFile)); await rm(path.join(directory, file));
@@ -57,6 +64,11 @@ export class Sessions {
     assert(typeof input.cwd === "string" && path.isAbsolute(input.cwd), "invalidCwd", "项目目录必须为绝对路径");
     const cwd = await import("node:fs/promises").then((fs) => fs.realpath(input.cwd));
     this.projects.add(cwd);
+    await this.stateQueue.run(async () => {
+      this.state.knownProjects = [...this.projects];
+      const target = path.join(this.options.home, "state.json"); const temporary = target + "." + randomUUID() + ".tmp";
+      await writeFile(temporary, JSON.stringify(this.state), { mode: 0o600 }); await rename(temporary, target);
+    });
     const directory = await this.store.sessionDir(cwd); await mkdir(directory, { recursive: true });
     let file = input.sessionFile ?? path.join(directory, `${new Date().toISOString().replace(/[:.]/g, "-")}_${randomUUID()}.jsonl`);
     assert(path.isAbsolute(file), "invalidSessionFile", "会话文件必须为绝对路径");
@@ -102,8 +114,8 @@ export class Sessions {
       assert(command && mutations.has(command.type), "unsupportedCommand", "不支持此会话控制命令");
       assert(request.expectedEpoch === model.epoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
       assert(request.expectedRevision === model.controlRevision, "revisionChanged", "会话状态已变化，请重新确认", 409);
-      session.lastActive = Date.now();
-      if (command.type === "restart") { assert(session.model.status === "interrupted", "restartNotAvailable", "只有中断的会话可以重启", 409); if (session.handle) await session.handle.stop(); session.recentExternal = false; await this.start(session); return { status: "accepted", snapshot: this.view(session) }; }
+      session.lastActive = Date.now(); const requestedFile = fileKey(session.file);
+      if (command.type === "restart") { assert(session.model.status === "interrupted", "restartNotAvailable", "只有中断的会话可以重启", 409); if (session.handle) await session.handle.stop(); session.recentExternal = false; await this.start(session, command.assumeNoWriter === true); return { status: "accepted", snapshot: this.view(session) }; }
       if (command.type === "close") {
         assert(!session.holds.size || command.confirmHolds === true, "holdsConfirmation", "会话仍有保活原因，请确认关闭", 409);
         const result = await this.stop(session, true); session.holds.clear(); return result;
@@ -111,6 +123,7 @@ export class Sessions {
       if (command.type === "stop") return this.stop(session, false);
       assert(model.inFlight.phase !== "stopping", "stopping", "正在停止，请稍后重试", 409);
       if (!session.handle) await this.start(session);
+      assert(fileKey(session.file) === requestedFile, "epochChanged", "会话启动期间已切换，请重新确认目标会话", 409);
       assert(session.handle?.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪，不能发送输入", 409);
       let rpc = { ...command };
       if (["prompt", "steer", "follow_up"].includes(command.type)) {
@@ -138,11 +151,11 @@ export class Sessions {
     if (!session.ui.has(body.id)) return { status: "alreadyHandled" };
     session.handle!.respondUi(body.response ? { ...body.response, id: body.id } : { id: body.id, cancelled: true }); session.ui.delete(body.id); return { status: "done" };
   }
-  private async start(session: HostedSession): Promise<void> {
+  private async start(session: HostedSession, assumeNoWriter = false): Promise<void> {
     assert(!session.recentExternal, "recentModification", "该会话可能正在别处运行，请只读查看或 Fork 为新会话", 409);
     await this.trust.request(session.cwd);
     try {
-      session.handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir: await this.store.sessionDir(session.cwd), decisions: this.trust.config() }, {
+      session.handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir: await this.store.sessionDir(session.cwd), decisions: this.trust.config(), assumeNoWriter }, {
         onRecord: (event) => this.receive(session, event),
         onReady: (state, data, reason) => this.rebind(session, state, data, reason),
         onExit: (reason, report, error) => {
@@ -153,6 +166,7 @@ export class Sessions {
       await session.handle.ready;
     } catch (error) {
       if (error instanceof PaneError && error.code === "externalWriter") session.model.readonlyReason = "externalWriter";
+      else if (session.model.status !== "interrupted") session.model.interrupt("startup", String(error));
       throw error;
     }
   }

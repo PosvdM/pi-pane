@@ -11,11 +11,11 @@ const commandPath = fileURLToPath(new URL("./fixtures/session-commands.ts", impo
 const script = { fallback: { segments: [{ type: "text", text: "完成" }] } };
 
 test("扩展运行中切换会话：旧订阅得到替换事件，旧 epoch 不能向新会话发送，重复 start 幂等", { timeout: 60000 }, async () => {
- const f = await piFixture(script); const server = await startServer(f, { extraExtensions: [providerPath, commandPath] }); let connection;
+ const f = await piFixture({ ...script, routes: [{ when: { lastUser: "源会话" }, reply: { segments: [{ type: "text", text: "仍在运行" }, { type: "hang" }] } }] }); const server = await startServer(f, { extraExtensions: [providerPath, commandPath] }); let connection;
  try {
   const token = await pair(server); const initial = await open(server, token, f);
   const first = await control(server, token, initial, { type: "prompt", message: "源会话" }); assert.equal(first.code, 200, JSON.stringify(first));
-  const id = first.value.snapshot.ref.id; await until(async () => (await snapshot(server, token, id)).status === "idle");
+  const id = first.value.snapshot.ref.id; await until(async () => JSON.stringify((await snapshot(server, token, id)).inFlight).includes("仍在运行"));
   const old = await snapshot(server, token, id); connection = await connect(server, token); connection.subscribe(old);
   const switched = await control(server, token, old, { type: "prompt", message: "/pane-test-new" }); assert.equal(switched.code, 200, JSON.stringify(switched));
   const event = await until(() => connection.messages.find(m => m.event?.type === "pane_session_replaced")); const newId = event.event.newRef.id;

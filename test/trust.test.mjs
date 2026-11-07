@@ -15,13 +15,20 @@ test("项目信任在拉起前询问，服务端及时推送且记住选择由 p
  const f = await piFixture(reply); await resource(f.cwd); const server = await startServer(f); let connection;
  try {
   const token = await pair(server); connection = await connect(server, token); const initial = await open(server, token, f);
-  const sending = control(server, token, initial, { type: "prompt", message: "信任后发送" });
+  const requestId = randomUUID();
+  const body = { requestId, expectedEpoch: initial.cursor.epoch, expectedRevision: initial.controlRevision, command: { type: "prompt", message: "信任后发送" } };
+  const route = "/api/sessions/" + initial.ref.id + "/control";
+  const sending = request(server, token, route, body);
   const prompt = await until(() => connection.messages.find(m => m.type === "project_trust")); assert.equal(path.resolve(prompt.request.cwd), path.resolve(f.cwd));
   assert.deepEqual((await readdir(path.join(f.root, "pane/run"))).filter(f => f.endsWith(".json")), []);
+  assert.deepEqual((await request(server, token, route, body)).value, { status: "pending" });
   const confirmed = await request(server, token, "/api/trust/" + prompt.request.id, { requestId: randomUUID(), decision: { trusted: true, remember: true } }); assert.equal(confirmed.code, 200);
   const result = await sending; assert.equal(result.code, 200, JSON.stringify(result)); assert.equal(result.value.snapshot.projectTrusted, true);
+  assert.deepEqual((await request(server, token, route, body)).value, result.value);
+  const conflict = await request(server, token, route, { ...body, command: { type: "prompt", message: "不同内容" } }); assert.equal(conflict.value.error, "idempotencyConflict");
   const saved = JSON.parse(await readFile(path.join(f.agentDir, "trust.json"), "utf8")); assert.ok(JSON.stringify(saved).includes("true"));
   const id = result.value.snapshot.ref.id; await until(async () => (await snapshot(server, token, id)).status === "idle");
+  assert.equal((await readFile(f.env.FAKE_REQUEST_LOG, "utf8")).split("\n").filter(line => line && JSON.parse(line).kind === "request").length, 1);
  } finally { connection?.close(); await server.close(); await f.cleanup(); }
 });
 

@@ -35,7 +35,7 @@ export interface PanePlugin {
   };
 }
 
-export default interface PluginFactory { (): PanePlugin }
+export type PanePluginFactory = () => PanePlugin;
 
 // 草案，P0 后冻结
 export interface PaneHostContext {
