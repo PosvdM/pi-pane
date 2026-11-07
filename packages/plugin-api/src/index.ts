@@ -474,7 +474,6 @@ export interface BannerState extends PaneBanner {
   sourceUnavailable: boolean;    // 来源插件未加载、初始化失败、停用或卸载
 }
 
-export interface ExtensionUiRequest { type: "extension_ui_request"; id: string; method: string; [key: string]: unknown }
 export const PANE_PROTOCOL = 1;
 export function negotiateProtocol(peer: readonly [number, number], supported: readonly [number, number] = [1, 1]): number {
   for (const range of [peer, supported]) {
@@ -485,4 +484,3 @@ export function negotiateProtocol(peer: readonly [number, number], supported: re
   return version;
 }
 export type DraftNode = { type: "text"; text: string } | { type: "image"; assetId: string };
-export interface ControlRequest { requestId: string; expectedEpoch: string; expectedRevision: number; command: { type: string; [key: string]: unknown }; draft?: DraftNode[] }

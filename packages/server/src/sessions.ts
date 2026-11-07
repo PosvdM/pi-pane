@@ -3,7 +3,8 @@ import { watchFile, unwatchFile } from "node:fs";
 import { readFile, readdir, rm, mkdir, stat, writeFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { stopByIdentity, probeSessionWriterLock, type ProcessIdentity, type StopReport } from "pi-hostkit";
-import type { ControlRequest, DraftNode, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
+import type { DraftNode, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
+import type { ControlRequest, ExtensionUiRequest } from "./pi-rpc.js";
 import { AssetStore } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { ControlQueue, RequestLedger } from "./control.js";
@@ -16,7 +17,7 @@ import { TrustDecisions } from "./trust.js";
 interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle;
   state?: any; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>; clients: number; lastActive: number;
-  holds: Map<string, { source: string; reason: string }>; ui: Map<string, any>; recentExternal: boolean; closed: boolean;
+  holds: Map<string, { source: string; reason: string }>; ui: Map<string, ExtensionUiRequest>; recentExternal: boolean; closed: boolean;
 }
 const mutations = new Set(["prompt", "steer", "follow_up", "stop", "close", "restart", "set_model", "set_thinking_level", "compact", "new_session", "fork", "clone", "set_session_name"]);
 const queries = new Set(["get_state", "get_available_models", "get_commands", "get_session_stats", "get_fork_messages", "get_last_assistant_text"]);

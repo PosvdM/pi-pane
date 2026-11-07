@@ -48,6 +48,13 @@ test("pane 协商选择交集最高版本并拒绝不兼容范围", () => {
   assert.throws(() => negotiateProtocol([1, 2], [3, 5]), /不兼容/);
 });
 
+test("通用插件类型声明不导出 pi 原生 RPC 信封", async () => {
+  const declarations = await readFile(new URL("../packages/plugin-api/dist/index.d.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(declarations, /\\b(?:ExtensionUiRequest|ControlRequest)\\b/);
+  const adapter = await readFile(new URL("../packages/server/dist/pi-rpc.d.ts", import.meta.url), "utf8");
+  assert.match(adapter, /interface ExtensionUiRequest/); assert.match(adapter, /interface ControlRequest/);
+});
+
 test("SessionModel 同步快照切点重放、实时订阅及取消", async t => {
   const { model } = await fixture(t);
   model.reset([entry("a")], "a");
