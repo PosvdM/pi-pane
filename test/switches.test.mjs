@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { writeFile, utimes, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { probeSessionWriterLock } from "pi-hostkit";
 import { piFixture, until, providerPath } from "./fixtures/helpers.mjs";
 import { startServer, pair, open, control, snapshot } from "./fixtures/client.mjs";
@@ -32,6 +33,33 @@ test("扩展运行中切换会话：旧订阅得到替换事件，旧 epoch 不�
   assert.equal((await probeSessionWriterLock(after.sessionFile)).held, true);
   assert.equal((await readFile(after.sessionFile, "utf8")).includes("不能进入新会话"), false);
  } finally { connection?.close(); await server.close(); await f.cleanup(); }
+});
+
+test("A resume 到已只读订阅的 B：复用目标模型并保留订阅、客户端和保活", { timeout: 45000 }, async () => {
+ const f = await piFixture(script); const file = f.sessionPath("opened-target");
+ await writeFile(path.join(f.agentDir, "trust.json"), JSON.stringify({ [f.cwd]: true }));
+ await writeFile(file, JSON.stringify({ type: "session", version: 3, id: "opened-target", cwd: f.cwd, timestamp: new Date().toISOString() }) + "\n"); await utimes(file, new Date(0), new Date(0));
+ const server = await startServer(f, { idleReclaimMs: 0, extraExtensions: [providerPath, commandPath] }); let connection; let releaseHold;
+ try {
+  const token = await pair(server); const b = await open(server, token, f, { sessionFile: file });
+  connection = await connect(server, token); connection.subscribe(b);
+  const target = server.sessions.records.get(b.ref.id); const model = target.model;
+  await until(() => target.clients === 1); releaseHold = server.sessions.hold(b.ref.id, "test", "目标保活"); const active = target.lastActive;
+  const first = await control(server, token, await open(server, token, f), { type: "prompt", message: "源会话" }); assert.equal(first.code, 200); assert.equal(first.value.status, "accepted", JSON.stringify(first));
+  const a = await until(async () => { const s = await snapshot(server, token, first.value.snapshot.ref.id); return s.status === "idle" && s; });
+  const switching = await control(server, token, a, { type: "prompt", message: "/pane-test-resume " + file }); assert.equal(switching.code, 200, JSON.stringify(switching));
+  await until(() => connection.messages.find(m => m.ref?.id === b.ref.id && m.event?.type === "resync"));
+  assert.equal(server.sessions.records.get(b.ref.id), target); assert.equal(target.model, model); assert.equal(target.clients, 1); assert.equal(target.holds.size, 1); assert.ok(target.lastActive >= active);
+  const rebound = await snapshot(server, token, b.ref.id); assert.notEqual(rebound.cursor.epoch, b.cursor.epoch); assert.equal(rebound.readonly, false);
+  const stale = await control(server, token, b, { type: "prompt", message: "旧目标 epoch" }); assert.equal(stale.code, 409); assert.equal(stale.value.error, "epochChanged");
+  await server.sessions.reclaim(); assert.equal(target.handle.acceptingInput, true);
+  const sent = await control(server, token, rebound, { type: "prompt", message: "目标后续输出" }); assert.equal(sent.code, 200, JSON.stringify(sent));
+  await until(() => connection.messages.some(m => m.ref?.id === b.ref.id && m.event?.type === "message_update"));
+  await until(async () => { const s = await snapshot(server, token, b.ref.id); return s.status === "idle" && JSON.stringify(s.entries).includes("目标后续输出"); });
+  assert.equal((await snapshot(server, token, a.ref.id)).readonly, true);
+  connection.close(); await until(() => target.clients === 0); releaseHold(); releaseHold = undefined;
+  await server.sessions.reclaim(); assert.equal(target.handle, undefined);
+ } finally { releaseHold?.(); connection?.close(); await server.close(); await f.cleanup(); }
 });
 
 test("其他进程以 pi-agora 身份持有同一 hostkit 写锁，pane 只读打开且不拉起写者", { timeout: 60000 }, async () => {

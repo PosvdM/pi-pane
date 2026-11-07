@@ -111,7 +111,7 @@ export class Sessions {
   }
   command(id: string, request: ControlRequest): Promise<any> {
     return this.ledger.execute(request.requestId, { sessionId: id, ...request }, () => this.record(id).control.run(async () => {
-      const session = this.record(id); const model = session.model; const command = request.command;
+      let session = this.record(id); const model = session.model; const command = request.command;
       assert(command && mutations.has(command.type), "unsupportedCommand", "不支持此会话控制命令");
       assert(request.expectedEpoch === model.epoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
       assert(request.expectedRevision === model.controlRevision, "revisionChanged", "会话状态已变化，请重新确认", 409);
@@ -137,7 +137,9 @@ export class Sessions {
       }
       // 受理控制操作只递增 revision；生成阶段由真实事件驱动，handled/拒绝不推测为 streaming。
       model.control(model.status, model.inFlight.phase, undefined, true);
-      const response = await session.handle.send(rpc, { trackResult: true });
+      const handle = session.handle;
+      const response = await handle.send(rpc, { trackResult: true });
+      session = this.files.get(fileKey(handle.sessionFile)) ?? session;
       try {
         await this.sync(session);
         if (["set_model", "set_thinking_level", "compact"].includes(command.type) && session.handle?.acceptingInput) {
@@ -167,11 +169,13 @@ export class Sessions {
   private async start(session: HostedSession, assumeNoWriter = false): Promise<void> {
     assert(!session.recentExternal, "recentModification", "该会话可能正在别处运行，请只读查看或 Fork 为新会话", 409);
     await this.trust.request(session.cwd);
+    let attached = session;
     try {
       session.handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir: await this.store.sessionDir(session.cwd), decisions: this.trust.config(), assumeNoWriter }, {
-        onRecord: (event) => this.receive(session, event),
-        onReady: (state, data, reason) => this.rebind(session, state, data, reason),
+        onRecord: (event) => this.receive(attached, event),
+        onReady: (state, data, reason) => { attached = this.rebind(attached, state, data, reason); },
         onExit: (reason, report, error) => {
+          const session = attached;
           if (report) this.reports.push(report);
           session.handle = undefined; session.ui.clear();
           if (reason === "会话已关闭" && !error) {
@@ -191,18 +195,27 @@ export class Sessions {
       throw error;
     }
   }
-  private rebind(session: HostedSession, state: any, data: any, reason: string): void {
+  private rebind(session: HostedSession, state: any, data: any, reason: string): HostedSession {
     const old = session.model; const changed = state.sessionId !== session.id || fileKey(state.sessionFile) !== fileKey(session.file);
     if (changed) {
       old.emit({ type: "pane_session_replaced", newRef: { source: "pane", id: state.sessionId }, reason: reason === "startup" ? "new" : reason });
       old.readonly = true; old.readonlyReason = "archived"; old.control("idle", "idle", undefined, true);
-      const previous: HostedSession = { ...session, handle: undefined, drafts: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
-      this.records.set(session.id, previous); this.files.set(fileKey(session.file), previous);
-      session.id = state.sessionId; session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
-      this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
+      const target = this.files.get(fileKey(state.sessionFile));
+      if (target && target !== session) {
+        assert(target.id === state.sessionId && !target.handle, "sessionIdentityConflict", "目标会话身份冲突或已被托管", 409);
+        // 保留目标对象及其模型：订阅退订闭包、clients、holds 和活动时间仍指向同一记录。
+        target.handle = session.handle; session.handle = undefined; session.ui.clear(); session.dirty = false;
+        session = target;
+      } else {
+        const previous: HostedSession = { ...session, handle: undefined, drafts: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
+        this.records.set(session.id, previous); this.files.set(fileKey(session.file), previous);
+        session.id = state.sessionId; session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
+        this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
+      }
     }
     session.state = state; session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
     session.model.reset(data.entries as Entry[], data.leafId); session.model.control("idle", "idle", undefined, true); session.recentExternal = false;
+    return session;
   }
   private receive(session: HostedSession, event: any): void {
     session.lastActive = Date.now();
@@ -218,9 +231,9 @@ export class Sessions {
     if (session.syncing) return session.syncing;
     session.syncing = (async () => {
       while (session.dirty && session.handle?.acceptingInput) {
-        session.dirty = false; const model = session.model; const epoch = model.epoch; const since = model.entries.at(-1)?.id;
-        const response = await session.handle.send({ type: "get_entries", ...(since ? { since } : {}) });
-        if (epoch !== model.epoch || session.model !== model) continue;
+        session.dirty = false; const model = session.model; const epoch = model.epoch; const since = model.entries.at(-1)?.id; const handle = session.handle;
+        const response = await handle.send({ type: "get_entries", ...(since ? { since } : {}) });
+        if (epoch !== model.epoch || session.model !== model || session.handle !== handle) continue;
         const data = response.data as any; model.append(data.entries, data.leafId);
       }
     })().finally(() => { session.syncing = undefined; });

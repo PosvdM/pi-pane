@@ -139,7 +139,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 **切换成功后**（收到新会话的 `session_start`，带 `previousSessionFile`）：
 
-1. 服务端调用 `get_state` 取新的 `sessionId` 和 `sessionFile`，再用 `get_entries` 重建会话模型。
+1. 服务端调用 `get_state` 取新的 `sessionId` 和 `sessionFile`，再用 `get_entries` 重建会话模型。目标已只读打开时，复用目标记录和模型，向已有订阅发 `resync`，保留订阅、客户端计数、保活及活动时间；进程事件与退出回调迁移到该目标记录。
 2. 控制队列等新的 pane-bridge 实例就绪后才恢复（见“会话替换后的重绑定”）。新会话节点变为托管中，进程的事件流更换 epoch；旧文件的写锁按 hostkit 在新会话的 `session_start` 之后释放；旧会话节点变为未托管，保留在树中，可以只读查看。
 3. 正在查看旧会话的标签页收到 `pane_session_replaced`，显示“此会话的进程已切换到 <新会话>”和“打开新会话”按钮，然后转为只读视图。
 
