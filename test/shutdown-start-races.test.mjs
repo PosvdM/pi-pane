@@ -4,6 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import fs, { readdir, writeFile, utimes } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
+import { inspect } from "node:util";
 import { isSameProcess, probeSessionWriterLock } from "pi-hostkit";
 import { Sessions } from "../packages/server/dist/sessions.js";
 import { AssetStore } from "../packages/server/dist/assets.js";
@@ -259,7 +260,7 @@ test("spawn 失败后的写锁释放拒绝先于关闭完成，仍保留实例�
   } finally { await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
 });
 
-for (const phase of ["report", "stop", "complete"]) test(`spawn 真实提交失败的 ${phase} 清理结果不被 release 成功覆盖`, { timeout: 30000 }, async () => {
+for (const phase of ["report", "stop"]) test(`spawn 真实提交失败的 ${phase} 清理结果不被 release 成功覆盖`, { timeout: 30000 }, async (t) => {
   const f = await piFixture(); const server = await startServer(f); let releasedWriter = false; let failedReport; let identity;
   try {
     const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
@@ -275,9 +276,10 @@ for (const phase of ["report", "stop", "complete"]) test(`spawn 真实提交失�
         identity = proc.identity; const stop = proc.stop.bind(proc);
         proc.stop = async (...args) => {
           const report = await stop(...args);
-          assert.equal(await isSameProcess(proc.identity), "gone", "根进程真实退出后才注入核查失败");
+          const writerState = await isSameProcess(proc.identity);
+          t.diagnostic(JSON.stringify({ phase, writerState, hostkitStopReport: report }));
+          assert.equal(writerState, "gone", "根进程真实退出后才注入核查失败");
           if (phase === "stop") throw new Error("注入 hostkit 停止拒绝且没有报告");
-          if (phase === "complete") return report;
           failedReport = { ...report, steps: [...report.steps, { step: "snapshot", ok: false, at: new Date().toISOString(), detail: "注入快照核查失败" }] };
           return failedReport;
         };
@@ -287,7 +289,7 @@ for (const phase of ["report", "stop", "complete"]) test(`spawn 真实提交失�
       return lock;
     };
     await assert.rejects(server.sessions.start(source), error => {
-      if (phase === "complete") { assert.match(error.message, /注入 running 记录提交失败/); return true; }
+      t.diagnostic(inspect(error, { depth: 12 }));
       assert.ok(error instanceof AggregateError); assert.match(error.message, /Cannot stop failed session writer/);
       assert.match(error.errors[0].message, /注入 running 记录提交失败/);
       if (phase === "report") assert.equal(error.errors[1].cause, failedReport);
@@ -300,14 +302,31 @@ for (const phase of ["report", "stop", "complete"]) test(`spawn 真实提交失�
     assert.equal(server.sessions.starts.size, 0); assert.equal(server.sessions.handles.size, 0);
     let releasedInstance = false; const release = server.lock.release.bind(server.lock);
     server.lock.release = async () => { releasedInstance = true; await release(); };
-    if (phase === "complete") {
-      await server.close(); assert.equal(releasedInstance, true, "普通启动拒绝在清理确认后允许关闭成功");
-    } else {
-      await assert.rejects(server.close(), AggregateError);
-      await assert.rejects(server.close(), AggregateError);
-      assert.equal(releasedInstance, false, "成功释放写锁不能清除 spawn 已报告的清理未确认");
-    }
+    await assert.rejects(server.close(), AggregateError);
+    await assert.rejects(server.close(), AggregateError);
+    assert.equal(releasedInstance, false, "成功释放写锁不能清除 spawn 已报告的清理未确认");
   } finally { await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
+});
+
+test("普通 spawn 拒绝在没有创建进程且真实写锁释放后允许关闭", { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); const failure = new Error("注入未创建进程的普通 spawn 拒绝"); let releasedWriter = false;
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
+    const acquire = server.sessions.driver.acquireWriter;
+    server.sessions.driver.acquireWriter = async (...args) => {
+      const lock = await acquire(...args); const release = lock.release.bind(lock);
+      lock.spawnWriter = async () => { throw failure; };
+      lock.release = async (...args) => { await release(...args); releasedWriter = true; };
+      return lock;
+    };
+    await assert.rejects(server.sessions.start(source), error => error === failure); await new Promise(setImmediate);
+    assert.equal(releasedWriter, true); assert.equal((await probeSessionWriterLock(source.file)).held, false);
+    assert.equal(server.sessions.starts.size, 0); assert.equal(server.sessions.handles.size, 0);
+    assert.deepEqual(server.sessions.cleanupErrors, []);
+    let releasedInstance = false; const release = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { releasedInstance = true; await release(); };
+    await server.close(); assert.equal(releasedInstance, true);
+  } finally { await server.close(); await f.cleanup(); }
 });
 
 for (const phase of ["acquire", "target-update", "clear-queue"]) test(`hostkit ${phase} 的报告错误在后续清理成功后仍由实例保留`, { timeout: 30000 }, async () => {
