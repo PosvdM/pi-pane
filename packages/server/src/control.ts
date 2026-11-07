@@ -7,7 +7,7 @@ function canonical(value: any): string {
 }
 export class RequestLedger {
   private records = new Map<string, { hash: string; finished?: number; result?: any; error?: unknown }>();
-  constructor(private readonly now = Date.now) {}
+  constructor(private readonly now = Date.now, private readonly waitMs = 30000) {}
   execute<T>(id: string, content: unknown, action: () => Promise<T>): Promise<T | { status: "pending" }> {
     assert(typeof id === "string" && id.length >= 1 && id.length <= 256, "invalidRequestId", "requestId 必须为 1 到 256 个字符");
     this.sweep(); const hash = createHash("sha256").update(canonical(content)).digest("hex"); const previous = this.records.get(id);
@@ -17,7 +17,11 @@ export class RequestLedger {
       if (previous.error) return Promise.reject(previous.error); return Promise.resolve(structuredClone(previous.result));
     }
     const record: { hash: string; finished?: number; result?: any; error?: unknown } = { hash }; this.records.set(id, record);
-    return Promise.resolve().then(action).then((result) => { record.finished = this.now(); record.result = structuredClone(result); return result; }, (error) => { record.finished = this.now(); record.error = error; throw error; });
+    const operation = Promise.resolve().then(action).then((result) => { record.finished = this.now(); record.result = structuredClone(result); return result; }, (error) => { record.finished = this.now(); record.error = error; throw error; });
+    // HTTP 等待到期只返回 pending；底层操作继续写入同一条幂等记录。
+    let timer: ReturnType<typeof setTimeout>;
+    const waiting = new Promise<{ status: "pending" }>((resolve) => { timer = setTimeout(() => resolve({ status: "pending" }), this.waitMs); });
+    return Promise.race([operation, waiting]).finally(() => clearTimeout(timer));
   }
   sweep(): void { for (const [id, record] of this.records) if (record.finished !== undefined && this.now() - record.finished > 86400000) this.records.delete(id); }
 }

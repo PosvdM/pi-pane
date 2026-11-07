@@ -239,7 +239,7 @@ interface DriverHandle {
 ### 通道
 
 - **命令**：HTTP `POST /api/...`，带 `Authorization` 头（见“鉴权”）。每个命令带 `requestId`（同时作为幂等键），会话命令还按“停止与控制队列”的表带 `expectedEpoch` 和 `expectedRevision`。如发送消息、steer、停止、切换模型、回应对话框、调用插件动作、提交表单、上传图片。
-- **幂等**：同一 `requestId` 的命令只执行一次。重复提交时服务端返回这次操作的**当前**状态：仍在执行就返回“处理中”，已结束就返回最终结果；最终结果至少保留 24 小时。同一 `requestId` 配不同的命令内容时拒绝（HTTP 409 `idempotencyConflict`）。服务端重启后幂等记录丢失，此时 epoch 已经改变，旧命令会被 epoch 检查拒绝。
+- **幂等**：同一 `requestId` 的命令只执行一次。HTTP 等待默认 30 秒（`rpcTimeoutMs`），等待到期返回 `{ status: "pending" }`，不取消底层控制操作、不完成幂等记录。控制 RPC 保留响应等待项，直到实际响应或传输关闭，信任询问、长时间压缩等操作的迟到结果仍写回同一记录。重复提交时服务端返回这次操作的**当前**状态：仍在执行就返回“处理中”，已结束就返回最终结果；最终结果至少保留 24 小时。传输中断且没有确认响应时返回 `rpcResultUnknown`，要求读取会话状态核对；只有 pi 明确拒绝的响应属于 `rpcRejected`。同一 `requestId` 配不同的命令内容时拒绝（HTTP 409 `idempotencyConflict`）。服务端重启后幂等记录丢失，此时 epoch 已经改变，旧命令会被 epoch 检查拒绝。
 - **事件**：一条 WebSocket `/ws`。浏览器订阅关心的会话和插件来源，服务端推送事件。
 
 ```ts

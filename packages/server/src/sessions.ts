@@ -8,7 +8,7 @@ import { AssetStore } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { ControlQueue, RequestLedger } from "./control.js";
 import { RpcSubprocessDriver, verifyStopped, type DriverHandle, type DriverOptions } from "./driver.js";
-import { assert, PaneError } from "./errors.js";
+import { assert, duration, PaneError } from "./errors.js";
 import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
@@ -22,7 +22,7 @@ const mutations = new Set(["prompt", "steer", "follow_up", "stop", "close", "res
 const queries = new Set(["get_state", "get_available_models", "get_commands", "get_session_stats", "get_fork_messages", "get_last_assistant_text"]);
 export interface SessionManagerOptions extends DriverOptions { idleReclaimMs?: number }
 export class Sessions {
-  readonly ledger = new RequestLedger();
+  readonly ledger: RequestLedger;
   private records = new Map<string, HostedSession>(); private files = new Map<string, HostedSession>();
   private driver: RpcSubprocessDriver; private timer: ReturnType<typeof setInterval>; private projects = new Set<string>();
   private state: Record<string, unknown> = {};
@@ -31,6 +31,7 @@ export class Sessions {
   private recovering = true; readonly reports: StopReport[] = [];
   constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
     private readonly emitUi: (sessionId: string, request: any) => void) {
+    this.ledger = new RequestLedger(Date.now, duration(options.rpcTimeoutMs, 30000));
     this.driver = new RpcSubprocessDriver(broker, { ...options, onTrust: (cwd) => trust.request(cwd) });
     this.timer = setInterval(() => { void this.reclaim().catch(() => {}); }, 10000); this.timer.unref();
   }
@@ -136,7 +137,7 @@ export class Sessions {
       }
       model.control(["prompt", "steer", "follow_up", "compact"].includes(command.type) ? "running" : model.status,
         command.type === "compact" ? "compacting" : ["prompt", "steer", "follow_up"].includes(command.type) ? "streaming" : model.inFlight.phase, undefined, true);
-      const response = await session.handle.send(rpc);
+      const response = await session.handle.send(rpc, { trackResult: true });
       await this.sync(session);
       if (["set_model", "set_thinking_level"].includes(command.type)) session.state = (await session.handle.send({ type: "get_state" })).data;
       return { status: "accepted", response, snapshot: this.view(session) };

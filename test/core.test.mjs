@@ -197,6 +197,15 @@ test("RequestLedger 缓存失败，final 至少保留 24h，pending 不过期", 
   gate.resolve("done"); assert.equal(await pending, "done");
 });
 
+test("RequestLedger 等待超时不结束操作，迟到结果覆盖 pending", async () => {
+  const ledger = new RequestLedger(Date.now, 10); const gate = deferred(); let calls = 0;
+  assert.deepEqual(await ledger.execute("late", {}, () => { calls++; return gate.promise; }), { status: "pending" });
+  assert.deepEqual(await ledger.execute("late", {}, () => assert.fail("duplicate")), { status: "pending" });
+  gate.resolve({ status: "accepted", response: "late response" }); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(await ledger.execute("late", {}, () => assert.fail("duplicate")), { status: "accepted", response: "late response" });
+  assert.equal(calls, 1);
+});
+
 test("ControlQueue 串行执行且失败不阻塞后续", async () => {
   const queue = new ControlQueue(); const gate = deferred(); const order = [];
   const first = queue.run(async () => { order.push("first:start"); await gate.promise; order.push("first:end"); return 1; });

@@ -39,20 +39,27 @@ test("没有项目资源但保存为 false 时，以 pane-bridge 的实际不信
  finally { await server.close(); await f.cleanup(); }
 });
 
-test("进程内 resume 到新项目时及时询问信任，回连实例复用并回报实际加载状态", { timeout: 60000 }, async () => {
+test("resume 信任回答晚于 RPC 等待期限时，requestId 保持 pending 并追踪最终结果", { timeout: 60000 }, async () => {
  const f = await piFixture(reply); const cwd = path.join(f.root, "other"); await resource(cwd); const target = f.sessionPath("other");
  await writeFile(target, JSON.stringify({ type: "session", version: 3, id: "other", cwd, timestamp: new Date().toISOString() }) + "\n");
  await writeFile(path.join(f.agentDir, "trust.json"), JSON.stringify({ [f.cwd]: true }));
- const server = await startServer(f, { extraExtensions: [providerPath, fileURLToPath(new URL("./fixtures/session-commands.ts", import.meta.url))] }); let connection;
+ // 将原 30 秒等待缩短为 5 秒，信任期限仍为默认 55 秒。
+ const server = await startServer(f, { rpcTimeoutMs: 5000, extraExtensions: [providerPath, fileURLToPath(new URL("./fixtures/session-commands.ts", import.meta.url))] }); let connection;
  try {
   const token = await pair(server); connection = await connect(server, token); const initial = await open(server, token, f); const first = await control(server, token, initial, { type: "prompt", message: "初始项目" }); assert.equal(first.code, 200);
   const id = first.value.snapshot.ref.id; await until(async () => (await snapshot(server, token, id)).status === "idle"); const state = await snapshot(server, token, id); connection.subscribe(state);
-   const switching = control(server, token, state, { type: "prompt", message: "/pane-test-resume " + target });
+  const route = "/api/sessions/" + state.ref.id + "/control";
+  const body = { requestId: randomUUID(), expectedEpoch: state.cursor.epoch, expectedRevision: state.controlRevision, command: { type: "prompt", message: "/pane-test-resume " + target } };
+  const switching = request(server, token, route, body);
   const prompt = await until(() => connection.messages.find(m => m.type === "project_trust")); assert.equal(path.resolve(prompt.request.cwd), path.resolve(cwd));
-  // 用户等待超过默认十秒的 bridge 就绪时间时，信任弹窗仍须有效，不能提前终止写者。
-  await delay(11000); const held = await probeSessionWriterLock(state.sessionFile); assert.equal(held.held, true); assert.equal(await isSameProcess(held.record.writer), "alive");
+  const timedOut = await switching; assert.equal(timedOut.code, 200); assert.deepEqual(timedOut.value, { status: "pending" });
+  await delay(6000); // 同时跨过原 bridge 十秒期限，信任询问仍不能杀掉写者。
+  assert.deepEqual((await request(server, token, route, body)).value, { status: "pending" });
+  const held = await probeSessionWriterLock(state.sessionFile); assert.equal(held.held, true); assert.equal(await isSameProcess(held.record.writer), "alive");
   await request(server, token, "/api/trust/" + prompt.request.id, { requestId: randomUUID(), decision: { trusted: false, remember: false } });
-  const result = await switching; assert.equal(result.code, 200, JSON.stringify(result));
+  const result = await until(async () => { const r = await request(server, token, route, body); return r.value.status !== "pending" && r; });
+  assert.equal(result.code, 200, JSON.stringify(result)); assert.equal(result.value.status, "accepted");
+  assert.deepEqual((await request(server, token, route, body)).value, result.value);
   const after = await until(async () => { const s = await snapshot(server, token, "other"); return s.ref && !s.readonly && s; }); assert.equal(after.projectTrusted, false);
  } finally { connection?.close(); await server.close(); await f.cleanup(); }
 });

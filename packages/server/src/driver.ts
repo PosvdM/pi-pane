@@ -27,7 +27,7 @@ export interface SessionDriver { start(spec: DriverSpec, callbacks: DriverCallba
 export interface DriverHandle {
   readonly identity: ProcessIdentity; readonly ready: Promise<void>; readonly exited: Promise<void>; readonly sessionFile: string;
   readonly acceptingInput: boolean;
-  send(command: RpcCommand, opts?: { timeoutMs?: number }): Promise<RpcResponse>;
+  send(command: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse>;
   respondUi(response: ExtensionUiResponse): void;
   stop(): Promise<StopReport>;
 }
@@ -147,12 +147,18 @@ class RpcHandle implements DriverHandle {
       default: throw new PaneError("unknownBridgeEvent", "不支持此 pane-bridge 请求");
     }
   }
-  private raw(command: RpcCommand, timeoutMs = this.options.rpcTimeoutMs ?? 30000): Promise<any> {
-    return this.proc.rpc.send(command, { timeoutMs }).then((response) => { assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409); return response; });
+  private raw(command: RpcCommand, timeoutMs = this.options.rpcTimeoutMs ?? 30000, trackResult = false): Promise<any> {
+    return this.proc.rpc.send(command, trackResult ? {} : { timeoutMs }).then((response) => { assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409); return response; });
   }
-  async send(command: RpcCommand, opts?: { timeoutMs?: number }): Promise<RpcResponse> {
+  async send(command: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse> {
     assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪或会话正在停止", 409);
-    const response = await this.raw(command, opts?.timeoutMs);
+    let response: RpcResponse;
+    try { response = await this.raw(command, opts?.timeoutMs, opts?.trackResult); }
+    catch (error) {
+      if (opts?.trackResult && !(error instanceof PaneError && error.code === "rpcRejected"))
+        throw new PaneError("rpcResultUnknown", "RPC 连接中断，无法确认操作结果；请读取会话状态核对", 503);
+      throw error;
+    }
     if (["prompt", "new_session", "fork", "clone"].includes(command.type) && this.enabled && !this.pendingTarget && this.locks.size > 1) {
       const state = await this.raw({ type: "get_state" });
       if (fileKey(state.data.sessionFile) === fileKey(this.current.sessionFile)) {
