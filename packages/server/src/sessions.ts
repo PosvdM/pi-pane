@@ -170,6 +170,9 @@ export class Sessions {
       });
       await session.handle.ready;
     } catch (error) {
+      // ready 可以先于停止流程失败；对外返回启动失败前，等待身份复查和写锁处理完成。
+      const failedHandle = session.handle;
+      if (failedHandle && !failedHandle.acceptingInput) await failedHandle.exited;
       if (error instanceof PaneError && error.code === "externalWriter") session.model.readonlyReason = "externalWriter";
       else if (session.model.status !== "interrupted") session.model.interrupt("startup", String(error));
       throw error;

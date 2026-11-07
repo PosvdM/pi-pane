@@ -28,6 +28,7 @@ for (const mode of ["bad-ticket", "stolen-ticket", "reject-callback", "no-ready"
         assert.equal((await probeSessionWriterLock(initial.sessionFile)).held, true);
       }
       const response = await result; assert.equal(response.code, 503, JSON.stringify(response));
+      assert.equal((await probeSessionWriterLock(initial.sessionFile)).held, false, "启动失败响应必须等到停止和写锁处理完成");
       const interrupted = await until(async () => { const s = await snapshot(server, token, initial.ref.id); return s.status === "interrupted" && s; });
       assert.equal(interrupted.readonly, true); await until(async () => await isSameProcess(writer) === "gone", 2000);
       const audit = await records(f.env.PANE_TEST_FAULT_LOG); assert.equal(audit.some(r => r.rpcInput && !["clear_queue", "abort"].includes(r.rpcInput)), false, JSON.stringify(audit));
