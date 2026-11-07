@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { acquireSessionWriterLock, currentProcessIdentity, isSameProcess, isSessionWriterLock,
+import { acquireSessionWriterLock,
   type Containment, type ExtensionUiResponse, type ManagedProcess, type PiInstall, type ProcessIdentity,
   type RpcCommand, type RpcResponse, type SessionWriterLock, type StopOptions, type StopReport } from "pi-hostkit";
 import { BridgeBroker, type TrustChoice } from "./bridge.js";
 import { assert, duration, PaneError } from "./errors.js";
 import { fileKey } from "./store.js";
+import { acquireRecoveredWriter } from "./writer-recovery.js";
+import { verifyStopped } from "./stop-report.js";
+export { checkStopReport, verifyStopped } from "./stop-report.js";
 
 export interface DriverSpec { cwd: string; sessionFile: string; sessionDir: string; decisions: Record<string, TrustChoice>; assumeNoWriter?: boolean }
 export interface DriverOptions {
@@ -28,24 +31,12 @@ export interface DriverHandle {
   respondUi(response: ExtensionUiResponse): void;
   stop(): Promise<StopReport>;
 }
-export function checkStopReport(report: StopReport): void {
-  assert(["job_object", "cgroup", "snapshot_visible"].includes(report.coverage), "stopCoverage", "停止报告的覆盖范围无效", 503);
-  const cleanupFailed = report.steps.some((step) => step.step === "snapshot cleanup" && !step.ok);
-  const verified = report.steps.some((step) => step.step === "verify" && step.ok);
-  // 发信号失败不等于仍有残留；仅在独立最终复查通过后接受，快照枚举失败仍按不完整处理。
-  assert(!report.leftovers.length && !report.steps.some((step) => !step.ok && ["snapshot", "verify"].includes(step.step)) && (!cleanupFailed || verified), "stopIncomplete", "仍有存活或无法确认退出的进程，保留写锁", 503);
-}
-export async function verifyStopped(identity: ProcessIdentity, report: StopReport): Promise<void> {
-  checkStopReport(report);
-  assert(await isSameProcess(identity) === "gone", "stopIncomplete", "pi 尚未确认退出，保留写锁", 503);
-}
 export class RpcSubprocessDriver implements SessionDriver {
-  constructor(private readonly broker: BridgeBroker, private readonly options: DriverOptions) { duration(options.readyTimeoutMs, 10000); }
+  constructor(private readonly broker: BridgeBroker, private readonly options: DriverOptions,
+    private readonly acquireWriter = acquireSessionWriterLock) { duration(options.readyTimeoutMs, 10000); }
   async start(spec: DriverSpec, callbacks: DriverCallbacks): Promise<DriverHandle> {
-    const lock = await acquireSessionWriterLock(spec.sessionFile, { app: "pi-pane", identity: currentProcessIdentity(this.options.instanceId) });
-    assert(isSessionWriterLock(lock), "externalWriter", "会话已由其他宿主托管，只能只读打开", 409);
-    if (await lock.recoverPreviousWriter({ ...this.options.stopOptions, assumeNoWriter: spec.assumeNoWriter }) === "failed") throw new PaneError("recoveryFailed", "上一个写者状态不明，请确认没有遗留的 pi 后重试", 409);
-    for (const report of lock.recoveryReports) { try { checkStopReport(report); } catch (error) { await lock.release(); throw error; } }
+    const lock = await acquireRecoveredWriter(spec.sessionFile, this.options.home, this.options.instanceId,
+      { ...this.options.stopOptions, assumeNoWriter: spec.assumeNoWriter }, this.acquireWriter);
     let handle!: RpcHandle; let attachHandle!: () => void; const available = new Promise<void>((resolve) => { attachHandle = resolve; });
     const launch = this.broker.issue(spec.decisions, async (event) => { await available; return handle.bridgeEvent(event); });
     const env = { ...process.env, ...this.options.env, PANE_BRIDGE_URL: this.options.bridgeUrl, PANE_BRIDGE_TICKET: launch.ticket } as Record<string, string>;
@@ -61,7 +52,7 @@ export class RpcSubprocessDriver implements SessionDriver {
     } catch (error) {
       launch.close(); await lock.release(); throw error;
     }
-    handle = new RpcHandle(proc, lock, launch.close, spec, callbacks, this.options); attachHandle();
+    handle = new RpcHandle(proc, lock, launch.close, spec, callbacks, this.options, this.acquireWriter); attachHandle();
     try { await handle.persist(); return handle; }
     catch (error) { await handle.stop(); throw error; }
   }
@@ -75,7 +66,8 @@ class RpcHandle implements DriverHandle {
   private generation = 0; private initialization = Promise.resolve(); private started = false; private listeners: (() => void)[] = [];
   private readonly recordFile: string;
   constructor(private readonly proc: ManagedProcess, lock: SessionWriterLock, private readonly revoke: () => void,
-    private readonly spec: DriverSpec, private readonly callbacks: DriverCallbacks, private readonly options: DriverOptions) {
+    private readonly spec: DriverSpec, private readonly callbacks: DriverCallbacks, private readonly options: DriverOptions,
+    private readonly acquireWriter: typeof acquireSessionWriterLock) {
     this.identity = proc.identity; this.current = lock; this.locks.set(fileKey(lock.sessionFile), lock);
     this.recordFile = path.join(options.home, "run", `${proc.identity.runId}.json`);
     this.ready = new Promise((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; }); this.ready.catch(() => {});
@@ -98,9 +90,7 @@ class RpcHandle implements DriverHandle {
   }
   private async target(file: string): Promise<boolean> {
     const key = fileKey(file); if (this.locks.has(key)) return true;
-    const lock = await acquireSessionWriterLock(file, { app: "pi-pane", identity: currentProcessIdentity(this.options.instanceId) });
-    if (!isSessionWriterLock(lock)) return false;
-    if (await lock.recoverPreviousWriter(this.options.stopOptions) === "failed") return false;
+    const lock = await acquireRecoveredWriter(file, this.options.home, this.options.instanceId, this.options.stopOptions, this.acquireWriter);
     // 保留每个已取得的目标锁，直到 session_start 确认切走或写者停止。
     this.locks.set(key, lock);
     await lock.update({ writer: this.identity, state: "running" }); return true;

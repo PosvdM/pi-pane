@@ -118,8 +118,9 @@ node <pi>/dist/bundle/cli.js --mode rpc
 | 进程内切换到已有会话 | ③ | 见“会话切换” |
 | 进程内 new、fork、clone | ④ | 见“会话切换” |
 | 关闭、回收 | — | 确认 pi 进程树已退出后释放 |
-| 取得锁之后 | — | 启动新写者之前按 hostkit 清理共享记录里的遗留 pi（不论它属于 pi-pane 还是 pi-agora），清理失败时不拉起并提示用户 |
+| 取得锁之后 | — | 首次拉起和目标切换共用恢复检查：按 hostkit 清理遗留 pi，再检查每份 StopReport，报告不完整时不登记新 writer |
 
+- 恢复报告含失败的 snapshot/verify 或无法确认的残留时，即使根进程已退出，也保留内核锁和旧 writer 身份，共享记录为 `stopping`，不调用普通 `release()`。错误、旧记录及报告保存在 `recovery/<会话路径哈希>.json`；该诊断阻止后续拉起，重启服务端也不自动清除。需独立核查并清理遗留进程后，由维护者检查恢复记录及共享锁记录，才能解除隔离。
 - 写锁被另一个托管写者持有时，会话以只读方式打开（`readonlyReason = "externalWriter"`），显示持有者（如“由 pi-agora 托管”），提供“Fork 为新会话”。
 - 终端里直接运行的 pi 不参与写锁，pi-pane 无法确认它是否在写。打开会话前文件在最近 60 秒内被修改过时，pi-pane 提示“该会话可能正在别处运行”，提供“只读打开”和“Fork 为新会话”两个选项。强制与外部写者同时写入不支持。
 - pi-pane 打开之后终端里才开始写同一文件的情况检测不到，列入剩余风险。
@@ -447,6 +448,7 @@ pane-bridge 是 pi-pane 用 `-e` 加载进每个主会话的 pi 扩展，负责�
   cache/blobs/       # 从会话文件中提取的图片缓存，可以随时删除
   tmp/               # 导出等临时文件
   run/               # 本实例托管进程的身份记录（hostkit 的 ProcessIdentity）；会话写锁的共享记录不在这里，在 ~/.pi/hostkit/locks/
+  recovery/          # 不完整遗留写者恢复的诊断；保留并阻止自动拉起
   state.json         # 界面状态：打开的会话、侧栏展开状态、已知项目目录
   banners.json       # persistent 横幅（见 plugin-api.md 的“横幅”），写临时文件后原子替换
 ```
