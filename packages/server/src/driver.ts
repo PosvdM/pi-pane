@@ -230,9 +230,13 @@ class RpcHandle implements DriverHandle {
     this.stopPromise = this.performStop(); return this.stopPromise;
   }
   async drain(): Promise<void> {
-    // target 的迟到锁清理需要先等 stop；关闭在 stop 完成后排空，避免循环等待。
-    await Promise.allSettled([this.initialization, ...this.targets]);
-    if (this.cleanupErrors.length) throw new AggregateError(this.cleanupErrors, "迟到目标锁清理未确认");
+    // exited 只表示退出回调已执行；排空必须同时保留缓存的停止结果及迟到清理错误。
+    // stop 不等待 target 或 initialization，迟到目标可以安全等待同一个 stop 结果。
+    const results = await Promise.allSettled([this.stop(), this.initialization, ...this.targets]);
+    // 目标请求的 bridgeStopping/externalWriter 拒绝不是清理失败；未确认的清理由 cleanupErrors 保存。
+    const errors = [...this.cleanupErrors];
+    if (results[0]!.status === "rejected") errors.push(results[0]!.reason);
+    if (errors.length) throw new AggregateError(errors, "会话停止或目标锁清理未确认");
   }
   private async performStop(): Promise<StopReport> {
     let report: StopReport | undefined; let failure: unknown;

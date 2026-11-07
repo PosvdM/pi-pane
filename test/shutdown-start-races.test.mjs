@@ -166,6 +166,38 @@ test("停止未确认时关闭返回失败并保留实例锁，并发调用不�
   } finally { if (stop) { handle.stop = stop; await stop(); } await server.lock.release(); await f.cleanup(); }
 });
 
+for (const phase of ["process", "verify", "update", "release"]) test(`关闭前真实停止的 ${phase} 失败在退出及登记收尾后仍保留实例锁`, { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); let handle; let lock; let update; let release;
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
+    await server.sessions.start(source); handle = source.handle; lock = handle.current;
+    update = lock.update.bind(lock); release = lock.release.bind(lock);
+    const stop = handle.proc.stop.bind(handle.proc);
+    handle.proc.stop = async (...args) => {
+      const report = await stop(...args);
+      assert.equal(await isSameProcess(handle.identity), "gone", "故障只在真实进程停止后注入");
+      if (phase === "process") throw new Error("注入真实停止失败");
+      if (phase === "verify") return { ...report, steps: [...report.steps, { step: "verify", ok: false, at: new Date().toISOString() }] };
+      return report;
+    };
+    if (phase === "update") lock.update = async data => { if (data.state === "stopping") throw new Error("注入停止锁更新失败"); return update(data); };
+    if (phase === "release") lock.release = async () => { throw new Error("注入停止锁释放失败"); };
+    await assert.rejects(handle.stop()); await handle.exited;
+    assert.equal(source.handle, undefined, "必须经过真实 performStop 的 onExit");
+    const finished = server.sessions.handles.get(handle); await finished?.catch(() => {}); await new Promise(setImmediate);
+    let released = false; const releaseInstance = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { released = true; await releaseInstance(); };
+    await assert.rejects(server.close(), AggregateError); await assert.rejects(server.close(), AggregateError);
+    assert.equal(released, false); assert.equal(server.sessions.handles.has(handle), true);
+    assert.equal((await probeSessionWriterLock(source.file)).held, true);
+    assert.ok((await readdir(path.join(f.root, "pane", "run"))).includes(handle.identity.runId + ".json"));
+  } finally {
+    await server.close().catch(() => {});
+    if (lock) { lock.update = update; lock.release = release; await release(); }
+    await server.lock.release(); await f.cleanup();
+  }
+});
+
 test("重绑定复制出的旧记录不继承 syncing，重新托管后真正取条目", async () => {
   const sessions = Object.create(Sessions.prototype); sessions.assets = new AssetStore("unused");
   sessions.records = new Map(); sessions.files = new Map(); sessions.watch = () => {};
