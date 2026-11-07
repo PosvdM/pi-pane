@@ -59,7 +59,8 @@ export class RpcSubprocessDriver implements SessionDriver {
       launch.close(); await lock.release(); throw error;
     }
     handle = new RpcHandle(proc, lock, launch.close, spec, callbacks, this.options); attachHandle();
-    await handle.persist(); return handle;
+    try { await handle.persist(); return handle; }
+    catch (error) { await handle.stop(); throw error; }
   }
 }
 class RpcHandle implements DriverHandle {
@@ -78,6 +79,7 @@ class RpcHandle implements DriverHandle {
     this.exited = new Promise((resolve) => { this.resolveExit = resolve; });
     this.listeners.push(proc.rpc.onEvent((event) => callbacks.onRecord(event)), proc.rpc.onUiRequest((event) => callbacks.onRecord(event)), proc.rpc.onError((error) => this.fail("RPC 传输故障", error)));
     this.armTimeout();
+    void proc.rpc.closed.then(() => { if (!this.stopping) this.fail("RPC 输出管道关闭"); });
     void proc.exited.then((info) => { if (!this.stopping) this.fail(this.started ? "pi 进程意外退出" : `pane-bridge 就绪前退出（${info.code}）：${proc.stderrTail()}`); });
   }
   get sessionFile(): string { return this.current.sessionFile; }
@@ -150,7 +152,14 @@ class RpcHandle implements DriverHandle {
   }
   async send(command: RpcCommand, opts?: { timeoutMs?: number }): Promise<RpcResponse> {
     assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪或会话正在停止", 409);
-    return this.raw(command, opts?.timeoutMs);
+    const response = await this.raw(command, opts?.timeoutMs);
+    if (["prompt", "new_session", "fork", "clone"].includes(command.type) && this.enabled && !this.pendingTarget && this.locks.size > 1) {
+      const state = await this.raw({ type: "get_state" });
+      if (fileKey(state.data.sessionFile) === fileKey(this.current.sessionFile)) {
+        for (const [key, lock] of this.locks) if (lock !== this.current) { await lock.release({ writerSwitchedAway: true }); this.locks.delete(key); }
+      }
+    }
+    return response;
   }
   respondUi(response: ExtensionUiResponse): void { assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪", 409); this.proc.rpc.respondUi(response); }
   private fail(reason: string, error?: unknown): void {

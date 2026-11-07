@@ -25,8 +25,9 @@ export class Sessions {
   readonly ledger = new RequestLedger();
   private records = new Map<string, HostedSession>(); private files = new Map<string, HostedSession>();
   private driver: RpcSubprocessDriver; private timer: ReturnType<typeof setInterval>; private projects = new Set<string>();
+  private recoveredFiles = new Set<string>();
   private recovering = true; readonly reports: StopReport[] = [];
-  constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, broker: BridgeBroker, private readonly options: SessionManagerOptions,
+  constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
     private readonly emitUi: (sessionId: string, request: any) => void) {
     this.driver = new RpcSubprocessDriver(broker, { ...options, onTrust: (cwd) => trust.request(cwd) });
     this.timer = setInterval(() => { void this.reclaim().catch(() => {}); }, 10000); this.timer.unref();
@@ -39,9 +40,16 @@ export class Sessions {
       assert(record.identity && typeof record.sessionFile === "string", "invalidRunRecord", "运行记录损坏，不能重新打开会话", 503);
       // 在所有恢复完成前不接受会话打开；身份查询不明或 StopReport 不完整时保留现场。
       const report = await stopByIdentity(record.identity, this.options.stopOptions); await verifyStopped(record.identity, report); this.reports.push(report);
-      await rm(path.join(directory, file));
+      this.recoveredFiles.add(fileKey(record.sessionFile)); await rm(path.join(directory, file));
     }
     this.recovering = false;
+  }
+  setBridgeUrl(url: string): void {
+    this.options.bridgeUrl = url;
+    this.driver = new RpcSubprocessDriver(this.broker, { ...this.options, onTrust: (cwd) => this.trust.request(cwd) });
+  }
+  async reextractBlobs(): Promise<void> {
+    for (const session of this.records.values()) this.assets.detach((await readSession(session.file)).entries);
   }
   private record(id: string): HostedSession { const session = this.records.get(id); assert(session, "sessionMissing", "会话不存在", 404); return session; }
   async open(input: { cwd: string; sessionFile?: string; fork?: boolean }): Promise<any> {
@@ -59,15 +67,19 @@ export class Sessions {
     const model = new SessionModel({ source: "pane", id }, this.assets); model.reset(parsed.entries, parsed.leafId);
     const busy = await probeSessionWriterLock(file); model.readonlyReason = busy.held ? "externalWriter" : "archived";
     let recentExternal = false;
-    try { recentExternal = !input.fork && Date.now() - (await stat(file)).mtimeMs < 60000; }
+    try { recentExternal = !input.fork && !this.recoveredFiles.has(fileKey(file)) && Date.now() - (await stat(file)).mtimeMs < 60000; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), clients: 0, lastActive: Date.now(), holds: new Map(), ui: new Map(), recentExternal, closed: false };
     this.records.set(id, session); this.files.set(fileKey(file), session);
-    watchFile(file, { persistent: false, interval: 500 }, () => {
-      if (session.handle || session.closed) return;
-      void readSession(file).then((parsed) => { if (!session.handle && !session.closed) model.reset(parsed.entries, parsed.leafId); }).catch((error) => model.emit({ type: "pane_diagnostic", message: String(error) }));
-    });
+    this.watch(file);
     return { ...this.view(session), diagnostics: parsed.diagnostics, ...(busy.held ? { heldBy: busy.record?.host.app } : {}), ...(recentExternal ? { warning: "recentModification" } : {}) };
+  }
+  private watch(file: string): void {
+    watchFile(file, { persistent: false, interval: 500 }, (current, previous) => {
+      const session = this.files.get(fileKey(file));
+      if (!session || session.handle || session.closed || current.mtimeMs === previous.mtimeMs && current.size === previous.size) return;
+      void readSession(file).then((parsed) => { if (!session.handle && !session.closed) session.model.reset(parsed.entries, parsed.leafId); }).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
+    });
   }
   private view(session: HostedSession): any { return { ...session.model.snapshot(), cwd: session.cwd, sessionFile: session.file, projectTrusted: session.state?.projectTrusted, holds: [...session.holds.values()] }; }
   snapshot(id: string): any { return this.view(this.record(id)); }
@@ -91,7 +103,7 @@ export class Sessions {
       assert(request.expectedEpoch === model.epoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
       assert(request.expectedRevision === model.controlRevision, "revisionChanged", "会话状态已变化，请重新确认", 409);
       session.lastActive = Date.now();
-      if (command.type === "restart") { if (session.handle) await session.handle.stop(); session.recentExternal = false; await this.start(session); return { status: "accepted", snapshot: this.view(session) }; }
+      if (command.type === "restart") { assert(session.model.status === "interrupted", "restartNotAvailable", "只有中断的会话可以重启", 409); if (session.handle) await session.handle.stop(); session.recentExternal = false; await this.start(session); return { status: "accepted", snapshot: this.view(session) }; }
       if (command.type === "close") {
         assert(!session.holds.size || command.confirmHolds === true, "holdsConfirmation", "会话仍有保活原因，请确认关闭", 409);
         const result = await this.stop(session, true); session.holds.clear(); return result;
@@ -147,12 +159,12 @@ export class Sessions {
   private rebind(session: HostedSession, state: any, data: any, reason: string): void {
     const old = session.model; const changed = state.sessionId !== session.id || fileKey(state.sessionFile) !== fileKey(session.file);
     if (changed) {
-      old.emit({ type: "pane_session_replaced", newRef: { source: "pane", id: state.sessionId }, reason });
+      old.emit({ type: "pane_session_replaced", newRef: { source: "pane", id: state.sessionId }, reason: reason === "startup" ? "new" : reason });
       old.readonly = true; old.readonlyReason = "archived"; old.control("idle", "idle", undefined, true);
       const previous: HostedSession = { ...session, handle: undefined, drafts: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
       this.records.set(session.id, previous); this.files.set(fileKey(session.file), previous);
       session.id = state.sessionId; session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
-      this.records.set(session.id, session); this.files.set(fileKey(session.file), session);
+      this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
     }
     session.state = state; session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
     session.model.reset(data.entries as Entry[], data.leafId); session.model.control("idle", "idle", undefined, true); session.recentExternal = false;
@@ -181,16 +193,17 @@ export class Sessions {
   }
   private async stop(session: HostedSession, close: boolean): Promise<any> {
     if (!session.handle) return { status: "nothingToStop" };
+    const handle = session.handle;
     session.model.control("running", "stopping", undefined, true);
     let cleared: any = { steering: [], followUp: [] }; let report: StopReport | undefined;
     try {
-      const response = await session.handle.send({ type: "clear_queue" }, { timeoutMs: 2000 }); cleared = response.data;
-      if (close) report = await session.handle.stop();
+      const response = await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 }); cleared = response.data;
+      if (close) report = await handle.stop();
       else {
-        try { await session.handle.send({ type: "abort" }, { timeoutMs: this.options.stopOptions?.abortTimeoutMs ?? 10000 }); session.model.control("idle", "idle"); await this.sync(session); }
-        catch { report = await session.handle.stop(); }
+        try { await handle.send({ type: "abort" }, { timeoutMs: this.options.stopOptions?.abortTimeoutMs ?? 10000 }); session.model.control("idle", "idle"); await this.sync(session); }
+        catch { report = await handle.stop(); }
       }
-    } catch (error) { if (session.handle) report = await session.handle.stop(); else throw error; }
+    } catch { report = await handle.stop(); }
     const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
     const drafts = texts.map((text) => session.drafts.get(text) ?? [{ type: "text", text }]);
     for (const text of texts) session.drafts.delete(text);
