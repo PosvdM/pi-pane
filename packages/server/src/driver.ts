@@ -20,7 +20,7 @@ export interface DriverOptions {
 }
 export interface DriverCallbacks {
   onRecord(event: any): void;
-  onReady(state: any, entries: any, reason: string): void;
+  onReady(state: any, entries: any, reason: string, handle: DriverHandle): void;
   onExit(reason: string, report?: StopReport, error?: unknown): void;
 }
 export interface SessionDriver { start(spec: DriverSpec, callbacks: DriverCallbacks): Promise<DriverHandle> }
@@ -64,7 +64,7 @@ class RpcHandle implements DriverHandle {
   private enabled = false; private stopping = false; private stopPromise?: Promise<StopReport>; private fatalReason?: string;
   private timer?: ReturnType<typeof setTimeout>; private pendingTarget?: string; private switchFailure?: unknown;
   private generation = 0; private initialization = Promise.resolve(); private started = false; private listeners: (() => void)[] = [];
-  private readonly recordFile: string;
+  private readonly recordFile: string; private persistence = Promise.resolve();
   constructor(private readonly proc: ManagedProcess, lock: SessionWriterLock, private readonly revoke: () => void,
     private readonly spec: DriverSpec, private readonly callbacks: DriverCallbacks, private readonly options: DriverOptions,
     private readonly acquireWriter: typeof acquireSessionWriterLock) {
@@ -79,7 +79,15 @@ class RpcHandle implements DriverHandle {
   }
   get sessionFile(): string { return this.current.sessionFile; }
   get acceptingInput(): boolean { return this.enabled && !this.stopping; }
-  async persist(): Promise<void> {
+  persist(): Promise<void> {
+    const write = this.persistence.then(async () => {
+      if (this.stopping) return;
+      await this.writeRecord();
+    });
+    // 停止等待已进入的写入（含 rename）结束；停止后才进入的持久化不创建文件。
+    this.persistence = write.catch(() => {}); return write;
+  }
+  private async writeRecord(): Promise<void> {
     const data = JSON.stringify({ identity: this.identity, sessionFile: this.sessionFile, cwd: this.spec.cwd });
     await mkdir(path.dirname(this.recordFile), { recursive: true });
     const temp = this.recordFile + ".tmp"; await writeFile(temp, data, { mode: 0o600 }); await rename(temp, this.recordFile);
@@ -99,7 +107,8 @@ class RpcHandle implements DriverHandle {
       throw new PaneError("bridgeStopping", "会话正在停止，目标写锁已释放", 409);
     }
     // 保留每个已取得的目标锁，直到 session_start 确认切走或写者停止。
-    await lock.update({ writer: this.identity, state: "running" }); return true;
+    await lock.update({ writer: this.identity, state: "running" });
+    assert(!this.stopping, "bridgeStopping", "会话正在停止", 409); return true;
   }
   async bridgeEvent(event: any): Promise<any> {
     assert(!this.stopping, "bridgeStopping", "会话正在停止", 409);
@@ -119,11 +128,11 @@ class RpcHandle implements DriverHandle {
       }
       case "shutdown": {
         if (event.reason === "quit") { this.enabled = false; return { accepted: true }; }
-        this.enabled = false; this.generation++; this.armTimeout();
+        this.enabled = false; const generation = ++this.generation; this.armTimeout();
         if (typeof event.target === "string") {
           this.pendingTarget = event.target;
-          try { if (!await this.target(event.target)) this.switchFailure = new Error("目标会话正被别处托管"); }
-          catch (error) { this.switchFailure = error; }
+          try { if (!await this.target(event.target)) throw new Error("目标会话正被别处托管"); }
+          catch (error) { if (!this.stopping && generation === this.generation) this.switchFailure = error; }
         }
         return { accepted: true };
       }
@@ -138,13 +147,19 @@ class RpcHandle implements DriverHandle {
             const destination = this.locks.get(fileKey(event.sessionFile));
             assert(destination, "unlockedWriter", "pi 切换到未取得写锁的会话");
             const state = await this.raw({ type: "get_state" });
+            if (this.stopping || generation !== this.generation) return;
             assert(fileKey(state.data.sessionFile) === fileKey(event.sessionFile) && state.data.sessionId === event.sessionId, "readyMismatch", "pane-bridge 与 RPC 的会话身份不符");
             const entries = await this.raw({ type: "get_entries" });
             if (this.stopping || generation !== this.generation) return;
-            for (const [key, lock] of this.locks) if (lock !== destination) { await lock.release({ writerSwitchedAway: true }); this.locks.delete(key); }
+            for (const [key, lock] of this.locks) if (lock !== destination) {
+              await lock.release({ writerSwitchedAway: true }); this.locks.delete(key);
+              if (this.stopping || generation !== this.generation) return;
+            }
             this.current = destination; this.pendingTarget = undefined;
             await this.persist();
-            this.callbacks.onReady({ ...state.data, projectTrusted: event.trusted, cwd: event.cwd }, entries.data, event.reason);
+            if (this.stopping || generation !== this.generation) return;
+            this.callbacks.onReady({ ...state.data, projectTrusted: event.trusted, cwd: event.cwd }, entries.data, event.reason, this);
+            if (this.stopping || generation !== this.generation) return;
             this.enabled = true; this.started = true; clearTimeout(this.timer); this.resolveReady();
           }).catch((error) => this.fail("pane-bridge 重绑定失败", error));
         });
@@ -166,10 +181,14 @@ class RpcHandle implements DriverHandle {
       throw error;
     }
     if (["prompt", "new_session", "fork", "clone"].includes(command.type) && this.enabled && !this.pendingTarget && this.locks.size > 1) {
+      const generation = this.generation;
       try {
         const state = await this.raw({ type: "get_state" });
-        if (fileKey(state.data.sessionFile) === fileKey(this.current.sessionFile)) {
-          for (const [key, lock] of this.locks) if (lock !== this.current) { await lock.release({ writerSwitchedAway: true }); this.locks.delete(key); }
+        if (!this.stopping && generation === this.generation && this.enabled && !this.pendingTarget && fileKey(state.data.sessionFile) === fileKey(this.current.sessionFile)) {
+          for (const [key, lock] of this.locks) if (lock !== this.current) {
+            await lock.release({ writerSwitchedAway: true }); this.locks.delete(key);
+            if (this.stopping || generation !== this.generation) break;
+          }
         }
       } catch (error) {
         // 控制响应已经确认；清理故障只记录诊断并停止写者，锁在确认进程退出前继续保留。
@@ -199,7 +218,8 @@ class RpcHandle implements DriverHandle {
       report = await this.proc.stop(this.options.stopOptions); await verifyStopped(this.identity, report);
       if (failure) throw failure;
       for (const lock of this.locks.values()) await lock.release(); this.locks.clear();
-      await rm(this.recordFile, { force: true });
+      await this.persistence;
+      await rm(this.recordFile + ".tmp", { force: true }); await rm(this.recordFile, { force: true });
       return report;
     } catch (error) { failure = error; throw error; }
     finally {

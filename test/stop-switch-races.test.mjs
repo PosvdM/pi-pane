@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { writeFile, utimes, stat } from "node:fs/promises";
+import fs, { writeFile, utimes, stat } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
 import { probeSessionWriterLock, isSameProcess } from "pi-hostkit";
 import { RequestLedger } from "../packages/server/dist/control.js";
@@ -79,6 +80,181 @@ for (const restart of [false, true]) test(`切换持久化迟到于停止${resta
     assert.equal((await snapshot(server, token, b.ref.id)).readonly, true);
     assert.equal(handle.acceptingInput, false);
   } finally { gate.resolve(); if (handle) await handle.initialization; await server.close(); await f.cleanup(); }
+});
+
+test("停止清理等待已进入的持久化写入，迟到写入与临时文件均被清理", { timeout: 30000 }, async () => {
+  const { f, server, a } = await setup(); const gate = deferred(); let writing;
+  try {
+    const handle = server.sessions.records.get(a.ref.id).handle; const entered = deferred();
+    const write = handle.writeRecord.bind(handle);
+    handle.writeRecord = async () => { entered.resolve(); await gate.promise; await write(); };
+    writing = handle.persist(); await entered.promise;
+    let finished = false; const stopping = handle.stop().then(() => { finished = true; });
+    await until(async () => handle.locks.size === 0);
+    assert.equal(await isSameProcess(handle.identity), "gone");
+    assert.equal(finished, false, "写入已进入持久化队列，停止不能先于迟到 rename 完成");
+    gate.resolve(); await writing; await stopping; await handle.exited;
+    await assert.rejects(stat(handle.recordFile), { code: "ENOENT" });
+    await assert.rejects(stat(handle.recordFile + ".tmp"), { code: "ENOENT" });
+  } finally { gate.resolve(); await writing; await server.close(); await f.cleanup(); }
+});
+
+test("旧写锁释放迟到于停止，不提交 current 或重绑定", { timeout: 30000 }, async () => {
+  const { f, target, server, token, a, b } = await setup(); const gate = deferred(); let handle;
+  try {
+    handle = server.sessions.records.get(a.ref.id).handle; const entered = deferred();
+    const old = handle.current; const release = old.release.bind(old);
+    old.release = async options => { if (options?.writerSwitchedAway) { entered.resolve(); await gate.promise; } return release(options); };
+    const route = "/api/sessions/" + a.ref.id + "/control";
+    const body = { requestId: randomUUID(), expectedEpoch: a.cursor.epoch, expectedRevision: a.controlRevision, command: { type: "prompt", message: "/pane-test-resume-hang " + target } };
+    assert.deepEqual((await request(server, token, route, body)).value, { status: "pending" }); await entered.promise;
+    await handle.stop(); await handle.exited;
+    gate.resolve(); await handle.initialization;
+    assert.equal(handle.current, old); assert.equal(handle.acceptingInput, false);
+    assert.equal((await snapshot(server, token, b.ref.id)).readonly, true);
+    await assert.rejects(stat(handle.recordFile), { code: "ENOENT" });
+  } finally { gate.resolve(); if (handle) await handle.initialization; await server.close(); await f.cleanup(); }
+});
+
+test("持久化等待期间代次变化，只有最新 bridgeReady 可以提交重绑定", { timeout: 30000 }, async () => {
+  const { f, target, server, token, a, b } = await setup(); const gate = deferred(); let handle;
+  try {
+    handle = server.sessions.records.get(a.ref.id).handle; const entered = deferred();
+    const persist = handle.persist.bind(handle); let first = true; const reasons = [];
+    handle.persist = async () => { if (first) { first = false; entered.resolve(); await gate.promise; } await persist(); };
+    const onReady = handle.callbacks.onReady;
+    handle.callbacks.onReady = (...args) => { reasons.push(args[2]); onReady(...args); };
+    const body = { requestId: randomUUID(), expectedEpoch: a.cursor.epoch, expectedRevision: a.controlRevision, command: { type: "prompt", message: "/pane-test-resume-hang " + target } };
+    assert.deepEqual((await request(server, token, "/api/sessions/" + a.ref.id + "/control", body)).value, { status: "pending" });
+    await entered.promise;
+    await handle.bridgeEvent({ type: "shutdown", reason: "reload" });
+    await handle.bridgeEvent({ type: "bridgeReady", sessionFile: target, sessionId: b.ref.id, cwd: f.cwd, trusted: false, reason: "reload" });
+    await new Promise(setImmediate); gate.resolve(); await handle.initialization;
+    assert.deepEqual(reasons, ["reload"]); assert.equal(handle.acceptingInput, true);
+    assert.equal(server.sessions.records.get(b.ref.id).handle, handle);
+  } finally { gate.resolve(); if (handle) await handle.initialization; await server.close(); await f.cleanup(); }
+});
+
+test("旧 handle 的 ready、事件和退出回调均不能修改重新启动的会话", { timeout: 30000 }, async () => {
+  const { f, target, server, token, a, b } = await setup();
+  try {
+    const source = server.sessions.records.get(a.ref.id); const old = source.handle;
+    await old.stop(); await old.exited;
+    const fresh = await snapshot(server, token, a.ref.id); const route = "/api/sessions/" + a.ref.id + "/control";
+    const result = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: fresh.cursor.epoch, expectedRevision: fresh.controlRevision, command: { type: "prompt", message: "新写者" } });
+    assert.equal(result.code, 200, JSON.stringify(result));
+    await until(() => source.model.status === "idle"); const replacement = source.handle;
+    const before = source.model.snapshot(); const reports = server.sessions.reports.length;
+    old.callbacks.onReady({ sessionFile: target, sessionId: b.ref.id, cwd: f.cwd }, { entries: [] }, "resume", old);
+    old.callbacks.onRecord({ type: "agent_start" });
+    old.callbacks.onRecord({ type: "extension_ui_request", id: "stale-ui", method: "input" });
+    old.callbacks.onExit("会话已关闭", { steps: [], leftovers: [] });
+    assert.equal(source.handle, replacement); assert.equal(replacement.acceptingInput, true);
+    assert.deepEqual(source.model.snapshot(), before); assert.equal(source.ui.size, 0);
+    assert.equal(server.sessions.reports.length, reports);
+    assert.equal(server.sessions.records.get(b.ref.id).handle, undefined);
+    assert.equal((await snapshot(server, token, b.ref.id)).readonly, true);
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+test("控制响应后的状态查询迟到于停止，不提交旧 handle 的状态", { timeout: 30000 }, async () => {
+  const { f, server, token, a } = await setup(); const gate = deferred();
+  try {
+    const source = server.sessions.records.get(a.ref.id); const handle = source.handle; const state = source.state;
+    const send = handle.send.bind(handle); const entered = deferred(); let armed = false;
+    handle.send = async (command, options) => {
+      const response = await send(command, options);
+      if (command.type === "set_thinking_level") armed = true;
+      if (command.type === "get_state" && armed) { armed = false; entered.resolve(); await gate.promise; }
+      return response;
+    };
+    const route = "/api/sessions/" + a.ref.id + "/control";
+    const body = { requestId: randomUUID(), expectedEpoch: a.cursor.epoch, expectedRevision: a.controlRevision, command: { type: "set_thinking_level", level: "high" } };
+    assert.deepEqual((await request(server, token, route, body)).value, { status: "pending" }); await entered.promise;
+    const current = await snapshot(server, token, a.ref.id);
+    const stopped = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: current.cursor.epoch, expectedRevision: current.controlRevision, command: { type: "close" } });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped)); await handle.exited;
+    gate.resolve(); const confirmed = await final(server, token, route, body);
+    assert.equal(confirmed.code, 200, JSON.stringify(confirmed)); assert.equal(confirmed.value.response.success, true);
+    assert.equal(source.state, state, "已停止写者的迟到 get_state 不能提交到会话");
+    assert.equal(source.model.readonly, true);
+  } finally { gate.resolve(); await server.close(); await f.cleanup(); }
+});
+
+test("就绪回调先于 start 返回时，停止仍能找到来源 handle 且迟到返回不重新挂载", { timeout: 30000 }, async () => {
+  const { f, server, token, a } = await setup(); const gate = deferred();
+  try {
+    const source = server.sessions.records.get(a.ref.id); await source.handle.stop();
+    const start = server.sessions.driver.start.bind(server.sessions.driver); const entered = deferred();
+    server.sessions.driver.start = async (...args) => { const handle = await start(...args); await handle.ready; entered.resolve(handle); await gate.promise; return handle; };
+    const fresh = await snapshot(server, token, a.ref.id); const route = "/api/sessions/" + a.ref.id + "/control";
+    const body = { requestId: randomUUID(), expectedEpoch: fresh.cursor.epoch, expectedRevision: fresh.controlRevision, command: { type: "prompt", message: "不得迟到发送" } };
+    assert.deepEqual((await request(server, token, route, body)).value, { status: "pending" });
+    const handle = await entered.promise; assert.equal(source.handle, handle);
+    const current = await snapshot(server, token, a.ref.id);
+    const stopped = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: current.cursor.epoch, expectedRevision: current.controlRevision, command: { type: "stop" } });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped)); await handle.exited;
+    assert.equal(await isSameProcess(handle.identity), "gone"); gate.resolve();
+    assert.equal((await final(server, token, route, body)).value.error, "interrupted");
+    assert.equal(source.handle, undefined); assert.equal(source.model.readonly, true);
+    await assert.rejects(stat(handle.recordFile), { code: "ENOENT" });
+  } finally { gate.resolve(); await server.close(); await f.cleanup(); }
+});
+
+test("启动故障及退出先于 start 返回时，保留原始 bridgeFailed 结果", { timeout: 30000 }, async () => {
+  const { f, server, token, a } = await setup();
+  try {
+    const source = server.sessions.records.get(a.ref.id); await source.handle.stop();
+    const start = server.sessions.driver.start.bind(server.sessions.driver);
+    server.sessions.driver.start = async (...args) => {
+      const handle = await start(...args); handle.fail("测试启动返回前故障"); await handle.exited; return handle;
+    };
+    const fresh = await snapshot(server, token, a.ref.id); const route = "/api/sessions/" + a.ref.id + "/control";
+    const result = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: fresh.cursor.epoch, expectedRevision: fresh.controlRevision, command: { type: "prompt", message: "不得发送" } });
+    assert.equal(result.code, 503, JSON.stringify(result)); assert.equal(result.value.error, "bridgeFailed");
+    assert.equal(source.handle, undefined); assert.equal(source.model.status, "interrupted");
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+test("旧 shutdown 的目标取锁失败迟到于新代次，不污染新初始化", { timeout: 30000 }, async () => {
+  const { f, target, server, a } = await setup(); const gate = deferred();
+  try {
+    const handle = server.sessions.records.get(a.ref.id).handle; const entered = deferred();
+    handle.target = async () => { entered.resolve(); await gate.promise; throw new Error("旧代次目标取锁失败"); };
+    const obsolete = handle.bridgeEvent({ type: "shutdown", reason: "resume", target }); await entered.promise;
+    await handle.bridgeEvent({ type: "shutdown", reason: "reload" });
+    gate.resolve(); await obsolete; assert.equal(handle.switchFailure, undefined);
+    await handle.bridgeEvent({ type: "bridgeReady", sessionFile: a.sessionFile, sessionId: a.ref.id, cwd: f.cwd, trusted: false, reason: "reload" });
+    await new Promise(setImmediate); await handle.initialization;
+    assert.equal(handle.acceptingInput, true); assert.equal(server.sessions.records.get(a.ref.id).handle, handle);
+  } finally { gate.resolve(); await server.close(); await f.cleanup(); }
+});
+
+test("只读文件读取迟到于启动、切换和停止，不把旧文件提交到新模型", { timeout: 30000 }, async (t) => {
+  const { f, server, token, a } = await setup(); const gate = deferred(); const returned = deferred(); let injected = false;
+  try {
+    const source = server.sessions.records.get(a.ref.id); const old = source.handle;
+    await old.stop(); await old.exited;
+    const target = f.sessionPath("late-watch-target");
+    await writeFile(target, JSON.stringify({ type: "session", version: 3, id: "late-watch-target", cwd: f.cwd, timestamp: new Date().toISOString() }) + "\n");
+    const read = fs.readFile; const entered = deferred();
+    const mock = t.mock.method(fs, "readFile", async (...args) => {
+      const data = await read(...args);
+      if (!injected && typeof args[0] === "string" && fileKey(args[0]) === fileKey(a.sessionFile)) { injected = true; entered.resolve(); await gate.promise; returned.resolve(); }
+      return data;
+    });
+    syncBuiltinESMExports();
+    await utimes(a.sessionFile, new Date(), new Date()); await entered.promise;
+    const fresh = await snapshot(server, token, a.ref.id); const route = "/api/sessions/" + a.ref.id + "/control";
+    const started = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: fresh.cursor.epoch, expectedRevision: fresh.controlRevision, command: { type: "prompt", message: "/pane-test-resume " + target } });
+    assert.equal(started.code, 200, JSON.stringify(started));
+    const rebound = await until(() => source.id === "late-watch-target" && source.handle?.acceptingInput);
+    assert.equal(rebound, true); await source.handle.stop();
+    const before = source.model.snapshot();
+    gate.resolve(); await returned.promise; await new Promise(setImmediate);
+    assert.deepEqual(source.model.snapshot(), before, "读到的 A 不能重置已切到新文件且停止的模型");
+    mock.mock.restore(); syncBuiltinESMExports();
+  } finally { gate.resolve(); t.mock.restoreAll(); syncBuiltinESMExports(); await server.close(); await f.cleanup(); }
 });
 
 test("停止完成后目标取锁才返回，不登记运行写者并释放迟到锁", { timeout: 30000 }, async () => {

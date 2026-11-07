@@ -15,7 +15,7 @@ import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 
 interface HostedSession {
-  id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle;
+  id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
   state?: any; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>; clients: number; lastActive: number;
   holds: Map<string, { source: string; reason: string }>; ui: Map<string, ExtensionUiRequest>; recentExternal: boolean; closed: boolean;
 }
@@ -92,7 +92,10 @@ export class Sessions {
     watchFile(file, { persistent: false, interval: 500 }, (current, previous) => {
       const session = this.files.get(fileKey(file));
       if (!session || session.handle || session.closed || current.mtimeMs === previous.mtimeMs && current.size === previous.size) return;
-      void readSession(file).then((parsed) => { if (!session.handle && !session.closed) session.model.reset(parsed.entries, parsed.leafId); }).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
+      const model = session.model; const epoch = model.epoch; const owner = session.owner;
+      void readSession(file).then((parsed) => {
+        if (!session.handle && !session.closed && session.owner === owner && this.files.get(fileKey(file)) === session && session.model === model && model.epoch === epoch) model.reset(parsed.entries, parsed.leafId);
+      }).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     });
   }
   private view(session: HostedSession): any { return { ...session.model.snapshot(), cwd: session.cwd, sessionFile: session.file, projectTrusted: session.state?.projectTrusted, holds: [...session.holds.values()] }; }
@@ -145,12 +148,13 @@ export class Sessions {
       const handle = session.handle;
       const response = await handle.send(rpc, { trackResult: true });
       session = this.files.get(fileKey(handle.sessionFile)) ?? session;
+      if (session.handle !== handle) return { status: "accepted", response, snapshot: this.view(session) };
       try {
         await this.sync(session);
         if (["set_model", "set_thinking_level", "compact"].includes(command.type) && session.handle?.acceptingInput) {
-          const currentModel = session.model; const epoch = currentModel.epoch;
-          const state = (await session.handle.send({ type: "get_state" })).data as any;
-          if (session.model === currentModel && currentModel.epoch === epoch) {
+          const currentModel = session.model; const epoch = currentModel.epoch; const currentHandle = session.handle;
+          const state = (await currentHandle.send({ type: "get_state" })).data as any;
+          if (session.handle === currentHandle && currentHandle.acceptingInput && session.model === currentModel && currentModel.epoch === epoch) {
             session.state = state;
             if (command.type === "compact" && !state.isCompacting && !state.isStreaming) currentModel.control("idle", "idle");
           }
@@ -175,15 +179,23 @@ export class Sessions {
     assert(!session.recentExternal, "recentModification", "该会话可能正在别处运行，请只读查看或 Fork 为新会话", 409);
     await this.trust.request(session.cwd);
     signal?.throwIfAborted();
-    let attached = session;
+    const sessionDir = await this.store.sessionDir(session.cwd);
+    signal?.throwIfAborted(); assert(!session.closed, "interrupted", "会话已关闭", 409);
+    const owner = Symbol(); session.owner = owner;
+    let attached = session; let handle: DriverHandle | undefined;
     try {
-      session.handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir: await this.store.sessionDir(session.cwd), decisions: this.trust.config(), assumeNoWriter }, {
-        onRecord: (event) => this.receive(attached, event),
-        onReady: (state, data, reason) => { attached = this.rebind(attached, state, data, reason); },
+      handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir, decisions: this.trust.config(), assumeNoWriter }, {
+        onRecord: (event) => { if (attached.owner === owner && !attached.closed) this.receive(attached, event); },
+        onReady: (state, data, reason, source) => {
+          if (attached.owner !== owner || attached.closed || attached.handle && attached.handle !== source) return;
+          // bridge 就绪可能先于 start 返回；回调携带来源 handle，绑定不能读取另一代的写者。
+          attached.handle = source; attached = this.rebind(attached, source, state, data, reason);
+        },
         onExit: (reason, report, error) => {
           const session = attached;
+          if (session.owner !== owner) return;
           if (report) this.reports.push(report);
-          session.handle = undefined; session.ui.clear();
+          session.owner = undefined; session.handle = undefined; session.ui.clear();
           if (reason === "会话已关闭" && !error) {
             session.model.readonly = true; session.model.readonlyReason = "archived"; session.model.inFlight.assistant = undefined; session.model.inFlight.tools = [];
             session.model.control("idle", "idle", reason, true);
@@ -192,24 +204,29 @@ export class Sessions {
         },
       });
       // 启动跨越取锁、spawn 和 bridge 就绪；停止抢占后，迟到的 handle 必须先结束，不能再发送输入。
-      const handle = session.handle;
-      const cancel = () => { void handle.stop().catch(() => {}); };
+      if (attached.owner !== owner || attached.closed) { await handle.stop(); await handle.ready; throw new PaneError("interrupted", "会话已关闭", 409); }
+      attached.handle = handle;
+      const startedHandle = handle;
+      const cancel = () => { void startedHandle.stop().catch(() => {}); };
       signal?.addEventListener("abort", cancel, { once: true });
       try {
         if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
         await handle.ready;
         if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
+        assert(attached.owner === owner && attached.handle === handle && !attached.closed, "interrupted", "会话写者已停止或更换", 409);
       } finally { signal?.removeEventListener("abort", cancel); }
     } catch (error) {
       // ready 可以先于停止流程失败；对外返回启动失败前，等待身份复查和写锁处理完成。
-      const failedHandle = session.handle;
-      if (failedHandle && !failedHandle.acceptingInput) await failedHandle.exited;
-      if (error instanceof PaneError && error.code === "externalWriter") session.model.readonlyReason = "externalWriter";
-      else if (session.model.status !== "interrupted") session.model.interrupt("startup", String(error));
+      if (handle && !handle.acceptingInput) await handle.exited;
+      if (attached.owner === owner) {
+        if (error instanceof PaneError && error.code === "externalWriter") attached.model.readonlyReason = "externalWriter";
+        else if (attached.model.status !== "interrupted") attached.model.interrupt("startup", String(error));
+      }
       throw error;
     }
   }
-  private rebind(session: HostedSession, state: any, data: any, reason: string): HostedSession {
+  private rebind(session: HostedSession, handle: DriverHandle, state: any, data: any, reason: string): HostedSession {
+    assert(session.handle === handle, "staleDriver", "会话写者已更换，忽略旧写者的重绑定", 409);
     const old = session.model; const changed = state.sessionId !== session.id || fileKey(state.sessionFile) !== fileKey(session.file);
     if (changed) {
       old.emit({ type: "pane_session_replaced", newRef: { source: "pane", id: state.sessionId }, reason: reason === "startup" ? "new" : reason });
@@ -219,10 +236,10 @@ export class Sessions {
         assert(target.id === state.sessionId && !target.handle && !target.control.busy, "sessionIdentityConflict", "目标会话身份冲突、已被托管或正在处理控制操作", 409);
         // 保留目标对象及模型；控制队列随写者迁移，切换后仍挂起的 RPC 必须能被目标会话停止。
         target.control = session.control; session.control = new ControlQueue();
-        target.handle = session.handle; session.handle = undefined; session.ui.clear(); session.dirty = false;
+        target.owner = session.owner; target.handle = handle; session.owner = undefined; session.handle = undefined; session.ui.clear(); session.dirty = false;
         session = target;
       } else {
-        const previous: HostedSession = { ...session, handle: undefined, drafts: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
+        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, drafts: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
         this.records.set(session.id, previous); this.files.set(fileKey(session.file), previous);
         session.id = state.sessionId; session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
         this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
@@ -267,14 +284,14 @@ export class Sessions {
           await handle.send({ type: "abort" }, { timeoutMs: this.options.stopOptions?.abortTimeoutMs ?? 10000 });
           // abort 的响应不能证明挂起的扩展命令已结束；抢占时关闭进程才能结束全部底层等待项。
           if (preempted) report = await handle.stop();
-          else { session.model.control("idle", "idle"); await this.sync(session); }
+          else if (session.handle === handle && handle.acceptingInput) { session.model.control("idle", "idle"); await this.sync(session); }
         }
         catch { report = await handle.stop(); }
       }
     } catch { report = await handle.stop(); }
     const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
     const drafts = texts.map((text) => session.drafts.get(text) ?? [{ type: "text", text }]);
-    for (const text of texts) session.drafts.delete(text);
+    if (!session.handle || session.handle === handle) for (const text of texts) session.drafts.delete(text);
     return { status: "done", clearedText: texts, clearedDrafts: drafts, ...(report ? { stopReport: report } : {}) };
   }
   private async reclaim(): Promise<void> {
