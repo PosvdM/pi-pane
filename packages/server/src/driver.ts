@@ -19,24 +19,28 @@ export interface DriverOptions {
   onTrust?: (cwd: string) => Promise<TrustChoice | undefined>;
 }
 export interface DriverCallbacks {
+  onHandle?(handle: DriverHandle): void;
   onRecord(event: any): void;
   onReady(state: any, entries: any, reason: string, handle: DriverHandle): void;
   onExit(reason: string, report?: StopReport, error?: unknown): void;
 }
-export interface SessionDriver { start(spec: DriverSpec, callbacks: DriverCallbacks): Promise<DriverHandle> }
+export interface SessionDriver { start(spec: DriverSpec, callbacks: DriverCallbacks, signal?: AbortSignal): Promise<DriverHandle> }
 export interface DriverHandle {
   readonly identity: ProcessIdentity; readonly ready: Promise<void>; readonly exited: Promise<void>; readonly sessionFile: string;
   readonly acceptingInput: boolean;
   send(command: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse>;
   respondUi(response: ExtensionUiResponse): void;
   stop(): Promise<StopReport>;
+  drain(): Promise<void>;
 }
 export class RpcSubprocessDriver implements SessionDriver {
   constructor(private readonly broker: BridgeBroker, private readonly options: DriverOptions,
     private readonly acquireWriter = acquireSessionWriterLock) { duration(options.readyTimeoutMs, 10000); }
-  async start(spec: DriverSpec, callbacks: DriverCallbacks): Promise<DriverHandle> {
+  async start(spec: DriverSpec, callbacks: DriverCallbacks, signal?: AbortSignal): Promise<DriverHandle> {
+    signal?.throwIfAborted();
     const lock = await acquireRecoveredWriter(spec.sessionFile, this.options.home, this.options.instanceId,
       { ...this.options.stopOptions, assumeNoWriter: spec.assumeNoWriter }, this.acquireWriter);
+    if (signal?.aborted) { await lock.release(); signal.throwIfAborted(); }
     let handle!: RpcHandle; let attachHandle!: () => void; const available = new Promise<void>((resolve) => { attachHandle = resolve; });
     const launch = this.broker.issue(spec.decisions, async (event) => { await available; return handle.bridgeEvent(event); });
     const env = { ...process.env, ...this.options.env, PANE_BRIDGE_URL: this.options.bridgeUrl, PANE_BRIDGE_TICKET: launch.ticket } as Record<string, string>;
@@ -53,7 +57,12 @@ export class RpcSubprocessDriver implements SessionDriver {
       launch.close(); await lock.release(); throw error;
     }
     handle = new RpcHandle(proc, lock, launch.close, spec, callbacks, this.options, this.acquireWriter); attachHandle();
-    try { await handle.persist(); return handle; }
+    try {
+      // spawn 可能晚于取消返回；先交付 handle，再检查取消，停止无需等待首次持久化或 ready。
+      callbacks.onHandle?.(handle);
+      if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
+      await handle.persist(); return handle;
+    }
     catch (error) { await handle.stop(); throw error; }
   }
 }
@@ -65,6 +74,7 @@ class RpcHandle implements DriverHandle {
   private timer?: ReturnType<typeof setTimeout>; private pendingTarget?: string; private switchFailure?: unknown;
   private generation = 0; private initialization = Promise.resolve(); private started = false; private listeners: (() => void)[] = [];
   private readonly recordFile: string; private persistence = Promise.resolve();
+  private targets = new Set<Promise<boolean>>(); private cleanupErrors: unknown[] = [];
   constructor(private readonly proc: ManagedProcess, lock: SessionWriterLock, private readonly revoke: () => void,
     private readonly spec: DriverSpec, private readonly callbacks: DriverCallbacks, private readonly options: DriverOptions,
     private readonly acquireWriter: typeof acquireSessionWriterLock) {
@@ -96,14 +106,19 @@ class RpcHandle implements DriverHandle {
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => this.fail("pane-bridge 就绪超时，请重启会话"), duration(this.options.readyTimeoutMs, 10000)); this.timer.unref();
   }
-  private async target(file: string): Promise<boolean> {
+  private target(file: string): Promise<boolean> {
+    const operation = this.acquireTarget(file); this.targets.add(operation);
+    void operation.then(() => this.targets.delete(operation), () => this.targets.delete(operation));
+    return operation;
+  }
+  private async acquireTarget(file: string): Promise<boolean> {
     const key = fileKey(file); if (this.locks.has(key)) return true;
     const lock = await acquireRecoveredWriter(file, this.options.home, this.options.instanceId, this.options.stopOptions, this.acquireWriter);
     // 取锁可能晚于停止返回；迟到锁不登记 writer，仍须在停止确认后清理。
     this.locks.set(key, lock);
     if (this.stopping) {
       try { await this.stop(); await lock.release(); this.locks.delete(key); }
-      catch (error) { this.callbacks.onRecord({ type: "pane_diagnostic", message: `迟到目标锁清理未确认：${String(error)}` }); throw error; }
+      catch (error) { this.cleanupErrors.push(error); this.callbacks.onRecord({ type: "pane_diagnostic", message: `迟到目标锁清理未确认：${String(error)}` }); throw error; }
       throw new PaneError("bridgeStopping", "会话正在停止，目标写锁已释放", 409);
     }
     // 保留每个已取得的目标锁，直到 session_start 确认切走或写者停止。
@@ -209,6 +224,11 @@ class RpcHandle implements DriverHandle {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true; this.enabled = false; clearTimeout(this.timer); this.revoke();
     this.stopPromise = this.performStop(); return this.stopPromise;
+  }
+  async drain(): Promise<void> {
+    // target 的迟到锁清理需要先等 stop；关闭在 stop 完成后排空，避免循环等待。
+    await Promise.allSettled([this.initialization, ...this.targets]);
+    if (this.cleanupErrors.length) throw new AggregateError(this.cleanupErrors, "迟到目标锁清理未确认");
   }
   private async performStop(): Promise<StopReport> {
     let report: StopReport | undefined; let failure: unknown;

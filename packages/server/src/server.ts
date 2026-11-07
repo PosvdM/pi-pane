@@ -56,7 +56,7 @@ export class PaneServer {
   readonly auth = new AuthStore(); readonly broker = new BridgeBroker(); readonly assets: AssetStore;
   readonly sessions: Sessions; readonly trust: TrustDecisions; readonly http: http.Server;
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024, perMessageDeflate: false });
-  private readonly clients = new Set<Client>(); private port = 0; private lock?: HeldLock; private sweep?: ReturnType<typeof setInterval>; private closed = false;
+  private readonly clients = new Set<Client>(); private port = 0; private lock?: HeldLock; private sweep?: ReturnType<typeof setInterval>; private closePromise?: Promise<void>;
   private constructor(private readonly options: PaneServerOptions, private readonly store: PiStore) {
     this.assets = new AssetStore(options.home);
     this.trust = new TrustDecisions(store, () => [...this.clients].some((c) => c.state === "authed"), (request) => this.broadcast({ type: "project_trust", request }));
@@ -219,13 +219,18 @@ export class PaneServer {
     for (const item of client.pending.splice(0)) { client.pendingBytes -= Buffer.byteLength(JSON.stringify(item)); client.ws.send(JSON.stringify(item)); }
     for (const item of client.needsResync.values()) client.ws.send(JSON.stringify(item)); client.needsResync.clear();
   }
-  async close(): Promise<void> {
-    if (this.closed) return; this.closed = true; clearInterval(this.sweep);
+  close(): Promise<void> {
+    if (!this.closePromise) this.closePromise = this.performClose();
+    return this.closePromise;
+  }
+  private async performClose(): Promise<void> {
+    clearInterval(this.sweep);
     for (const client of this.clients) { this.closeClient(client, 1001, "服务端停止"); client.ws.terminate(); }
     let error: unknown;
     try { await this.sessions.close(); } catch (cause) { error = cause; }
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     if (this.http.listening) { this.http.closeAllConnections(); await new Promise<void>((resolve) => this.http.close(() => resolve())); }
-    await this.lock?.release(); if (error) throw error;
+    if (error) throw error;
+    await this.lock?.release();
   }
 }

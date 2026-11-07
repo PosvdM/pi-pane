@@ -30,6 +30,8 @@ export class Sessions {
   private stateQueue = new ControlQueue();
   private recoveredFiles = new Set<string>();
   private recovering = true; private closing = false; readonly reports: StopReport[] = [];
+  private starts = new Map<AbortController, Promise<void>>(); private closePromise?: Promise<void>;
+  private handles = new Map<DriverHandle, Promise<void>>();
   constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
     private readonly emitUi: (sessionId: string, request: any) => void) {
     this.ledger = new RequestLedger(Date.now, duration(options.rpcTimeoutMs, 30000));
@@ -180,7 +182,18 @@ export class Sessions {
     if (!session.ui.has(body.id)) return { status: "alreadyHandled" };
     session.handle!.respondUi(body.response ? { ...body.response, id: body.id } : { id: body.id, cancelled: true }); session.ui.delete(body.id); return { status: "done" };
   }
-  private async start(session: HostedSession, assumeNoWriter = false, signal?: AbortSignal): Promise<void> {
+  private start(session: HostedSession, assumeNoWriter = false, signal?: AbortSignal): Promise<void> {
+    if (this.closing) return Promise.reject(new PaneError("interrupted", "会话已关闭", 409));
+    const controller = new AbortController(); const cancellation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    // 信任询问及目录读取也属于启动；登记后才进入第一个异步步骤。
+    const operation = Promise.resolve().then(() => this.performStart(session, assumeNoWriter, cancellation));
+    const settled = operation.catch((error) => { if (controller.signal.aborted && error !== cancellation.reason) throw error; });
+    this.starts.set(controller, settled);
+    void settled.then(() => this.starts.delete(controller), () => this.starts.delete(controller));
+    return operation;
+  }
+  private async performStart(session: HostedSession, assumeNoWriter: boolean, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
     assert(!session.recentExternal, "recentModification", "该会话可能正在别处运行，请只读查看或 Fork 为新会话", 409);
     await this.trust.request(session.cwd);
     signal?.throwIfAborted();
@@ -188,8 +201,18 @@ export class Sessions {
     signal?.throwIfAborted(); assert(!this.closing && !session.closed, "interrupted", "会话已关闭", 409);
     const owner = Symbol(); session.owner = owner;
     let attached = session; let handle: DriverHandle | undefined;
+    const cancel = () => { void handle?.stop().catch(() => {}); };
+    signal.addEventListener("abort", cancel, { once: true });
     try {
       handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir, decisions: this.trust.config(), assumeNoWriter }, {
+        onHandle: (source) => {
+          handle = source;
+          // 退出回调会摘下会话 handle；迟到目标取锁及初始化仍由独立的排空记录覆盖。
+          const finished = source.exited.then(() => source.drain()); this.handles.set(source, finished);
+          void finished.then(() => this.handles.delete(source), () => {});
+          if (signal.aborted || this.closing || attached.owner !== owner || attached.closed) cancel();
+          else attached.handle = source;
+        },
         onRecord: (event) => { if (attached.owner === owner && !attached.closed) this.receive(attached, event); },
         onReady: (state, data, reason, source) => {
           if (this.closing || attached.owner !== owner || attached.closed || attached.handle && attached.handle !== source) return;
@@ -207,28 +230,24 @@ export class Sessions {
           } else session.model.interrupt("pi", `${reason}${error ? `：${String(error)}` : ""}`);
           session.lastActive = Date.now(); session.recentExternal = false;
         },
-      });
+      }, signal);
       // 启动跨越取锁、spawn 和 bridge 就绪；停止抢占后，迟到的 handle 必须先结束，不能再发送输入。
       if (this.closing || attached.owner !== owner || attached.closed) { await handle.stop(); await handle.ready; throw new PaneError("interrupted", "会话已关闭", 409); }
       attached.handle = handle;
-      const startedHandle = handle;
-      const cancel = () => { void startedHandle.stop().catch(() => {}); };
-      signal?.addEventListener("abort", cancel, { once: true });
-      try {
-        if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
-        await handle.ready;
-        if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
-        assert(!this.closing && attached.owner === owner && attached.handle === handle && !attached.closed, "interrupted", "会话写者已停止或更换", 409);
-      } finally { signal?.removeEventListener("abort", cancel); }
+      signal.throwIfAborted();
+      await handle.ready;
+      signal.throwIfAborted();
+      assert(!this.closing && attached.owner === owner && attached.handle === handle && !attached.closed, "interrupted", "会话写者已停止或更换", 409);
     } catch (error) {
       // ready 可以先于停止流程失败；对外返回启动失败前，等待身份复查和写锁处理完成。
-      if (handle && !handle.acceptingInput) await handle.exited;
+      if (handle) { await handle.stop(); await handle.drain(); }
       if (attached.owner === owner) {
         if (error instanceof PaneError && error.code === "externalWriter") attached.model.readonlyReason = "externalWriter";
         else if (attached.model.status !== "interrupted") attached.model.interrupt("startup", String(error));
       }
+      if (this.closing && signal.aborted && handle) signal.throwIfAborted();
       throw error;
-    }
+    } finally { signal.removeEventListener("abort", cancel); }
   }
   private rebind(session: HostedSession, handle: DriverHandle, state: any, data: any, reason: string): HostedSession {
     assert(session.handle === handle, "staleDriver", "会话写者已更换，忽略旧写者的重绑定", 409);
@@ -244,7 +263,7 @@ export class Sessions {
         target.owner = session.owner; target.handle = handle; session.owner = undefined; session.handle = undefined; session.ui.clear(); session.dirty = false;
         session = target;
       } else {
-        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, drafts: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
+        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, syncing: undefined, dirty: false, drafts: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
         this.records.set(session.id, previous); this.files.set(fileKey(session.file), previous);
         session.id = state.sessionId; session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
         this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
@@ -302,12 +321,21 @@ export class Sessions {
   private async reclaim(): Promise<void> {
     for (const session of this.records.values()) if (session.handle && session.model.status === "idle" && !session.clients && !session.holds.size && !session.ui.size && Date.now() - session.lastActive >= (this.options.idleReclaimMs ?? 1800000)) await this.stop(session, true);
   }
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (!this.closePromise) this.closePromise = this.performClose();
+    return this.closePromise;
+  }
+  private async performClose(): Promise<void> {
     this.closing = true; clearInterval(this.timer); this.trust.close(); const errors: unknown[] = [];
+    const starts = [...this.starts];
+    for (const [controller] of starts) controller.abort(new PaneError("interrupted", "会话已关闭", 409));
     for (const session of this.records.values()) {
       session.closed = true; unwatchFile(session.file);
-      if (session.handle) try { await session.handle.stop(); } catch (error) { errors.push(error); }
+      const handle = session.handle;
+      if (handle) try { await handle.stop(); await handle.drain(); } catch (error) { errors.push(error); }
     }
+    for (const result of await Promise.allSettled(starts.map(([, settled]) => settled))) if (result.status === "rejected") errors.push(result.reason);
+    for (const [handle, finished] of this.handles) try { await handle.stop(); await finished; } catch (error) { errors.push(error); }
     if (errors.length) throw new AggregateError(errors, "部分会话未确认停止");
   }
 }
