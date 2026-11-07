@@ -62,10 +62,12 @@ for (const mode of ["bad-ticket", "stolen-ticket", "reject-callback", "no-ready"
 }
 for (const mode of ["reload-no-ready", "reload-disconnect", "switch-no-ready", "switch-disconnect"]) {
   test(`替换中的 pane-bridge 故障 ${mode}：新实例未就绪时停止并保留只读视图`, { timeout: 45000 }, async () => {
-    const f = await faultFixture(mode); const server = await startServer(f, { readyTimeoutMs: 3000 });
+    // 正常首次启动使用生产默认期限，只有故障替换使用缩短期限。
+    const f = await faultFixture(mode); const server = await startServer(f);
     try {
       const token = await pair(server); const initial = await open(server, token, f); const first = await control(server, token, initial, { type: "prompt", message: "正常输入" }); assert.equal(first.code, 200, JSON.stringify(first));
       const id = first.value.snapshot.ref.id; await until(async () => (await snapshot(server, token, id)).status === "idle");
+      server.sessions.driver.options.readyTimeoutMs = 3000;
       const state = await snapshot(server, token, id); const command = mode.startsWith("reload") ? "/pane-test-reload" : "/pane-test-new";
       const result = await control(server, token, state, { type: "prompt", message: command }); assert.equal(result.code, 200, JSON.stringify(result));
       await until(async () => (await records(f.env.PANE_TEST_FAULT_LOG)).some(r => r.readyAttempt > 1));
