@@ -9,7 +9,7 @@ import { fileKey } from "./store.js";
 // pane 拒绝已恢复的报告时保留内核锁；hostkit failed/throw 已自行解锁，隔离依赖持久标记和旧共享记录。
 const quarantined = new Map<string, { lock: SessionWriterLock; error: unknown }>();
 export async function acquireRecoveredWriter(file: string, home: string, instanceId: string, opts: RecoverOptions | undefined,
-  acquire: typeof acquireSessionWriterLock = acquireSessionWriterLock): Promise<SessionWriterLock> {
+  acquire: typeof acquireSessionWriterLock = acquireSessionWriterLock, onFailure?: (error: unknown) => void): Promise<SessionWriterLock> {
   const key = createHash("sha256").update(fileKey(file)).digest("hex");
   const diagnostic = path.join(home, "recovery", key + ".json");
   let blocked = false;
@@ -25,6 +25,8 @@ export async function acquireRecoveredWriter(file: string, home: string, instanc
     for (const report of lock.recoveryReports) checkStopReport(report);
   } catch (error) {
     quarantined.set(fileKey(file), { lock, error });
+    // 在持久化隔离记录之前通知本实例；记录写入失败也不能丢失未确认的恢复。
+    onFailure?.(error);
     let recordError: unknown;
     // 仅成功返回的恢复仍持锁并写入 starting；failed/throw 保留 hostkit 未改写的旧记录。
     if (recovered) try { await lock.update({ state: "stopping", writer: lock.previous?.writer }); } catch (failure) { recordError = failure; }

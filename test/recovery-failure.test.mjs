@@ -58,11 +58,12 @@ for (const fault of ["failed", "throw"]) test(`hostkit 恢复 ${fault} 真正解
     else assert.equal(await next.recoverPreviousWriter(), "failed");
     assert.equal(attempts, 2, "下一宿主仍执行旧写者恢复检查");
     assert.deepEqual(JSON.parse(await readFile(shared, "utf8")), previous);
-    await server.close(); server = await startServer(f); token = await pair(server);
+    await assert.rejects(server.close(), AggregateError); await server.lock.release();
+    server = await startServer(f); assert.equal(server.sessions.recoveryDiagnostics.length, 1); token = await pair(server);
     initial = await open(server, token, f, { sessionFile: target });
     const retry = await control(server, token, initial, { type: "prompt", message: "重启也须隔离" });
     assert.equal(retry.code, 503); assert.equal(retry.value.error, "stopIncomplete"); assert.equal(attempts, 2);
     assert.equal(server.sessions.snapshot(initial.ref.id).readonly, true);
     assert.deepEqual(JSON.parse(await readFile(diagnostic, "utf8")), saved);
-  } finally { await server.close(); await old.stop({ abortTimeoutMs: 100, graceMs: 100, termGraceMs: 100 }); await f.cleanup(); }
+  } finally { await server.close().catch(() => {}); await server.lock.release(); await old.stop({ abortTimeoutMs: 100, graceMs: 100, termGraceMs: 100 }); await f.cleanup(); }
 });

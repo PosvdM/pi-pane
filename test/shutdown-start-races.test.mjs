@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { readdir, writeFile, utimes } from "node:fs/promises";
+import fs, { readdir, writeFile, utimes } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { isSameProcess, probeSessionWriterLock } from "pi-hostkit";
 import { Sessions } from "../packages/server/dist/sessions.js";
 import { AssetStore } from "../packages/server/dist/assets.js";
@@ -166,7 +167,7 @@ test("停止未确认时关闭返回失败并保留实例锁，并发调用不�
   } finally { if (stop) { handle.stop = stop; await stop(); } await server.lock.release(); await f.cleanup(); }
 });
 
-for (const phase of ["process", "verify", "update", "release"]) test(`关闭前真实停止的 ${phase} 失败在退出及登记收尾后仍保留实例锁`, { timeout: 30000 }, async () => {
+for (const phase of ["process", "verify", "update", "release", "record"]) test(`关闭前真实停止的 ${phase} 失败在退出及登记收尾后仍保留实例锁`, { timeout: 30000 }, async (t) => {
   const f = await piFixture(); const server = await startServer(f); let handle; let lock; let update; let release;
   try {
     const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
@@ -182,20 +183,91 @@ for (const phase of ["process", "verify", "update", "release"]) test(`关闭前�
     };
     if (phase === "update") lock.update = async data => { if (data.state === "stopping") throw new Error("注入停止锁更新失败"); return update(data); };
     if (phase === "release") lock.release = async () => { throw new Error("注入停止锁释放失败"); };
+    if (phase === "record") {
+      const rm = fs.rm;
+      t.mock.method(fs, "rm", async (...args) => { if (args[0] === handle.recordFile) throw new Error("注入运行记录清理失败"); return rm(...args); });
+      syncBuiltinESMExports();
+    }
     await assert.rejects(handle.stop()); await handle.exited;
     assert.equal(source.handle, undefined, "必须经过真实 performStop 的 onExit");
     const finished = server.sessions.handles.get(handle); await finished?.catch(() => {}); await new Promise(setImmediate);
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    if (phase === "record") {
+      await server.sessions.start(source); const replacement = source.handle; await replacement.stop(); await replacement.drain();
+      assert.equal(server.sessions.handles.has(handle), true, "成功重启和退出不能清除旧 handle 的失败");
+    }
     let released = false; const releaseInstance = server.lock.release.bind(server.lock);
     server.lock.release = async () => { released = true; await releaseInstance(); };
     await assert.rejects(server.close(), AggregateError); await assert.rejects(server.close(), AggregateError);
     assert.equal(released, false); assert.equal(server.sessions.handles.has(handle), true);
-    assert.equal((await probeSessionWriterLock(source.file)).held, true);
+    assert.equal((await probeSessionWriterLock(source.file)).held, phase !== "record");
     assert.ok((await readdir(path.join(f.root, "pane", "run"))).includes(handle.identity.runId + ".json"));
   } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
     await server.close().catch(() => {});
     if (lock) { lock.update = update; lock.release = release; await release(); }
     await server.lock.release(); await f.cleanup();
   }
+});
+
+for (const phase of ["start", "target"]) test(`本实例 ${phase} 恢复隔离阻止关闭，下一实例只诊断旧标记`, { timeout: 30000 }, async () => {
+  const f = await piFixture(); let server = await startServer(f); let faultLock;
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
+    if (phase === "target") await server.sessions.start(source);
+    const driver = phase === "start" ? server.sessions.driver : source.handle;
+    const acquire = driver.acquireWriter;
+    driver.acquireWriter = async (...args) => {
+      faultLock = await acquire(...args); const recover = faultLock.recoverPreviousWriter.bind(faultLock);
+      faultLock.recoverPreviousWriter = async (...args) => { await recover(...args); throw new Error("注入关闭前恢复失败"); };
+      return faultLock;
+    };
+    if (phase === "start") await assert.rejects(server.sessions.start(source), { code: "stopIncomplete" });
+    else {
+      const handle = source.handle;
+      await handle.bridgeEvent({ type: "shutdown", reason: "resume", target: f.sessionPath("failed-before-close") });
+      await handle.stop(); await handle.drain();
+      await server.sessions.handles.get(handle); await new Promise(setImmediate);
+      assert.equal(server.sessions.handles.size, 0, "写者本身已确认停止，失败由实例恢复登记保留");
+    }
+    let released = false; const release = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { released = true; await release(); };
+    await assert.rejects(server.close(), AggregateError); assert.equal(released, false);
+    await faultLock.release(); faultLock = undefined; await server.lock.release();
+    server = await startServer(f);
+    assert.equal(server.sessions.recoveryDiagnostics.length, 1); assert.match(server.sessions.recoveryDiagnostics[0], /既有写者恢复隔离记录/);
+    await server.close();
+  } finally { await server.close().catch(() => {}); await faultLock?.release(); await server.lock.release(); await f.cleanup(); }
+});
+
+test("spawn 失败后的写锁释放拒绝先于关闭完成，仍保留实例清理失败", { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f);
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
+    const acquire = server.sessions.driver.acquireWriter;
+    server.sessions.driver.acquireWriter = async (...args) => {
+      const lock = await acquire(...args); const release = lock.release.bind(lock);
+      lock.spawnWriter = async () => { throw new Error("注入 spawn 拒绝"); };
+      lock.release = async () => { await release(); throw new Error("注入启动清理拒绝"); };
+      return lock;
+    };
+    await assert.rejects(server.sessions.start(source), /注入启动清理拒绝/); await new Promise(setImmediate);
+    assert.equal(server.sessions.starts.size, 0); assert.equal(server.sessions.handles.size, 0);
+    let released = false; const release = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { released = true; await release(); };
+    await assert.rejects(server.close(), AggregateError); assert.equal(released, false);
+  } finally { await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
+});
+
+test("运行记录恢复失败由本实例保存，随后关闭不能报告成功", { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f);
+  try {
+    await writeFile(path.join(f.root, "pane", "run", "broken.json"), JSON.stringify({ identity: {} }));
+    await assert.rejects(server.sessions.recover(), { code: "invalidRunRecord" });
+    let released = false; const release = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { released = true; await release(); };
+    await assert.rejects(server.close(), AggregateError); assert.equal(released, false);
+  } finally { await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
 });
 
 test("重绑定复制出的旧记录不继承 syncing，重新托管后真正取条目", async () => {

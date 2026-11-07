@@ -31,7 +31,8 @@ export class Sessions {
   private recoveredFiles = new Set<string>();
   private recovering = true; private closing = false; readonly reports: StopReport[] = [];
   private starts = new Map<AbortController, Promise<void>>(); private closePromise?: Promise<void>;
-  private handles = new Map<DriverHandle, Promise<void>>();
+  private handles = new Map<DriverHandle, Promise<void>>(); private cleanupErrors: unknown[] = [];
+  readonly recoveryDiagnostics: string[] = [];
   constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
     private readonly emitUi: (sessionId: string, request: any) => void) {
     this.ledger = new RequestLedger(Date.now, duration(options.rpcTimeoutMs, 30000));
@@ -44,15 +45,21 @@ export class Sessions {
       assert(this.state && typeof this.state === "object" && !Array.isArray(this.state), "invalidState", "服务端状态文件无效", 503);
       if (Array.isArray(this.state.knownProjects)) for (const cwd of this.state.knownProjects) if (typeof cwd === "string" && path.isAbsolute(cwd)) this.projects.add(cwd);
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    try {
+      const existing = await readdir(path.join(this.options.home, "recovery"));
+      for (const file of existing) if (file.endsWith(".json") || file.endsWith(".tmp")) this.recoveryDiagnostics.push(`既有写者恢复隔离记录：${file}`);
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const directory = path.join(this.options.home, "run"); await mkdir(directory, { recursive: true });
-    for (const file of await readdir(directory)) {
-      if (!file.endsWith(".json")) continue;
-      const record = JSON.parse(await readFile(path.join(directory, file), "utf8")) as { identity: ProcessIdentity; sessionFile: string };
-      assert(record.identity && Number.isSafeInteger(record.identity.pid) && record.identity.pid > 0 && typeof record.identity.startTime === "string" && record.identity.startTime.length > 0 && typeof record.identity.runId === "string" && typeof record.identity.instanceId === "string" && typeof record.sessionFile === "string", "invalidRunRecord", "运行记录损坏，不能重新打开会话", 503);
-      // 在所有恢复完成前不接受会话打开；身份查询不明或 StopReport 不完整时保留现场。
-      const report = await stopByIdentity(record.identity, this.options.stopOptions); await verifyStopped(record.identity, report); this.reports.push(report);
-      this.recoveredFiles.add(fileKey(record.sessionFile)); await rm(path.join(directory, file));
-    }
+    try {
+      for (const file of await readdir(directory)) {
+        if (!file.endsWith(".json")) continue;
+        const record = JSON.parse(await readFile(path.join(directory, file), "utf8")) as { identity: ProcessIdentity; sessionFile: string };
+        assert(record.identity && Number.isSafeInteger(record.identity.pid) && record.identity.pid > 0 && typeof record.identity.startTime === "string" && record.identity.startTime.length > 0 && typeof record.identity.runId === "string" && typeof record.identity.instanceId === "string" && typeof record.sessionFile === "string", "invalidRunRecord", "运行记录损坏，不能重新打开会话", 503);
+        // 在所有恢复完成前不接受会话打开；身份查询不明或 StopReport 不完整时保留现场。
+        const report = await stopByIdentity(record.identity, this.options.stopOptions); await verifyStopped(record.identity, report); this.reports.push(report);
+        this.recoveredFiles.add(fileKey(record.sessionFile)); await rm(path.join(directory, file));
+      }
+    } catch (error) { this.cleanupErrors.push(error); throw error; }
     this.recovering = false;
   }
   setBridgeUrl(url: string): void {
@@ -205,6 +212,7 @@ export class Sessions {
     signal.addEventListener("abort", cancel, { once: true });
     try {
       handle = await this.driver.start({ cwd: session.cwd, sessionFile: session.file, sessionDir, decisions: this.trust.config(), assumeNoWriter }, {
+        onCleanupFailure: (error) => { this.cleanupErrors.push(error); },
         onHandle: (source) => {
           handle = source;
           // 退出回调会摘下会话 handle；迟到目标取锁及初始化仍由独立的排空记录覆盖。
@@ -336,6 +344,8 @@ export class Sessions {
     }
     for (const result of await Promise.allSettled(starts.map(([, settled]) => settled))) if (result.status === "rejected") errors.push(result.reason);
     for (const [handle, finished] of this.handles) try { await handle.stop(); await finished; } catch (error) { errors.push(error); }
+    // 仅汇总本实例产生的恢复失败；既有隔离记录留作诊断，不阻止正常关闭。
+    errors.push(...this.cleanupErrors);
     if (errors.length) throw new AggregateError(errors, "部分会话未确认停止");
   }
 }

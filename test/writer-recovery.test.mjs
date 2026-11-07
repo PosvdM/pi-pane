@@ -56,5 +56,6 @@ for (const switching of [false, true]) test(`不完整恢复报告在${switching
     const retry = await open(server, token, f, { sessionFile: target });
     const denied = await control(server, token, retry, { type: "prompt", message: "仍须阻止" }); assert.equal(denied.code, 503); assert.equal(denied.value.error, "stopIncomplete");
     assert.equal((await probeSessionWriterLock(target)).record.state, "stopping");
-  } finally { await server.close(); await oldProcess.stop({ abortTimeoutMs: 100, graceMs: 100, termGraceMs: 100 }); await f.cleanup(); }
+    await assert.rejects(server.close(), AggregateError);
+  } finally { await server.close().catch(() => {}); await server.lock.release(); await oldProcess.stop({ abortTimeoutMs: 100, graceMs: 100, termGraceMs: 100 }); await f.cleanup(); }
 });

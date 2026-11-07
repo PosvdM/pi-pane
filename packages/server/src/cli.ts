@@ -10,6 +10,7 @@ let config: Partial<PaneServerOptions> = {};
 try { config = JSON.parse(await readFile(path.join(home, "config.json"), "utf8")); }
 catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 const server = await PaneServer.start({ home, port: config.port, piPath: config.piPath, idleReclaimMs: config.idleReclaimMs });
+for (const diagnostic of server.sessions.recoveryDiagnostics) console.warn(diagnostic);
 const printCode = () => console.log(`配对地址：${server.origin}/#code=${server.auth.issuePairCode()}\n配对码使用一次或十分钟后失效。按 Enter 生成新码。`);
 printCode();
 const input = process.stdin.isTTY ? createInterface({ input: process.stdin }) : undefined;
