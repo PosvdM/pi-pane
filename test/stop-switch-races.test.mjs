@@ -10,22 +10,63 @@ import { fileKey } from "../packages/server/dist/store.js";
 import { piFixture, providerPath, until } from "./fixtures/helpers.mjs";
 import { startServer, pair, open, control, snapshot, request } from "./fixtures/client.mjs";
 const commands = fileURLToPath(new URL("./fixtures/session-commands.ts", import.meta.url));
-const deferred = () => { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; };
-async function setup() {
+const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
+function holdReadyStart(driver, gate) {
+  const start = driver.start.bind(driver); const entered = deferred(); entered.promise.catch(() => {});
+  driver.start = async (...args) => {
+    try { const handle = await start(...args); await handle.ready; entered.resolve(handle); await gate.promise; return handle; }
+    catch (error) { entered.reject(error); throw error; }
+  };
+  return entered.promise;
+}
+async function setup(afterListen = async () => {}) {
   const f = await piFixture({ fallback: { segments: [{ type: "text", text: "完成" }] } });
-  const target = f.sessionPath("stop-race-target");
-  await writeFile(target, JSON.stringify({ type: "session", version: 3, id: "stop-race-target", cwd: f.cwd, timestamp: new Date().toISOString() }) + "\n");
-  await utimes(target, new Date(0), new Date(0));
-  const server = await startServer(f, { extraExtensions: [providerPath, commands] });
-  const token = await pair(server); const b = await open(server, token, f, { sessionFile: target });
-  const first = await control(server, token, await open(server, token, f), { type: "prompt", message: "源会话" }); assert.equal(first.code, 200);
-  const a = await until(async () => { const s = await snapshot(server, token, first.value.snapshot.ref.id); return s.status === "idle" && s; });
-  server.sessions.ledger = new RequestLedger(Date.now, 50);
-  return { f, target, server, token, a, b };
+  const target = f.sessionPath("stop-race-target"); let server;
+  try {
+    await writeFile(target, JSON.stringify({ type: "session", version: 3, id: "stop-race-target", cwd: f.cwd, timestamp: new Date().toISOString() }) + "\n");
+    await utimes(target, new Date(0), new Date(0));
+    server = await startServer(f, { extraExtensions: [providerPath, commands] });
+    await afterListen({ server, f, target });
+    const token = await pair(server); const b = await open(server, token, f, { sessionFile: target });
+    const first = await control(server, token, await open(server, token, f), { type: "prompt", message: "源会话" }); assert.equal(first.code, 200);
+    const a = await until(async () => { const s = await snapshot(server, token, first.value.snapshot.ref.id); return s.status === "idle" && s; });
+    server.sessions.ledger = new RequestLedger(Date.now, 50);
+    return { f, target, server, token, a, b };
+  } catch (error) {
+    // 调用方尚未进入 try/finally；初始化失败仍须关闭已经监听或启动写者的现场。
+    const failures = [error];
+    try { await server?.close(); } catch (failure) { failures.push(failure); }
+    try { await f.cleanup(); } catch (failure) { failures.push(failure); }
+    if (failures.length > 1) throw new AggregateError(failures, "切换测试初始化或清理失败");
+    throw error;
+  }
 }
 async function final(server, token, route, body) {
   return until(async () => { const r = await request(server, token, route, body); return r.value.status !== "pending" && r; });
 }
+
+test("切换测试初始化拒绝时关闭真实写者、HTTP 和实例锁并清理现场", { timeout: 30000 }, async () => {
+  const failure = new Error("注入初始化拒绝"); let server; let handle; let root; let released = false;
+  await assert.rejects(setup(async value => {
+    server = value.server; root = value.f.root;
+    const view = await server.sessions.open({ cwd: value.f.cwd });
+    const source = server.sessions.records.get(view.ref.id); await server.sessions.start(source); handle = source.handle;
+    const release = server.lock.release.bind(server.lock);
+    server.lock.release = async () => { released = true; await release(); };
+    throw failure;
+  }), error => error === failure);
+  assert.equal(server.http.listening, false); assert.equal(released, true);
+  assert.equal(await isSameProcess(handle.identity), "gone"); assert.equal(server.sessions.handles.size, 0);
+  if (!process.env.KEEP_FIXTURES) await assert.rejects(stat(root), { code: "ENOENT" });
+});
+
+test("迟到启动的就绪拒绝会传给入口 gate，不留下永远等待的 entered", async () => {
+  const failure = new Error("注入就绪前启动失败"); const gate = deferred();
+  const driver = { start: async () => ({ ready: Promise.reject(failure) }) };
+  const entered = holdReadyStart(driver, gate); const starting = driver.start();
+  await assert.rejects(entered, error => error === failure);
+  await assert.rejects(starting, error => error === failure); gate.resolve();
+});
 
 test("A resume 已打开的 B 后扩展永久等待，控制队列随写者迁移，B.stop 仍能抢占", { timeout: 30000 }, async () => {
   const { f, target, server, token, a, b } = await setup();
@@ -185,12 +226,11 @@ test("就绪回调先于 start 返回时，停止仍能找到来源 handle 且�
   const { f, server, token, a } = await setup(); const gate = deferred();
   try {
     const source = server.sessions.records.get(a.ref.id); await source.handle.stop();
-    const start = server.sessions.driver.start.bind(server.sessions.driver); const entered = deferred();
-    server.sessions.driver.start = async (...args) => { const handle = await start(...args); await handle.ready; entered.resolve(handle); await gate.promise; return handle; };
+    const entered = holdReadyStart(server.sessions.driver, gate);
     const fresh = await snapshot(server, token, a.ref.id); const route = "/api/sessions/" + a.ref.id + "/control";
     const body = { requestId: randomUUID(), expectedEpoch: fresh.cursor.epoch, expectedRevision: fresh.controlRevision, command: { type: "prompt", message: "不得迟到发送" } };
     assert.deepEqual((await request(server, token, route, body)).value, { status: "pending" });
-    const handle = await entered.promise; assert.equal(source.handle, handle);
+    const handle = await entered; assert.equal(source.handle, handle);
     const current = await snapshot(server, token, a.ref.id);
     const stopped = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: current.cursor.epoch, expectedRevision: current.controlRevision, command: { type: "stop" } });
     assert.equal(stopped.code, 200, JSON.stringify(stopped)); await handle.exited;
