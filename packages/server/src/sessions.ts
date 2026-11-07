@@ -135,11 +135,23 @@ export class Sessions {
         }
         assert(typeof rpc.message === "string" && Buffer.byteLength(rpc.message) <= 1024 * 1024, "invalidMessage", "消息文本无效或超过 1 MiB");
       }
-      model.control(["prompt", "steer", "follow_up", "compact"].includes(command.type) ? "running" : model.status,
-        command.type === "compact" ? "compacting" : ["prompt", "steer", "follow_up"].includes(command.type) ? "streaming" : model.inFlight.phase, undefined, true);
+      // 受理控制操作只递增 revision；生成阶段由真实事件驱动，handled/拒绝不推测为 streaming。
+      model.control(model.status, model.inFlight.phase, undefined, true);
       const response = await session.handle.send(rpc, { trackResult: true });
-      await this.sync(session);
-      if (["set_model", "set_thinking_level"].includes(command.type)) session.state = (await session.handle.send({ type: "get_state" })).data;
+      try {
+        await this.sync(session);
+        if (["set_model", "set_thinking_level", "compact"].includes(command.type) && session.handle?.acceptingInput) {
+          const currentModel = session.model; const epoch = currentModel.epoch;
+          const state = (await session.handle.send({ type: "get_state" })).data as any;
+          if (session.model === currentModel && currentModel.epoch === epoch) {
+            session.state = state;
+            if (command.type === "compact" && !state.isCompacting && !state.isStreaming) currentModel.control("idle", "idle");
+          }
+        }
+      } catch (error) {
+        // 控制响应已经确认；后续快照查询失败不能把已执行操作缓存为失败。
+        session.model.emit({ type: "pane_diagnostic", message: String(error) });
+      }
       return { status: "accepted", response, snapshot: this.view(session) };
     }));
   }
