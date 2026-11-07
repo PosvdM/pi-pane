@@ -1,6 +1,6 @@
 # 总体架构
 
-> 状态：设计草案。接口和默认值是草案，P0 验证后冻结。
+> 状态：M1 服务端核心已实现。Web 界面与设备签名在 M2、插件宿主在 M3 实现。本文描述完整架构；M1 的可用接口与验收映射见 [development.md](development.md)。
 
 pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起一个 `pi --mode rpc` 子进程，把聊天流转发给浏览器；子代理、会议等功能由插件通过通用接口显示，pi-pane 本身不实现这些业务。
 
@@ -76,7 +76,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 - 始终带 `--session <路径>`，不让 pi 自己选文件名：pi-pane 必须在 pi 打开会话文件之前持有它的写锁（见“会话写锁”）。路径必须是不依赖 pi 环境的绝对路径（不用 `~` 或相对路径），`spawnWriter` 按 pi 的参数规则核对它就是持锁的文件（见 pi-hostkit 设计文档的[“取得锁之后”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁之后)）。
 - **新建会话**：按 pi-hostkit 设计文档[“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ②，pi-pane 在会话目录下预先分配一个新文件路径，取得该路径的写锁后以 `--session <该路径>` 拉起；文件不存在时 pi 新建会话并沿用这个路径。不用 `--session-id` 或不带 `--session` 让 pi 自己生成路径。
-- **Fork 为新会话**（从只读视图）：P0 实测发现 pi 的 `SessionManager.forkFrom()` 会在源文件无尾换行或尾部截断时修改源文件（末尾追加换行，并将截断行永久留在文件中间），违背对源文件的只读承诺。因此只读查看要 fork 时，pi-pane 先将源文件复制到临时目录，再在进程内对临时副本调用 `SessionManager.forkFrom(副本, cwd, sessionDir)` 生成新文件。`forkFrom()` 把传入的路径写进新文件会话头的 `parentSession`，会话列表读取这个字段（依据：`dist/core/session-manager.js` 的 `forkFrom()` 与会话列表读取）；所以在取得新文件的写锁并拉起 pi 之前，将新文件会话头的 `parentSession` 修正为规范化后的原始源文件路径；只修改新生成的文件，原始源文件保持只读。随后取得新文件的写锁，以 `--session <新文件>` 拉起，并清理临时副本。这是 pi-hostkit 设计文档[“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ⑤（先写后锁），取锁失败时不拉起并告诉用户。不用 `--fork` 参数。P1 增加测试，验证源文件字节不变，且新会话的父路径指向真实源文件。
+- **Fork 为新会话**（从只读视图）：P0 实测发现 pi 的 `SessionManager.forkFrom()` 会在源文件无尾换行或尾部截断时修改源文件（末尾追加换行，并将截断行永久留在文件中间），违背对源文件的只读承诺。因此只读查看要 fork 时，pi-pane 先将源文件复制到临时目录，再在进程内对临时副本调用 `SessionManager.forkFrom(副本, cwd, sessionDir)` 生成新文件。`forkFrom()` 把传入的路径写进新文件会话头的 `parentSession`，会话列表读取这个字段（依据：`dist/core/session-manager.js` 的 `forkFrom()` 与会话列表读取）；所以在取得新文件的写锁并拉起 pi 之前，将新文件会话头的 `parentSession` 修正为规范化后的原始源文件路径；只修改新生成的文件，原始源文件保持只读。随后取得新文件的写锁，以 `--session <新文件>` 拉起，并清理临时副本。这是 pi-hostkit 设计文档[“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ⑤（先写后锁），取锁失败时不拉起并告诉用户。不用 `--fork` 参数。M1 自动测试验证源文件字节不变，且新会话的父路径指向真实源文件。
 
 - **不加 `-ne`**：主会话加载用户自己配置的 pi 扩展、技能、MCP，和在终端里运行 pi 一样。pi-agora 的扩展也是这样进入主会话的。
 - **不加 `--approve`**：项目资源是否加载按用户的信任决定，见“项目信任”。
@@ -273,12 +273,12 @@ type ServerMessage =
 - 浏览器打开会话：`GET /api/sessions/:id/snapshot` 取快照，再通过 WebSocket 用快照的 `cursor` 订阅。
 - 快照是对会话模型的一次同步读取，返回的 `entries`、`inFlight` 和 `cursor` 属于同一时刻：游标之前的事件都已反映在快照里，订阅从游标之后的第一条事件开始。因为模型更新和 `seq` 分配在同一次处理中完成，两者之间没有可以插入事件的空隙。
 - 快照只带聊天视图的最后一页（默认 50 条）和历史水位 `historyBefore`。向上滚动时 `GET /api/sessions/:id/history?before=<entryId>` 取更早的页，规则见 [plugin-api.md](plugin-api.md#sessionsnapshot)。
-- **条目与图片分离**：P0 实测表明大图会导致全量 `get_entries` 耗时急剧上升。因此重连和快照**只用 `since` 增量取条目**，不全量取；快照中只放图片的引用（哈希/URL），浏览器显示时再单独异步取图。单张图片的大小上限放到 P1 按实测再定。
+- **条目与图片分离**：P0 实测表明大图会导致全量 `get_entries` 耗时急剧上升。因此重连和快照**只用 `since` 增量取条目**，不全量取；快照中只放图片的引用（哈希/URL），浏览器显示时再单独异步取图。M1 实测后固定单张图片上限为 4 MiB；观测值见 [development.md](development.md#图片上限观测)。
 
 ### 游标与重连
 
 - 每个会话的事件游标是 `{ epoch, seq }`。服务端启动、进程重启、进程切换会话、模型重建时生成新的 epoch。
-- 服务端在内存中保留每个会话最近 2000 个事件。
+- 服务端在内存中保留每个会话最近 2000 个事件，同时使用 32 MiB 字节限额；单条事件可以保留。
 - 断线重连：带上最后收到的游标重新订阅。epoch 不同、`seq` 大于当前最新值、或该 `seq` 之后的事件已不在缓冲区时，服务端发 `resync`，浏览器重新取快照。
 - `message_update` 只带增量（依据：pi `docs/json.md`），浏览器按 `contentIndex` 拼接，`*_end` 和 `message_end` 到达后用完整内容替换。
 

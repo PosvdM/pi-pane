@@ -35,7 +35,7 @@ async function upload(req: IncomingMessage): Promise<{ image: Buffer; mimeType: 
   return new Promise((resolve, reject) => {
     let image: Buffer | undefined; let thumb: Buffer | undefined; let mimeType = ""; let failed: unknown;
     let parser;
-    try { parser = busboy({ headers: req.headers, limits: { files: 2, parts: 2, fields: 0, fileSize: MAX_IMAGE_BYTES + 1, headerPairs: 64 } }); }
+    try { parser = busboy({ headers: req.headers, limits: { files: 3, parts: 3, fields: 0, fileSize: MAX_IMAGE_BYTES + 1, headerPairs: 64 } }); }
     catch { reject(new PaneError("invalidUpload", "图片上传格式无效")); return; }
     const names = new Set<string>();
     parser.on("file", (name, stream, info) => {

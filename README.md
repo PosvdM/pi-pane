@@ -2,7 +2,7 @@
 
 pi-pane 是 [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) 编码智能体的轻量 Web 界面。它在浏览器里显示和操作 pi 会话；子代理、会议等功能由插件提供，pi-pane 只提供通用的显示接口。
 
-> **当前状态：设计阶段，还没有代码。** 本仓库目前只有设计文档，接口和默认值都是草案，P0 验证后冻结。
+> **当前状态：M1 服务端核心。** 三个 workspace 包提供会话托管、pane 协议类型和 pane-bridge。Web 界面在 M2 实现，插件宿主在 M3 实现；当前通过 HTTP 和 WebSocket 接口使用。开发与验收说明见 [docs/development.md](docs/development.md)。
 
 ## 为什么要做
 
@@ -15,7 +15,9 @@ pi 在终端里工作得很好，但有几件事终端做不好：
 
 pi-pane 不替代终端：会话仍然是 pi 自己的会话文件，在终端和 pi-pane 之间可以来回打开。
 
-## 功能
+## 功能范围
+
+以下为完整 MVP 的目标范围。M1 只实现服务端核心，前端与插件能力尚不可用。
 
 - **托管主会话**：每个打开的会话对应一个 `pi --mode rpc` 子进程，加载你自己的 pi 扩展、技能和配置，和在终端里运行 pi 一样。没在运行的会话可以只读查看，第一次发送时再启动。
 - **聊天**：Markdown、思考内容折叠、工具调用卡片、`edit` 差异显示、压缩分隔标记；发送、运行中追加（steer）、排队（follow-up）、停止（排队中的消息退回输入框）；切换模型和 thinking；查看上下文用量和费用。
@@ -26,7 +28,7 @@ pi-pane 不替代终端：会话仍然是 pi 自己的会话文件，在终端�
 
 不包含终端、Git、文件编辑器、canvas、设备中心、审批规则引擎和定时任务。
 
-## 运行环境与安全（计划）
+## 运行环境与安全
 
 - Node.js 24 及以上；pi 1.5.x（`>=1.5.0 <1.6.0`），依次从配置项 `piPath`、pi 官方安装脚本的安装目录、全局 npm 目录查找。
 - Windows、macOS、Linux 同时支持。
@@ -60,6 +62,18 @@ packages/
   bridge-extension/   加载进每个主会话的 pi 扩展：图片顺序还原、多题表单通道、会话切换回报、项目信任决定
   plugin-api/         插件接口和 pane 协议类型（@pi-pane/plugin-api）
 ```
+
+## 开发运行
+
+需要 Node.js 24 及以上、npm、pi 1.5.x，以及构建 pi-hostkit 原生模块所需的 Python 和 C/C++ 工具链。
+
+```sh
+npm ci
+npm test
+npm start
+```
+
+`npm start` 只提供 M1 服务端接口，默认监听 `127.0.0.1:4319`，终端显示一次性配对地址。当前没有可操作的首页。配置文件为 `~/.pi/pane/config.json`，可设置 `piPath`、`port` 和 `idleReclaimMs`；`PI_PANE_HOME` 可覆盖数据目录。接口与测试入口见 [开发文档](docs/development.md)。
 
 ## 文档
 
