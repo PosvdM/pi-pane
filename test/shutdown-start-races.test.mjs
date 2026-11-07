@@ -46,6 +46,26 @@ for (const phase of ["acquire", "spawn"]) test(`关闭等待 start 返回及 rea
   } finally { gate.resolve(); await starting; await closing; await server.close(); await f.cleanup(); }
 });
 
+test("创建 handle 后立即交付，首次 persist 和 start 返回前可以停止写者", { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); const gate = deferred(); const entered = deferred(); let starting; let closing;
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
+    const start = server.sessions.driver.start.bind(server.sessions.driver);
+    server.sessions.driver.start = (spec, callbacks, signal) => start(spec, { ...callbacks, onHandle: handle => {
+      callbacks.onHandle(handle); const persist = handle.persist.bind(handle);
+      handle.persist = async () => { entered.resolve(handle); await gate.promise; await persist(); };
+    } }, signal);
+    starting = server.sessions.start(source).catch(error => error); const handle = await entered.promise;
+    assert.equal(source.handle, handle); assert.equal(handle.acceptingInput, false);
+    let finished = false; closing = server.close().then(() => { finished = true; });
+    await handle.exited; await new Promise(setImmediate);
+    assert.equal(await isSameProcess(handle.identity), "gone"); assert.equal(finished, false);
+    gate.resolve(); assert.equal((await starting).code, "interrupted"); await closing;
+    assert.equal((await probeSessionWriterLock(source.file)).held, false);
+    assert.deepEqual(await readdir(path.join(f.root, "pane", "run")), []);
+  } finally { gate.resolve(); await starting; await closing; await server.close(); await f.cleanup(); }
+});
+
 for (const phase of ["trust", "directory", "restart"]) test(`关闭登记并等待 ${phase} 阶段的启动`, { timeout: 30000 }, async () => {
   const f = await piFixture(); const server = await startServer(f); const gate = deferred(); const entered = deferred();
   let starting; let closing;
@@ -134,7 +154,9 @@ test("重绑定复制出的旧记录不继承 syncing，重新托管后真正取
   sessions.records.set(source.id, source); sessions.files.set(fileKey(file), source);
   const syncing = sessions.sync(source); source.dirty = true;
   sessions.rebind(source, handle, { sessionId: "target", sessionFile: destination }, { entries: [] }, "resume");
-  const previous = sessions.records.get("source"); gate.resolve(); await syncing;
+  const previous = sessions.records.get("source");
+  assert.equal(previous.syncing, undefined); assert.equal(previous.dirty, false);
+  gate.resolve(); await syncing;
   let reads = 0; previous.handle = { acceptingInput: true, send: async () => { reads++; return { data: { entries: [] } }; } };
   await sessions.sync(previous); assert.equal(reads, 1, "旧记录重新启动后必须执行 get_entries，不能复用已完成的 Promise");
   assert.equal(previous.syncing, undefined); assert.equal(previous.dirty, false);
