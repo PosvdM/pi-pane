@@ -114,6 +114,8 @@ class RpcHandle implements DriverHandle {
         try { return { decision: await this.options.onTrust?.(event.cwd) }; }
         finally { if (!this.stopping && !this.enabled) this.armTimeout(); }
       }
+      case "instance":
+      case "beforeSwitch":
       case "beforeFork": return { accepted: true };
       case "lock": {
         assert(typeof event.target === "string" && path.isAbsolute(event.target), "invalidTarget", "会话目标必须是绝对路径");

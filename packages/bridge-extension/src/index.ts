@@ -26,22 +26,28 @@ export default async function bridge(pi: ExtensionApi): Promise<void> {
   }
   const conn = connection; const instance = ++conn.sequence;
   const call = (type: string, data: object = {}, timeoutMs = 10000) => post(conn.url + "/bridge/event", { ...data, type, instance }, conn.token, timeoutMs);
+  const authenticated = call("instance").then(() => true, () => false);
   let start: Promise<unknown> | undefined; const unsubscribe: (() => void)[] = [];
   pi.on("project_trust", async (event) => {
     const cwd = pathKey(event.cwd); let choice = conn.decisions[cwd];
     if (!choice) {
-      try { const result = await call("trust", { cwd: event.cwd }, 59000); choice = result.decision; if (choice) conn.decisions[cwd] = choice; }
+      try { if (!await authenticated) return { trusted: "undecided" }; const result = await call("trust", { cwd: event.cwd }, 59000); choice = result.decision; if (choice) conn.decisions[cwd] = choice; }
       catch { return { trusted: "undecided" }; }
     }
     return choice ? { trusted: choice.trusted ? "yes" : "no", remember: choice.remember } : { trusted: "undecided" };
   });
   pi.on("session_before_switch", async (event) => {
-    if (event.reason !== "resume") return;
-    try { const reply = await call("lock", { target: event.targetSessionFile, reason: "resume" }); return { cancel: !reply.acquired }; }
+    try {
+      if (!await authenticated) return { cancel: true };
+      const reply = event.reason === "resume"
+        ? await call("lock", { target: event.targetSessionFile, reason: "resume" })
+        : await call("beforeSwitch");
+      return { cancel: event.reason === "resume" ? !reply.acquired : !reply.accepted };
+    }
     catch { return { cancel: true }; }
   });
   pi.on("session_before_fork", async () => {
-    try { await call("beforeFork"); } catch { return { cancel: true }; }
+    try { if (!await authenticated) return { cancel: true }; const reply = await call("beforeFork"); return { cancel: !reply.accepted }; } catch { return { cancel: true }; }
   });
   pi.on("session_shutdown", async (event) => {
     for (const remove of unsubscribe.splice(0)) remove();
@@ -53,7 +59,7 @@ export default async function bridge(pi: ExtensionApi): Promise<void> {
         // 多题表单由 M2 接入；未启用的通道以 aborted 结束，不能伪造用户取消。
         pi.events.emit("pane:form:response", { requestId: data.requestId, outcome: { status: "aborted" } });
       }));
-      start = call("bridgeReady", { reason: event.reason, sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, trusted: ctx.isProjectTrusted() });
+      start = authenticated.then((ok) => { if (!ok) throw new Error("pane-bridge 实例认证失败"); return call("bridgeReady", { reason: event.reason, sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, trusted: ctx.isProjectTrusted() }); });
     }
     await start;
   });

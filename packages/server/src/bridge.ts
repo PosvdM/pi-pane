@@ -27,14 +27,19 @@ export class BridgeBroker {
     assert(run && !run.closed, "invalidBridgeCredential", "pane-bridge 凭证已失效", 403);
     assert(Number.isSafeInteger(event.instance) && event.instance > 0, "invalidBridgeInstance", "pane-bridge 实例号无效");
     if (run.identity) assert(await isSameProcess(run.identity) === "alive", "bridgeProcessGone", "pane-bridge 所属进程已退出", 403);
+    if (event.type === "instance") {
+      assert(event.instance === run.instance + 1, "staleBridgeInstance", "pane-bridge 实例已被替换", 409);
+      run.instance = event.instance; run.readyPayload = undefined;
+      return run.handler(event);
+    }
     if (event.type === "bridgeReady") {
       const payload = JSON.stringify(event);
-      assert(event.instance >= run.instance, "staleBridgeInstance", "pane-bridge 实例已被替换", 409);
-      if (event.instance === run.instance) { assert(run.readyPayload === payload, "bridgeReadyConflict", "同一实例的就绪信息不一致", 409); return { accepted: true }; }
-      run.instance = event.instance; run.readyPayload = payload;
+      assert(event.instance === run.instance, "staleBridgeInstance", "pane-bridge 实例已被替换", 409);
+      if (run.readyPayload) { assert(run.readyPayload === payload, "bridgeReadyConflict", "同一实例的就绪信息不一致", 409); return { accepted: true }; }
+      run.readyPayload = payload;
     } else {
-      // project_trust 发生于新实例 session_start 之前；它只能查询决定，不能改变会话写锁。
-      assert(event.instance === run.instance || event.type === "trust" && event.instance === run.instance + 1, "staleBridgeInstance", "pane-bridge 实例已被替换", 409);
+      // 实例认证允许就绪前协调写锁；是否可发送输入由 driver 的就绪门禁单独控制。
+      assert(event.instance === run.instance, "staleBridgeInstance", "pane-bridge 实例已被替换", 409);
     }
     return run.handler(event);
   }

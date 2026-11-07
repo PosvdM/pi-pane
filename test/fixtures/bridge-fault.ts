@@ -1,4 +1,5 @@
 import { appendFileSync } from "node:fs";
+import { probeSessionWriterLock, isSameProcess } from "pi-hostkit";
 const globalKey = Symbol.for("pane-test.bridge-fault");
 export default async function(pi) {
   const mode = process.env.PANE_TEST_FAULT;
@@ -19,11 +20,19 @@ export default async function(pi) {
       let body;
       try { body = JSON.parse(options?.body); } catch {}
       if (String(url).endsWith("/bridge/event") && body?.type === "bridgeReady") {
-        log({ readyAttempt: body.instance, reason: body.reason, file: body.sessionFile });
+        const lock = await probeSessionWriterLock(body.sessionFile);
+        log({ readyAttempt: body.instance, reason: body.reason, file: body.sessionFile, held: lock.held, state: lock.record?.state,
+          writerAlive: lock.record?.writer ? await isSameProcess(lock.record.writer) : "missing" });
         if (mode === "no-ready" || mode === "timer-switch" || mode === "reload-no-ready" && body.instance > 1 || mode === "switch-no-ready" && body.instance > 1) return new Response(JSON.stringify({ accepted: true }), { status: 200 });
         if (mode === "reload-disconnect" && body.instance > 1 || mode === "switch-disconnect" && body.instance > 1) throw new Error("测试注入回连中断");
       }
-      return original(url, options);
+      const response = await original(url, options);
+      if (String(url).endsWith("/bridge/event") && body?.type === "shutdown" && body.target) {
+        const lock = await probeSessionWriterLock(body.target);
+        log({ switchWindow: body.reason, file: body.target, held: lock.held, state: lock.record?.state,
+          writerAlive: lock.record?.writer ? await isSameProcess(lock.record.writer) : "missing" });
+      }
+      return response;
     };
   }
   globalThis[globalKey].currentApi = pi;

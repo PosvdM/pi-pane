@@ -24,6 +24,13 @@ for (const mode of ["bad-ticket", "stolen-ticket", "reject-callback", "no-ready"
       const lock = await until(async () => { const p = await probeSessionWriterLock(initial.sessionFile); return p.held && p.record?.writer && p; }); const writer = lock.record.writer;
       if (["no-ready", "timer-switch"].includes(mode)) {
         await until(async () => (await records(f.env.PANE_TEST_FAULT_LOG)).some(r => r.readyAttempt));
+        if (mode === "timer-switch") {
+          const windows = await until(async () => { const rows = (await records(f.env.PANE_TEST_FAULT_LOG)).filter(r => r.switchWindow); return rows.length === 3 && rows; });
+          assert.deepEqual(windows.map(r => r.switchWindow), ["new", "resume", "fork"]);
+          for (const row of windows) { assert.equal(row.held, true, JSON.stringify(row)); assert.equal(row.writerAlive, "alive", JSON.stringify(row)); assert.equal(row.state, "running"); }
+          const starts = (await records(f.env.PANE_TEST_FAULT_LOG)).filter(r => r.readyAttempt);
+          for (const row of starts) { assert.equal(row.held, true, JSON.stringify(row)); assert.equal(row.writerAlive, "alive", JSON.stringify(row)); }
+        }
         const before = await records(f.env.PANE_TEST_FAULT_LOG); assert.equal(before.some(r => r.rpcInput), false);
         assert.equal((await probeSessionWriterLock(initial.sessionFile)).held, true);
       }
