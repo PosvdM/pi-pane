@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { API } from 'typescript/unstable/sync';
@@ -50,7 +50,7 @@ function diagnostics(program) {
 }
 
 test('公共包的全部通用类型和示例插件可在隔离临时项目中编译', async t => {
-  const home = await mkdtemp(path.join(tmpdir(), 'pane-plugin-contract-'));
+  const home = await realpath(await mkdtemp(path.join(tmpdir(), 'pane-plugin-contract-')));
   t.after(() => rm(home, { recursive: true, force: true }));
   const packageDir = path.join(home, 'node_modules/@pi-pane/plugin-api');
   await mkdir(packageDir, { recursive: true });
