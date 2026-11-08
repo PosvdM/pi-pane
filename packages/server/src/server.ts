@@ -70,10 +70,11 @@ export class PaneServer {
   private readonly clients = new Set<Client>(); private port = 0; private lock?: HeldLock; private sweep?: ReturnType<typeof setInterval>; private closePromise?: Promise<void>;
   private constructor(private readonly options: PaneServerOptions, private readonly store: PiStore) {
     this.assets = new AssetStore(options.home);
-    this.trust = new TrustDecisions(store, () => [...this.clients].some((c) => c.state === "authed"), (request) => this.broadcast({ type: "project_trust", request }));
+    this.trust = new TrustDecisions(store, () => [...this.clients].some((c) => c.state === "authed"), (request) => this.broadcast({ type: "project_trust", request }), 55000, (id) => this.broadcast({ type: "project_trust_resolved", id }));
     this.sessions = new Sessions(this.assets, store, this.trust, this.broker, {
       ...options, pi: store.install, instanceId: this.auth.instanceId, bridgeUrl: "", extensionPath: options.extensionPath ?? fileURLToPath(new URL("../../bridge-extension/dist/index.js", import.meta.url)),
-    }, (id, request) => { for (const client of this.clients) if (client.subscriptions.has(id)) this.push(client, { type: "ui_request", ref: { source: "pane", id }, request }); });
+    }, (id, request) => { for (const client of this.clients) if (client.subscriptions.has(id)) this.push(client, { type: "ui_request", ref: { source: "pane", id }, request }); },
+    (sessionId, id, reason) => { for (const client of this.clients) if (client.subscriptions.has(sessionId)) this.push(client, { type: "ui_resolved", ref: { source: "pane", id: sessionId }, id, reason }); });
     this.http = http.createServer((req, res) => { void this.request(req, res).catch((error) => this.error(res, error)); });
     this.http.requestTimeout = 65000; this.http.headersTimeout = 10000; this.http.keepAliveTimeout = 5000;
     this.http.on("upgrade", (req, socket, head) => {
@@ -99,7 +100,7 @@ export class PaneServer {
       server.port = (server.http.address() as { port: number }).port;
       // 驱动延迟到第一次发送才启动，监听端口确定后设置回连地址。
       server.sessions.setBridgeUrl(server.origin);
-      server.sweep = setInterval(() => { server.auth.sweep(); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
+      server.sweep = setInterval(() => { server.auth.sweep(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
       return server;
     } catch (error) { await server.close().catch(() => {}); throw error; }
   }
@@ -132,8 +133,14 @@ export class PaneServer {
       if (req.method === "POST" && pathname === "/api/ws-ticket") { sendJson(res, 200, { ticket: this.auth.issueTicket(credential) }); return; }
       if (req.method === "POST" && pathname === "/api/auth/logout") { this.auth.revoke(credential); sendJson(res, 200, { status: "done" }); return; }
       if (req.method === "POST" && pathname === "/api/auth/code") { sendJson(res, 200, { code: this.auth.issuePairCode() }); return; }
-      if (req.method === "GET" && pathname === "/api/sessions") { sendJson(res, 200, { sessions: await this.sessions.list() }); return; }
+      if (req.method === "GET" && pathname === "/api/sessions") { sendJson(res, 200, await this.sessions.list()); return; }
       if (req.method === "GET" && pathname === "/api/trust") { sendJson(res, 200, { requests: this.trust.list() }); return; }
+      const exported = pathname.match(/^\/api\/exports\/([^/]+)$/);
+      if (req.method === "GET" && exported) {
+        const content = await this.sessions.exports.download(exported[1]);
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Content-Disposition", 'attachment; filename="pi-session.html"'); res.end(content); return;
+      }
       const trust = pathname.match(/^\/api\/trust\/([^/]+)$/);
       if (req.method === "POST" && trust) {
         const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); this.trust.answer(trust[1], body.decision); return { status: "done" }; })); return;
@@ -174,15 +181,21 @@ export class PaneServer {
       throw new PaneError("notFound", "接口不存在", 404);
     }
     if (req.method === "GET" && this.options.webRoot) {
-      const root = await import("node:fs/promises").then((fs) => fs.realpath(this.options.webRoot!));
+      let root: string;
+      try { root = await import("node:fs/promises").then((fs) => fs.realpath(this.options.webRoot!)); }
+      catch (error) { if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw new PaneError("notFound", "Web 界面未构建，请运行 npm run build", 404); throw error; }
       const target = path.resolve(root, "." + decodeURIComponent(pathname === "/" ? "/index.html" : pathname));
       assert(target.startsWith(root + path.sep), "notFound", "文件不存在", 404);
-      const actual = await import("node:fs/promises").then((fs) => fs.realpath(target)); assert(actual.startsWith(root + path.sep), "notFound", "文件不存在", 404);
+      let actual: string;
+      try { actual = await import("node:fs/promises").then((fs) => fs.realpath(target)); }
+      catch (error) { if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw new PaneError("notFound", "文件不存在", 404); throw error; }
+      assert(actual.startsWith(root + path.sep), "notFound", "文件不存在", 404);
       assert((await stat(actual)).isFile(), "notFound", "文件不存在", 404);
-      const types: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
+      const types: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+        ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".webp": "image/webp", ".woff2": "font/woff2", ".json": "application/json; charset=utf-8", ".map": "application/json; charset=utf-8" };
       res.setHeader("Content-Type", types[path.extname(actual)] ?? "application/octet-stream"); res.end(await readFile(actual)); return;
     }
-    throw new PaneError("notFound", "M1 只提供服务端接口，Web 界面在 M2 实现", 404);
+    throw new PaneError("notFound", "Web 界面未构建，请运行 npm run build", 404);
   }
   private connection(ws: WebSocket): void {
     if (this.stopping) { ws.on("error", () => {}); ws.terminate(); return; }
@@ -206,7 +219,7 @@ export class PaneServer {
         if (message.type === "subscribe") {
           assert(message.ref?.source === "pane" && typeof message.ref.id === "string", "invalidRef", "只支持主会话订阅");
           client.subscriptions.get(message.ref.id)?.();
-          const off = this.sessions.subscribe(message.ref.id, message.after as StreamCursor, (event) => this.push(client, { type: "session", ...event }));
+          const off = this.sessions.subscribe(message.ref.id, message.after as StreamCursor, (event) => this.push(client, { type: "session", ...event }), (request) => this.push(client, { type: "ui_request", ref: message.ref, request }));
           client.subscriptions.set(message.ref.id, off);
         } else if (message.type === "unsubscribe") { client.subscriptions.get(message.ref?.id)?.(); client.subscriptions.delete(message.ref?.id); }
         else if (message.type === "ping") this.push(client, { type: "pong" });

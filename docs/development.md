@@ -23,6 +23,7 @@
 | `packages/server/src/auth.ts` | 配对码、内存凭证、一次性 WebSocket ticket 和规范源校验 |
 | `packages/server/src/server.ts` | 规范源 HTTP、WebSocket 首帧鉴权、订阅与背压、multipart 图片上传 |
 | `packages/server/src/sessions.ts` | 会话登记、控制队列、增量取条目、切换路由、只读文件监视和回收 |
+| `packages/server/src/web-api.ts`、`web-adapter.ts`、`exports.ts` | 浏览器协议类型、pi 数据转换与 HTML 导出下载存储 |
 | `packages/server/src/driver.ts` | hostkit 写锁、启动门闩、RPC、就绪超时、进程停止和运行身份记录 |
 | `packages/server/src/writer-recovery.ts`、`stop-report.ts` | 首次拉起与目标切换的共同恢复检查、不完整报告隔离和停止报告判定 |
 | `packages/server/src/hostkit-cleanup.ts` | hostkit 拒绝中的清理事实识别及同步、异步调用观察 |
@@ -46,19 +47,24 @@
 | `POST /api/auth/pair` | `{code}` 换取 `{credential, instanceId}` |
 | `POST /api/auth/code`、`POST /api/auth/logout` | 已登录浏览器生成新码、吊销当前凭证 |
 | `POST /api/ws-ticket` | 获取 30 秒一次性 ticket |
-| `GET /api/sessions` | pi 会话存储列表 |
+| `GET /api/sessions` | `PaneSessionList`，含标题、ISO 时间、父会话文件、`hosted` 和已登记会话的 `status`；不含消息全文 |
 | `POST /api/sessions/open` | `{requestId,cwd,sessionFile?,fork?}`；只读打开，省略文件时预分配路径；并发同路径复用已登记记录，服务关闭时返回 503 serverStopping |
-| `GET /api/sessions/:id/snapshot` | 同步读取快照；附带 cwd、sessionFile、实际项目信任状态和 hold 原因 |
+| `GET /api/sessions/:id/snapshot` | `PaneSessionView`；附带 `cwd`、`sessionFile`、`hosted`、最近的 pane `state`、实际项目信任状态和 hold 原因；打开会话也使用该视图 |
 | `GET /api/sessions/:id/history?before=<id>&limit=50` | 按父链读取更早的聊天分支条目 |
 | `POST /api/sessions/:id/control` | `{requestId,expectedEpoch,expectedRevision,command,draft?}`；普通控制串行、停止优先和幂等 |
-| `POST /api/sessions/:id/query` | `{type}`，只读查询模型、命令、统计等信息 |
-| `POST /api/sessions/:id/ui` | `{requestId,expectedEpoch,id,response}` 回应 pi 对话框 |
+| `POST /api/sessions/:id/query` | `{type:PaneQueryType}`，`type` 为 `state`、`models`、`commands`、`stats` 或 `forkPoints`；响应为 `PaneQueryResults[type]`，不含 RPC 信封；pi 拒绝时返回 409 `rpcRejected` |
+| `POST /api/sessions/:id/ui` | `PaneUiAnswerRequest`：`{requestId,expectedEpoch,id,answer?}`；`answer` 为 `{value}` 或 `{confirmed}`，省略表示取消；种类或选项不匹配时返回 400 `invalidUiAnswer` |
+| `GET /api/exports/:id` | 下载本实例生成且未过期的 HTML；需要凭证；文件位于数据目录的 `tmp/exports/`，24 小时后清理 |
 | `GET /api/trust`、`POST /api/trust/:id` | 待答信任询问、`{requestId,decision?:{trusted,remember}}`；省略决定表示关闭询问 |
 | `POST /api/assets` | multipart 的 image、thumb；X-Request-Id 作为幂等键 |
 | `POST /api/assets/touch` | `{requestId,assetIds}` 延长资源期限 |
 | `GET /api/assets/:hash`、`GET /api/assets/:hash/thumb`、`GET /api/blobs/:hash` | 带凭证按哈希取图 |
 
-控制命令包括 prompt、steer、follow_up、stop、close、restart、set_model、set_thinking_level、compact、new_session、fork、clone、set_session_name。图片使用草稿节点，不接受命令中直接提供 base64 images。restart 只用于中断的会话，不允许借重启绕过最近修改警告或其他宿主写锁。上一个写者状态不明时，浏览器须经用户确认后才能在 restart 命令中附上 assumeNoWriter: true。
+M2 协议变更：/query、/ui、控制结果、会话列表改为 web-api.ts 的 pane 类型。浏览器只依赖 `packages/server/src/web-api.ts`；pi 原始 RPC 形状仅在服务端使用，会话流和 entries 沿用 plugin-api.md。
+
+控制命令包括 prompt、steer、follow_up、stop、close、restart、set_model、set_thinking_level、compact、new_session、fork、clone、set_session_name、export。`export` 使用普通控制队列，校验 `expectedEpoch` 和 `expectedRevision`；服务端向 pi 发送 `export_html`，固定 `outputPath` 为数据目录下 `tmp/exports/<128 位随机 base64url id>.html`。下载标识必须为规范的 22 字符 base64url，且已由本实例生成；响应类型为 `text/html; charset=utf-8`，以 `pi-session.html` 作为附件文件名。
+
+控制受理结果为 `{status:"accepted",snapshot,result?}`。`result` 仅包含 `handled`、`cancelled` 或 `exportId`；输入被扩展消费时 `handled` 为 true，`new_session`、`fork`、`clone` 被取消时 `cancelled` 为 true。`stop`/`close` 的 `done` 结果只含 `clearedText` 和 `clearedDrafts`，停止诊断由服务端内部 `reports` 保存。图片使用草稿节点，不接受命令中直接提供 base64 images。restart 只用于中断的会话，不允许借重启绕过最近修改警告或其他宿主写锁。上一个写者状态不明时，浏览器须经用户确认后才能在 restart 命令中附上 assumeNoWriter: true。
 
 `/bridge/launch` 和 `/bridge/event` 是独立的进程级 Agent 通道，不能使用浏览器凭证；其 token 也不能调用 `/api/*`。
 
@@ -80,7 +86,13 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 
 连接 `/ws` 后，第一帧为 `{type:"auth",ticket,paneProtocol:[1,1]}`。五秒内没有有效首帧即关闭，拒绝后不再处理任何帧。鉴权后第一条消息为 `banners`，M1 的数组为空，并附上协商版本和 connectionId。
 
-订阅：`{type:"subscribe",ref:{source:"pane",id},after:{epoch,seq}}`。取消订阅：`{type:"unsubscribe",ref}`。事件使用 plugin-api.md 的会话流形状。信任询问通过 `{type:"project_trust",request:{id,cwd,expiresAt}}` 推送；没有浏览器时返回 undecided，不把它等同于不信任。
+订阅：`{type:"subscribe",ref:{source:"pane",id},after:{epoch,seq}}`。取消订阅：`{type:"unsubscribe",ref}`。事件使用 plugin-api.md 的会话流形状。
+
+扩展 UI 通过 `{type:"ui_request",ref,request:PaneUiRequest}` 推送，以 `kind` 区分对话框、通知和编辑器状态。`level` 默认 `info`，`widget placement` 默认 `aboveEditor`。服务端在收到带 `timeout` 的 pi 对话框时计算 `expiresAt`，重订阅补推时保留同一期限。回答、取消、到期、写者退出或会话切换时，向该会话的所有订阅者推送 `{type:"ui_resolved",ref,id,reason}`，`reason` 分别为 `answered`、`cancelled`、`expired` 或 `closed`；到期仅清理服务端待答记录，不向 pi 发送回答。过期或已处理的回答返回 `alreadyHandled`。
+
+信任询问通过 `{type:"project_trust",request:{id,cwd,expiresAt}}` 推送，回答或到期后广播 `{type:"project_trust_resolved",id}`；没有浏览器时返回 undecided，不把它等同于不信任。
+
+CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配置文件 `webRoot` 覆盖。目录不存在时服务仍可启动，非 API 路径返回 404“Web 界面未构建，请运行 npm run build”。
 
 每会话保留最近 2000 条事件，并用 32 MiB 字节限额限制缓冲；单条事件仍可保留。发送缓冲达到 1 MiB 时合并连续文本增量；达到 8 MiB 时以 resync 替换待发会话增量。非会话消息仍积压超过 1 MiB 时关闭慢连接。浏览器慢不会阻塞 RPC stdout。
 

@@ -86,7 +86,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 ### 会话列表
 
-会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。
+会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。HTTP 返回 `PaneSessionList`：`path` 映射为 `sessionFile`，`firstMessage` 的前 200 个字符作为 `title`，空会话的 pi 占位标题转换为空字符串；`created`/`modified` 转为 ISO 时间，`parentSessionPath` 映射为 `parentSessionFile`。列表不下发 `allMessagesText` 等消息全文；`hosted` 按匹配 `fileKey` 的写者是否接受输入填写，已登记记录附带 `status`。
 
 - 存储位置按 pi 的规则确定（依据：pi `docs/sessions.md`、`docs/settings.md`）：环境变量 `PI_CODING_AGENT_SESSION_DIR` 优先，其次是 agent 目录（默认 `~/.pi/agent`，可由 `PI_CODING_AGENT_DIR` 覆盖）下 `settings.json` 的 `sessionDir`，都没有时用 `<agent 目录>/sessions/`。
 - 项目的 `.pi/settings.json` 也可以设置 `sessionDir`（pi 在信任判断之前就读取它，依据：pi `docs/configuration.md`）。pi-pane 对已知的项目目录（打开过或新建过会话的 `cwd`）另外读取这个设置，把那里的会话一并列出。
@@ -172,7 +172,7 @@ pi 决定信任的顺序（依据：`dist/core/project-trust.js` 的 `resolvePro
 
 - 拉起一个会话之前，服务端用 pi 导出的 `hasTrustRequiringProjectResources(cwd)` 和 `ProjectTrustStore`（依据：`dist/index.d.ts` 第 28 行）判断该目录是否有需要信任的资源、是否已有保存的决定。注意：没有资源的目录，如果 `trust.json` 里记的是 false，同样当作不信任。有资源且没有保存的决定时，浏览器显示“是否信任项目 <cwd>？”，选项为“信任”“不信任”和“记住此选择”。这一步发生在用户打开或新建会话的那个标签页里，用户一定在场。
 - 决定不用 `--approve`/`--no-approve` 传给 pi：命令行覆盖对该进程内所有目录生效，进程内切换到别的项目时也会沿用。服务端把“目录 → `{ trusted, remember }`”放进 pane-bridge 的启动配置（随回连通道的兑换响应下发），比较路径前先做 `realpath`（例如 macOS 上系统临时目录 `event.cwd` 在 `/private/var` 与 `/var` 的符号链接差异）；pane-bridge 的 `project_trust` 处理器只对匹配的目录返回这个决定，返回值按 pi 的类型 `{ trusted: "yes" | "no" | "undecided", remember?: boolean }`（依据：`dist/core/extensions/types.d.ts` 第 558–562 行）；`remember: true` 时由 pi 写入 `trust.json`。
-- 用户关闭询问框或没有作答时，处理器返回 `"undecided"`。
+- 用户关闭询问框或没有作答时，处理器返回 `"undecided"`。回答或超时后向全部已鉴权浏览器广播 `{type:"project_trust_resolved",id}`，关闭其他标签页的同一询问框。
 - 同一 pi-pane 运行期间对同一目录的回答缓存在服务端内存里（未勾选“记住”时只对本次运行有效），重新拉起时不再询问。
 
 **补充：进程内切换到新目录**
@@ -240,6 +240,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 | `GET /api/trust`、`POST /api/trust/:id` | 返回 503 `serverStopping`，不读取或提交信任决定。 |
 | `GET /api/sessions/:id/snapshot`、`GET /api/sessions/:id/history` | 返回 503 `serverStopping`。 |
 | `POST /api/sessions/:id/control`、`POST /api/sessions/:id/query`、`POST /api/sessions/:id/ui` | 返回 503 `serverStopping`，不提交控制、RPC 查询或 UI 回应。 |
+| `GET /api/exports/:id` | 返回 503 `serverStopping`，不读取导出文件。 |
 | `POST /api/assets`、`POST /api/assets/touch` | 返回 503 `serverStopping`，不上传或刷新附件。 |
 | `GET /api/assets/:hash`、`GET /api/assets/:hash/thumb`、`GET /api/blobs/:hash`、`GET /api/blobs/:hash/thumb` | 返回 503 `serverStopping`，不读取附件或重建缓存。 |
 | `POST /bridge/launch`、`POST /bridge/event` | 返回 503 `serverStopping`，不兑换 bridge ticket 或受理新桥接事件；已登记事件按关闭屏障收尾。 |
@@ -321,6 +322,12 @@ interface DriverHandle {
 
 ### 通道
 
+浏览器接口由 `packages/server/src/web-api.ts` 定义，`web-adapter.ts` 在服务端转换 pi 原始数据。M2 协议变更：/query、/ui、控制结果、会话列表改为 web-api.ts 的 pane 类型。会话流与 entries 保持 plugin-api.md 的 pane 协议。
+
+`POST /api/sessions/:id/query` 接受 `{type}`，`type` 仅为 `state`、`models`、`commands`、`stats`、`forkPoints`，服务端分别调用 `get_state`、`get_available_models`、`get_commands`、`get_session_stats`、`get_fork_messages`，返回对应的 `PaneQueryResults[type]`，pi 拒绝时返回 409 `rpcRejected`。快照和打开响应包含 `hosted`，并在存在最近状态时附带 `PaneSessionState`。
+
+控制受理结果为 `{status:"accepted",snapshot,result?}`，不含 pi `response`；`result` 按命令提供 `handled`、`cancelled` 或 `exportId`。`stop`/`close` 返回 `{status:"done",clearedText,clearedDrafts}`，停止报告仅用于服务端诊断。
+
 - **命令**：HTTP `POST /api/...`，带 `Authorization` 头（见“鉴权”）。每个命令带 `requestId`（同时作为幂等键），会话命令还按“停止与控制队列”的表带 `expectedEpoch` 和 `expectedRevision`。如发送消息、steer、停止、切换模型、回应对话框、调用插件动作、提交表单、上传图片。
 - **幂等**：同一 `requestId` 的命令只执行一次。HTTP 等待默认 30 秒（`rpcTimeoutMs`），等待到期返回 `{ status: "pending" }`，不取消底层控制操作、不完成幂等记录。控制 RPC 保留本地响应等待项，直到实际响应、传输关闭或停止失败后的本地等待终结；服务正常运行时，信任询问、长时间压缩等操作的迟到结果仍写回同一记录。重复提交时服务端返回这次操作的**当前**状态：仍在执行就返回“处理中”，已结束就返回最终结果；最终结果至少保留 24 小时。传输中断且没有确认响应时返回 `rpcResultUnknown`，要求读取会话状态核对；只有 pi 明确拒绝的响应属于 `rpcRejected`。同一 `requestId` 配不同的命令内容时拒绝（HTTP 409 `idempotencyConflict`）。服务端重启后幂等记录丢失，此时 epoch 已经改变，旧命令会被 epoch 检查拒绝。
 - **事件**：一条 WebSocket `/ws`。浏览器订阅关心的会话和插件来源，服务端推送事件。
@@ -331,7 +338,10 @@ type ServerMessage =
   | { type: "session"; ref: SessionRef; cursor: StreamCursor; event: object } // pi 会话事件、pane_* 事件或 resync
   | { type: "tree"; source: string; change: TreeChange }
   | { type: "panel"; update: PanelUpdate }
-  | { type: "ui_request"; ref: SessionRef; request: ExtensionUiRequest }       // pi 原生扩展 UI
+  | { type: "ui_request"; ref: SessionRef; request: PaneUiRequest }
+  | { type: "ui_resolved"; ref: SessionRef; id: string; reason: "answered" | "cancelled" | "expired" | "closed" }
+  | { type: "project_trust"; request: { id: string; cwd: string; expiresAt: string } }
+  | { type: "project_trust_resolved"; id: string }
   | { type: "form"; form: FormSpec }
   | { type: "formRemoved"; formId: string; reason: FormRemovedReason }
   | { type: "presence"; request: { id: string; title: string; summary: string; payload: unknown; source: string } }
@@ -342,6 +352,10 @@ type ServerMessage =
 ```
 
 `BannerState` 是 `PaneBanner` 加上 `source` 和 `sourceUnavailable: boolean`（见 [plugin-api.md](plugin-api.md#横幅)）。`SessionRef`、`StreamCursor`、`TreeChange`、`FormSpec`、`PaneNotification` 等类型由 pane 协议 v1 定义（[plugin-api.md](plugin-api.md)）。主会话的 `SessionRef` 是 `{ source: "pane", id: <piSessionId> }`。
+
+扩展 UI 使用 `PaneUiRequest` 的 `kind`，不向浏览器下发 pi `method`。`notify` 的 `level` 默认 `info`，`widget` 的 `placement` 默认 `aboveEditor`。对话框的 `timeout` 在收到时换算为 `expiresAt`；重新订阅时补推原始期限。`POST /api/sessions/:id/ui` 接受 `{requestId,expectedEpoch,id,answer?}`，`answer` 为 `{value}` 或 `{confirmed}`，省略表示取消；回答类型必须匹配 `kind`，`select` 的 `value` 必须属于 `options`，否则返回 400 `invalidUiAnswer`。回答或取消后向全部会话订阅者推送 `ui_resolved`；到期推 `expired` 并删除待答记录，pi 自行处理默认值，服务端不再回复 pi。写者退出、切换会话或 `reload` 清除对话框时推 `closed`。
+
+导出下载只接受规范的 22 字符 base64url 标识，且必须由本实例生成，只读取数据目录 `tmp/exports/`。响应使用 `Content-Type: text/html; charset=utf-8` 和 `Content-Disposition: attachment; filename="pi-session.html"`。`sweep` 删除超过 24 小时的导出文件。CLI 的 `webRoot` 默认是相对 server dist 的 `../../web/dist`，配置文件可以覆盖；目录不存在时非 API 路径返回 404“Web 界面未构建，请运行 npm run build”，不影响服务启动。
 
 ### 会话模型
 
@@ -393,7 +407,7 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 | `/thinking [level]` | RPC `set_thinking_level`；无参数时打开选择 |
 | `/new` | RPC `new_session`，按“会话切换”处理 |
 | `/name [名称]` | RPC `set_session_name`；无参数时显示当前名称 |
-| `/export` | RPC `export_html`，输出路径在 pi-pane 的临时目录里，完成后提供下载 |
+| `/export` | pane `export` 控制命令进入普通队列，校验 `expectedEpoch`/`expectedRevision`；RPC `export_html` 的 `outputPath` 固定在数据目录 `tmp/exports/<128 位随机 base64url id>.html`，`result.exportId` 用于已鉴权的 `GET /api/exports/:id` 下载 |
 | `/fork` | 用 `get_fork_messages` 列出可选的用户消息，选中后 RPC `fork` |
 | `/clone` | RPC `clone` |
 | `/resume` | 打开 pi-pane 的会话列表 |
