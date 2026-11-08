@@ -30,8 +30,9 @@ export const editorText = new Store<{ sessionId: string; text: string; seq: numb
 let unsubscribe: (() => void) | null = null;
 let reloading: Promise<void> | null = null;
 const retiredEpochs = new Set<string>();
-/** 本标签页发起了会切换会话的操作（首次发送、/new、/fork、/clone）：收到替换事件时自动跟随。 */
-let followSwitch = false;
+/** 本标签页发起了会切换会话的操作（首次发送、/new、/fork、/clone）：截止时间前收到替换事件时自动跟随。 */
+let followUntil = 0;
+const FOLLOW_WINDOW_MS = 15000;
 
 const LAST_SESSION_KEY = "pi-pane.lastSession";
 
@@ -68,7 +69,7 @@ function onEvent(id: string, record: Parameters<typeof apply>[1]): void {
   if (result !== "applied") return;
   const event = record.event as any;
   if (event.type === "pane_session_replaced") {
-    if (followSwitch) { followSwitch = false; void open(event.newRef.id); return; }
+    if (Date.now() < followUntil) { followUntil = 0; void open(event.newRef.id); return; }
   }
   if (event.type === "pane_status" && event.status === "idle") void refreshStats();
   current.touch();
@@ -187,14 +188,14 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[]):
   const id = state.id;
   const body = { requestId: newId(), expectedEpoch: model.view.cursor.epoch, expectedRevision: model.view.controlRevision ?? 0, command, ...(draft ? { draft } : {}) };
   const switching = ["new_session", "fork", "clone"].includes(command.type) || (!model.view.hosted && ["prompt", "steer", "follow_up"].includes(command.type));
-  if (switching) followSwitch = true;
+  if (switching) followUntil = Number.MAX_SAFE_INTEGER;
   try {
     for (;;) {
       const result = await api<PaneControlResult>(`/api/sessions/${encodeURIComponent(id)}/control`, body);
       if (result.status === "pending") { await new Promise((r) => setTimeout(r, 1000)); continue; }
       if (result.status === "accepted") {
         const next = result.snapshot.ref.id;
-        if (next !== id && current.get()?.id === id) { followSwitch = false; await open(next); }
+        if (next !== id && current.get()?.id === id) { followUntil = 0; await open(next); }
         else if (current.get()?.id === id && current.get()?.model) {
           const live = current.get()!.model!;
           // 响应中的快照可能落后于已收到的事件；只取更新的 revision 和托管状态。
@@ -212,7 +213,10 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[]):
     else if (failure.code === "revisionChanged") { await reload(); }
     else if (failure.code === "rpcResultUnknown") { await reload(); }
     return { ok: false, error: failure };
-  } finally { if (switching) followSwitch = false; }
+  } finally {
+    // 进程内切换的重绑定可能晚于控制响应：响应后仍在一段时间内自动跟随替换事件。
+    if (switching && followUntil) followUntil = Date.now() + FOLLOW_WINDOW_MS;
+  }
 }
 
 /** 停止：clear_queue + abort，清出的消息回到输入框。 */

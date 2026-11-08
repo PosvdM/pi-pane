@@ -17,6 +17,15 @@ const PHASE_TEXT: Record<string, string> = {
 function money(value: number): string { return value < 0.01 && value > 0 ? "<$0.01" : `$${value.toFixed(2)}`; }
 function tokens(value: number): string { return value >= 1000 ? `${(value / 1000).toFixed(1)}k` : String(value); }
 
+function firstUserText(entries: { type: string; message?: any }[]): string {
+  for (const entry of entries) {
+    const content = entry.type === "message" && entry.message?.role === "user" ? entry.message.content : undefined;
+    const text = typeof content === "string" ? content : Array.isArray(content) ? content.filter((b: any) => b.type === "text").map((b: any) => b.text).join(" ") : "";
+    if (text.trim()) return text.trim().slice(0, 80);
+  }
+  return "";
+}
+
 function Header() {
   const state = useStore(current)!;
   const view = state.model!.view;
@@ -26,7 +35,7 @@ function Header() {
   return (
     <div class="chat-head">
       <div class="title-block">
-        <div class="title" data-testid="session-title">{view.state?.sessionName || view.sessionFile.split(/[\\/]/).pop()?.replace(/\.jsonl$/, "") || "新会话"}</div>
+        <div class="title" data-testid="session-title">{view.state?.sessionName || firstUserText(state.model!.entries) || "新会话"}</div>
         <div class="subtitle" title={view.sessionFile}>{view.cwd}</div>
       </div>
       <div class="head-meta">
