@@ -4,7 +4,7 @@
 
 需要 Node.js 24 及以上、npm、pi 1.5.0 和原生模块编译工具链。Windows 使用带 C++ 工作负载的 Visual Studio Build Tools；macOS 使用 Xcode Command Line Tools；Linux 使用 Python 3、gcc 和 make。
 
-`npm ci` 安装固定 git 提交的 pi-hostkit，依赖的 prepare 脚本构建 TypeScript 和原生模块。本仓库固定到 `36f97ae683d5b0fb8ee495eecc04df7ab381f66a`，该版本为 Windows MSVC 设置 UTF-8 源码编码。没有 npm 发布包，也不要求本地链接其他仓库。
+`npm ci` 安装固定 git 提交的 pi-hostkit，依赖的 prepare 脚本构建 TypeScript 和原生模块。本仓库固定到 `b6659ea30a63e7b35b8c7f16cdfa22e7dd5442a6`，路径并发创建复核、Linux 进程状态有界重读及 Windows Job 退出可见性由 hostkit 处理。没有 npm 发布包，也不要求本地链接其他仓库。
 
 | 命令 | 用途 |
 | --- | --- |
@@ -137,8 +137,8 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 停止判定同时核对覆盖范围、leftovers、快照完整性和写者身份。snapshot cleanup 中的发信号错误（如进程退出竞态中的 EPERM）只在最终 verify 独立确认通过、leftovers 为空时可接受；pane 自己的停止或报告复查无法确认时保留尚未释放的写锁。hostkit 恢复 failed/throw 时已经自行解锁，旧共享记录仍留存写者，其他宿主必须再次恢复检查。三种恢复拒绝路径都写入 recovery/ 持久标记并阻止自动重试。边界由 stop-report、writer-recovery 和 recovery-failure 测试固定；核查与解除隔离的完整步骤见 [architecture.md 的“会话写锁”](architecture.md#会话写锁)。
 
-固定的 hostkit 版本存在 [#6 路径探测竞态](https://github.com/PosvdM/pi-hostkit/issues/6)：首次落盘可能位于 realpath 的 ENOENT 与 lstat 之间。pane 的 fileKey 只在 ENOTDIR 时立即用 native realpath 复核一次，复核仍失败就拒绝；没有 sleep 或一般错误重试。core 用确定性的文件创建注入覆盖成功复核及持续 ENOTDIR。依赖升级到修复版本后移除该复核。
+`fileKey` 直接使用 hostkit 的真实路径解析和比较键。首次落盘位于 realpath 的 ENOENT 与 lstat 之间时，由 hostkit 有界复核；pane 不捕获 ENOTDIR 或增加路径重试。core 用确定性的文件创建注入覆盖并发创建，并验证真实 ENOTDIR 只查询一次且原样拒绝。
 
-hostkit #5 尚未关闭：Windows Job 已清空后，独立进程表可能短暂仍见到已退出的后代。测试最多等待两秒确认可见性，不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
+Windows Job 模式在停止返回前独立确认已知成员退出；platform 测试在 StopReport 返回后立即核对已知后代身份，不设置额外退出观察窗口，也不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
 
 M1 没有前端，未验证真实输入框、BroadcastChannel、浏览器设备密钥和持久表单；这些属于 M2/M3。HTML 导出的图片排列仍由 pi 决定。插件接口类型完整导出不表示插件宿主已实现。

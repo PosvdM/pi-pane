@@ -18,7 +18,7 @@
     "start": "node packages/server/dist/cli.js"
   },
   "dependencies": {
-    "pi-hostkit": "github:PosvdM/pi-hostkit#36f97ae683d5b0fb8ee495eecc04df7ab381f66a",
+    "pi-hostkit": "github:PosvdM/pi-hostkit#b6659ea30a63e7b35b8c7f16cdfa22e7dd5442a6",
     "ws": "^8.18.3",
     "busboy": "^1.6.0",
     "image-size": "^2.0.2"

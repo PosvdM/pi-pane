@@ -230,7 +230,7 @@ test("ControlQueue 串行执行且失败不阻塞后续", async () => {
   assert.deepEqual(order, ["first:start", "first:end", "second", "third"]);
 });
 
-test("会话首次落盘处于路径探测窗口时复核 realpath，真实非目录仍拒绝", async t => {
+test("会话首次落盘的路径探测竞态由 hostkit 处理，真实非目录直接拒绝", async t => {
   const { home } = await fixture(t); const file = path.join(home, "materializing.jsonl");
   const original = realpathSync.native; let injected = false;
   const mocked = t.mock.method(realpathSync, "native", (target, ...args) => {
@@ -245,7 +245,7 @@ test("会话首次落盘处于路径探测窗口时复核 realpath，真实非�
   assert.equal(injected, true); assert.equal(key, fileKey(file));
   const failure = Object.assign(new Error("not a directory"), { code: "ENOTDIR" }); let attempts = 0;
   const invalid = t.mock.method(realpathSync, "native", () => { attempts++; throw failure; });
-  try { assert.throws(() => fileKey(path.join(file, "child.jsonl")), error => error === failure); assert.equal(attempts, 2); }
+  try { assert.throws(() => fileKey(path.join(file, "child.jsonl")), error => error === failure); assert.equal(attempts, 1); }
   finally { invalid.mock.restore(); }
 });
 
