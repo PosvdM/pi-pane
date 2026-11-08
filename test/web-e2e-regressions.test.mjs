@@ -6,14 +6,14 @@ import { fileURLToPath } from "node:url";
 import { readSession } from "../packages/server/dist/store.js";
 import { openPaired } from "./fixtures/browser.mjs";
 import { providerPath, uiExtensionPath, until } from "./fixtures/helpers.mjs";
-import { setup, byId, newSession, send, idle, sessionView, records, replyScript, secondTab } from "./fixtures/web-e2e.mjs";
+import { setup, byId, newSession, send, idle, sessionView, records, replyScript, secondTab, sessionItem } from "./fixtures/web-e2e.mjs";
 
 const progressTool = fileURLToPath(new URL("./fixtures/progress-tool.ts", import.meta.url));
 const extensionOptions = {
   serverOptions: fixture => ({ extraExtensions: [providerPath, uiExtensionPath], env: { ...fixture.env, PANE_UI_LOG: path.join(fixture.root, "ui.jsonl") } }),
 };
 const networkErrors = [/Failed to load resource: net::ERR_FAILED/, /Failed to load resource: net::ERR_INTERNET_DISCONNECTED/];
-const item = (page, view) => byId(page, "session-item").and(page.getByTitle(view.sessionFile, { exact: true }));
+const item = (page, view) => sessionItem(page, view.sessionFile);
 const latch = () => {
   let release;
   const promise = new Promise(resolve => { release = resolve; });
@@ -73,7 +73,7 @@ test("R1 Chrome 已保存草稿在最后一次编辑后立即切换会话仍完�
     const range = document.createRange(); range.selectNodeContents(editor); range.collapse(false);
     getSelection().removeAllRanges(); getSelection().addRange(range);
     document.execCommand("insertText", false, "末");
-    [...document.querySelectorAll('[data-testid="session-item"]')].find(el => el.title === file).click();
+    [...document.querySelectorAll('[data-testid="session-item"]')].find(el => el.dataset.sessionFile === file).click();
   }, b.sessionFile);
   await opened(page, b);
   assert.deepEqual(await page.evaluate(key => JSON.parse(localStorage.getItem(key)), key), [{ type: "text", text: "已保存草稿末" }]);
@@ -328,7 +328,7 @@ test("R6 Chrome 较早打开响应晚到不能覆盖最后选择的会话", { ti
     gate.release(); await (await delivered).finished(); await renderSettled(page);
     assert.equal(await byId(page, "chat").getAttribute("data-session-id"), b.ref.id);
     assert.equal(await byId(page, "session-title").textContent(), "导航会话乙");
-    assert.equal(await page.locator('[data-testid="session-item"].active').getAttribute("title"), b.sessionFile);
+    assert.equal(await page.locator('[data-testid="session-item"].active').getAttribute("data-session-file"), b.sessionFile);
     assert.equal(await page.evaluate(() => sessionStorage.getItem("pi-pane.lastSession")), b.ref.id);
   } finally { gate.release(); await page.unrouteAll({ behavior: "wait" }); }
 });

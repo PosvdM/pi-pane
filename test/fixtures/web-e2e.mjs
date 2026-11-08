@@ -88,9 +88,15 @@ export async function secondTab(state) {
     await state.page.evaluate(() => JSON.parse(sessionStorage.getItem("pi-pane.auth"))), "新标签页必须经 BroadcastChannel 取得相同凭证");
   assert.equal(new URL(page.url()).hash, "");
   const file = (await sessionView(state)).sessionFile;
-  await byId(page, "session-item").and(page.getByTitle(file, { exact: true })).click();
+  await sessionItem(page, file).click();
   await byId(page, "composer").waitFor();
   await page.waitForFunction(() => !document.querySelector('[data-testid="net-banner"]'));
   assert.equal(await byId(page, "chat").getAttribute("data-session-id"), (await sessionView(state)).ref.id);
   return page;
+}
+
+/** 侧栏中对应会话文件的条目；CSS 属性值中的反斜杠和引号需转义（Windows 路径）。 */
+export function sessionItem(page, file) {
+  const value = file.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return page.locator('[data-testid="session-item"][data-session-file="' + value + '"]');
 }
