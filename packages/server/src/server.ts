@@ -266,9 +266,12 @@ export class PaneServer {
     }
   }
   private mainTreeRows(): MainTreeRow[] {
-    return this.sessions.mainSessionCatalog().map((info) => ({
-      info, ...this.mainTreeMetadata.get(info.ref.id), ...this.sessions.mainSessionDetails(info.ref.id),
-    }));
+    return this.sessions.mainSessionCatalog().map((info) => {
+      const stored = this.mainTreeMetadata.get(info.ref.id); const current = this.sessions.mainSessionDetails(info.ref.id);
+      const lastActivityAt = !current?.lastActivityAt ? stored?.lastActivityAt : !stored?.lastActivityAt ? current.lastActivityAt
+        : Date.parse(stored.lastActivityAt) > Date.parse(current.lastActivityAt) ? stored.lastActivityAt : current.lastActivityAt;
+      return { info, ...stored, ...current, ...(lastActivityAt ? { lastActivityAt } : {}) };
+    });
   }
   private disposeClient(client: Client): void {
     this.plugins.presence.disconnect(client.id);

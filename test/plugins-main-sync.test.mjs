@@ -3,6 +3,18 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { Sessions } from "../packages/server/dist/sessions.js";
 import { MainTree } from "../packages/server/dist/plugins/main-tree.js";
+import { PaneServer } from "../packages/server/dist/server.js";
+
+test("主树合并模型详情与目录时保留较新的活动时间，避免只读记录覆盖新存档活动", () => {
+  const server = Object.create(PaneServer.prototype); const info = { ref: { source: "pane", id: "main" } };
+  const older = "2026-01-01T00:00:00.000Z"; const newer = "2026-02-01T00:00:00.000Z";
+  server.mainTreeMetadata = new Map([["main", { messageCount: 2, lastActivityAt: newer }]]);
+  let current = { messageCount: 3, lastActivityAt: older, holds: [] };
+  server.sessions = { mainSessionCatalog: () => [info], mainSessionDetails: () => current };
+  assert.equal(server.mainTreeRows()[0].lastActivityAt, newer); assert.equal(server.mainTreeRows()[0].messageCount, 3);
+  current = { ...current, lastActivityAt: "2026-03-01T00:00:00.000Z" }; assert.equal(server.mainTreeRows()[0].lastActivityAt, current.lastActivityAt);
+  current = undefined; assert.equal(server.mainTreeRows()[0].lastActivityAt, newer); assert.equal(server.mainTreeRows()[0].messageCount, 2);
+});
 
 // 模型保持idle，排除agent/status事件代为通知的可能，直接验证增量提交切点。
 test("增量条目提交后通知插件与树，标题和最终消息数不依赖后续状态事件", async () => {

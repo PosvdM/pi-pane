@@ -134,7 +134,7 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 | 保活与主动关闭 | `plugins-holds`：仅列托管、读取历史、预登记 hold、多重 hold、空闲回收、关闭二次确认、旧 release 空操作、进程切换不迁移 hold；`plugins-host`：失败和停用释放插件资源。 |
 | 横幅故障 | `plugins-banners`：原子写、重启、加载失败/停用保留 persistent 并标注不可用、来源恢复后 listBanners 与显式清除、配置移除二次确认/审计、I/O 失败保留旧状态；`plugins-http`：新连接重发、停用和重启、禁止删除仍配置来源。 |
 | 通知、鉴权与关闭门禁 | `plugins-host`：通知按来源去重；`plugins-http`：所有读写使用浏览器凭证；`shutdown-ingress`：插件全路由统一拒绝关闭后的请求，multipart 解析前不插入无关异步路由；`backpressure`：同名不同来源的增量与 resync 隔离。 |
-| 主会话增量目录 | `plugins-main-sync`：模型保持idle，增量条目提交后插件收到onChange，树取得新标题/消息数；无新条目不伪造树变更。 |
+| 主会话增量目录 | `plugins-main-sync`：模型保持idle，增量条目提交后插件收到onChange，树取得新标题/消息数；无新条目不伪造树变更，目录和记录合并时保留较新活动时间。 |
 | 主会话名称 | `plugins-main-title`：真实 pi 改名、扩展清空名称、重启后的只读打开及只读文件更新，同步反映在 mainSessions、树订阅和新快照，状态缓存不覆盖较新名称；所有名称入口统一处理空白和清空值，目录与打开前后覆盖长Unicode、无文本、真实占位字面量及文本块矩阵。 |
 | 公共 API 契约 | `plugin-api-contract`：导出类型与真实示例实现的 TypeScript 编译、原生 RPC 不外泄、当前与上一版本范围协商、畸形范围拒绝，以及测试插件完整能力与故障。 |
 
