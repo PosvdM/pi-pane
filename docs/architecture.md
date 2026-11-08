@@ -1,6 +1,6 @@
 # 总体架构
 
-> 状态：M1 服务端核心已实现。Web 界面与设备签名在 M2、插件宿主在 M3 实现。本文描述完整架构；M1 的可用接口与验收映射见 [development.md](development.md)。
+> 状态：M1 核心与 M3 插件服务端已实现。Web 界面、设备签名与插件界面另行验收，agora 联调不属于插件宿主单独验收。本文描述完整架构；可用接口与自动化验收映射见 [development.md](development.md)。
 
 pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起一个 `pi --mode rpc` 子进程，把聊天流转发给浏览器；子代理、会议等功能由插件通过通用接口显示，pi-pane 本身不实现这些业务。
 
@@ -333,8 +333,9 @@ type ServerMessage =
   | { type: "panel"; update: PanelUpdate }
   | { type: "ui_request"; ref: SessionRef; request: ExtensionUiRequest }       // pi 原生扩展 UI
   | { type: "form"; form: FormSpec }
-  | { type: "formRemoved"; formId: string; reason: FormRemovedReason }
+  | { type: "formRemoved"; source: string; formId: string; reason: FormRemovedReason }
   | { type: "presence"; request: { id: string; title: string; summary: string; payload: unknown; source: string } }
+  | { type: "presenceClosed"; id: string; reason: "confirmed" | "cancelled" | "timeout" }
   | { type: "notification"; notification: PaneNotification }
   | { type: "banners"; banners: BannerState[] }   // 当前全部横幅，整体替换
   | { type: "banner"; banner: BannerState }       // 新增或替换一条（含来源插件状态变化）
@@ -439,7 +440,11 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 - 握手时校验 `Host` 和 `Origin`，但不在 URL 或握手头里带凭证。
 - 浏览器先用 `Authorization` 头调用 `POST /api/ws-ticket` 取一张一次性 ticket（30 秒有效），连接后发送的第一帧必须是 `{ "type": "auth", "ticket": "…" }`。5 秒内没有收到有效的首帧时服务端关闭连接。
 - 首帧之前服务端不推送任何数据，也不处理其他帧。
-- 鉴权通过后，服务端先发一条 `banners`（当前全部插件横幅），再处理订阅。每次重连都一样，所以横幅不依赖事件缓冲。
+- 鉴权通过后，服务端先发一条 `banners`（当前全部插件横幅，并带 `paneProtocol`、`connectionId`），再逐条发送当前持久表单的 `form`，随后处理订阅。每次重连都一样，所以横幅与待处理表单不依赖事件缓冲。
+- 会话订阅帧为 `{ type: "subscribe", ref, after: StreamCursor }`，取消帧为 `{ type: "unsubscribe", ref }`；`ref.source` 可以是 `pane` 或已启用的插件。每个连接以完整的 `(source, id)` 隔离订阅和慢客户端重同步，插件同名会话不会覆盖主会话。
+- 插件树订阅帧为 `{ type: "treeSubscribe", source, after: TreeCursor }`，取消帧为 `{ type: "treeUnsubscribe", source }`。插件负责快照切点和重放边界，服务端转发 `tree` 变更；浏览器按 [树同步规则](plugin-api.md#同步) 合并分页、修订号和 tombstone。
+- 设备注册帧为 `{ type: "device", device: PresenceDevice }`，确认回应帧为 `{ type: "presenceResponse", id, response: { proof?: UserPresenceProof, error?: "rejected" | "unsupported" } }`。设备字段只用于显示和路由，不能替代插件后台的验签。
+- M3 的 v1 兼容扩展包括 `formRemoved.source` 和 `presenceClosed`。浏览器按 `(source, formId)` 识别持久表单；收到 `presenceClosed` 后关闭同一 `id` 的确认框。`confirmed` 表示已有标签页确认，`cancelled` 表示拒绝、取消或来源停用，`timeout` 表示到期。
 
 ### 其他规则
 
@@ -489,6 +494,39 @@ Agent（主代理和子代理）与用户是同一个操作系统用户，在同
 - 插件只能提供声明式 UI（树节点、面板内容、动作、表单、通知），不能向浏览器注入脚本。
 - 对插件的调用使用合作式异步超时（默认 10 秒），超时或异常不影响主会话，对应位置显示错误；插件里的同步死循环会卡住整个服务端。是否用 worker 隔离插件待定。
 
+实现集中在 `packages/server/src/plugins/`：`runtime.ts` 负责加载、版本协商和生命周期 fencing，`host.ts` 提供上下文与订阅路由，`operations.ts` 维护事务幂等和持久表单对齐，`presence.ts` 路由用户在场确认，`banners.ts` 保存横幅与审计。停用或激活失败先使上下文失效，再取消订阅、确认请求和 hold；迟到的异步回调不能重新写入宿主状态。
+
+### 插件 HTTP 接口
+
+以下接口均受浏览器鉴权和服务关闭门禁保护。`source`、会话、动作、面板和表单 id 作为独立路径段时需要 URL 编码。插件调用不会通过 pane-bridge 的 `/bridge/*` 接口受理。
+
+| 方法与路径 | 请求与结果 |
+| --- | --- |
+| `GET /api/plugins` | 返回 `{ plugins }`，包含配置定位符、已识别的来源、协商版本及 `active`、`failed` 或 `disabled` 状态。 |
+| `GET /api/plugins/:source/catalog` | 返回 `{ actions, panels, renderers }` 静态目录。 |
+| `POST /api/plugins/:source/disable` | 请求带 `connectionId`；停用当前实例中的插件，配置项保持不变。 |
+| `POST /api/tree/snapshot`、`GET /api/tree/children` | 主会话来源 `pane` 的按需树；参数和返回类型与下述插件树接口一致，`source = "pane"` 的 WebSocket 树订阅使用同一套游标规则。 |
+| `POST /api/plugins/:source/tree/snapshot` | `{ openNodeIds?, recentSince? }`；默认无打开节点、最近七天，返回 `TreeSnapshot`。 |
+| `GET /api/plugins/:source/tree/children` | 查询参数 `parentId`、`epoch`、可选 `cursor`、`limit`（默认 50，最多 200）；返回 `TreeChildrenPage`。 |
+| `GET /api/plugins/:source/sessions/:id/snapshot` | 返回 `SessionSnapshot`，图片在服务端转换为按哈希引用。 |
+| `GET /api/plugins/:source/sessions/:id/history` | 查询参数 `before`、`limit`（默认 50，最多 200）；返回 `HistoryPage`。 |
+| `POST /api/plugins/:source/sessions/:id/send` | `{ connectionId, idempotencyKey, input, expectedRevision? }`；返回 `SendResult`。 |
+| `POST /api/plugins/:source/sessions/:id/abort` | `{ connectionId, clearQueue: true, expectedRevision? }`；返回 `AbortResult`。 |
+| `GET /api/plugins/:source/panels/:id` | 可选查询参数 `nodeId`；返回声明式 `PanelContent`，不加载插件前端代码。 |
+| `POST /api/plugins/:source/actions/:id/form` | `{ target? }`；返回 `{ form: FormSpec \| null }`，不进入待处理区。 |
+| `POST /api/plugins/:source/actions/:id/invoke` | `{ connectionId, idempotencyKey, target?, input?, formId?, formRevision? }`；返回 `ActionResult`。 |
+| `GET /api/forms`、`GET /api/plugins/:source/forms` | 返回全部或某个插件的 `{ forms }`，以 `(source, id)` 隔离，组内按 `(createdAt, id)` 排序。 |
+| `POST /api/plugins/:source/forms/:id` | `{ connectionId, idempotencyKey, revision, outcome }`；返回 `FormSubmitResult`。来源由路径确定，不能在请求体中覆盖。 |
+| `POST /api/presence/:id` | `{ connectionId, response }`；与 WebSocket 的 `presenceResponse` 语义相同。 |
+| `GET /api/banners/removable` | 返回来源已经移出配置的 persistent `{ banners }`。停用或加载失败的插件不在此列。 |
+| `POST /api/banners/remove` | `{ connectionId, source, id, confirmed: true }`；设置页完成二次确认后移除，内容、时间与标签页写入 `plugin-audit.jsonl`。 |
+
+涉及浏览器来源的请求必须提供首个 `banners` 帧里的 `connectionId`。服务端核对它属于当前 HTTP 凭证且仍在线，再填写 `RequestOrigin`；请求体中的 `origin`、`deviceId` 和时间不能覆盖这些字段。用户在场确认只接受收到该挑战的连接回应，签名内容和设备信任仍由插件后台验证。
+
+动作、表单和发送使用插件来源内共享的幂等键命名空间。重复且仍在执行时返回 `pending`；等待到期不取消底层调用，迟到的最终结果写回同一记录。插件已经返回 `pending` 时，同键查询可再次调用插件查询后台状态。最终结果至少保留 24 小时；同键不同内容返回 `idempotencyConflict`。重启后的最终幂等保证由插件及其后台提供，宿主不把内存记录当作持久事务日志。
+
+主会话树由 `main-tree.ts` 从会话目录与当前托管状态构建：项目分组保留在快照中，冷历史按 keyset 游标分页；来源级变更缓冲保留最近 2000 条，游标跨 epoch、超前或缓冲缺口均返回 `reset`。主会话保活可以在尚未打开或托管时登记，不会因此启动进程；hold 始终绑定原 `SessionRef`，进程切换后不会迁到新会话。
+
 详见 [plugin-api.md](plugin-api.md#运行方式与超时)。
 
 ## pane-bridge
@@ -535,6 +573,8 @@ pane-bridge 是 pi-pane 用 `-e` 加载进每个主会话的 pi 扩展，负责�
   recovery/          # 不完整遗留写者恢复的诊断；保留并阻止自动拉起
   state.json         # 界面状态：打开的会话、侧栏展开状态、已知项目目录
   banners.json       # persistent 横幅（见 plugin-api.md 的“横幅”），写临时文件后原子替换
+  runtime-sources.json # 插件配置定位符与来源 id 的持久映射，用于判断遗留横幅能否手动移除
+  plugin-audit.jsonl # 已登录浏览器移除遗留横幅的审计记录
 ```
 
 pi-pane 自己不在磁盘上保存访问凭证和对话内容，对话只在 pi 的会话文件里。

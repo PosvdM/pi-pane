@@ -17,9 +17,13 @@ import { PiStore } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
 import { CLOSE_IO_TIMEOUT_MS } from "./inflight.js";
+import { PluginHost } from "./plugins/host.js";
+import { NOT_PLUGIN_ROUTE, pluginHttp } from "./plugins/http.js";
+import { MainTree, type MainTreeRow } from "./plugins/main-tree.js";
 
 export interface PaneServerOptions extends Partial<Omit<SessionManagerOptions, "pi" | "bridgeUrl" | "instanceId" | "extensionPath">> {
   home: string; piPath?: string; port?: number; agentDir?: string; extensionPath?: string; webRoot?: string;
+  plugins?: string[]; pluginTimeoutMs?: number;
 }
 interface Client {
   ws: WebSocket; id: string; credential?: string; state: "pending" | "authed" | "closed";
@@ -32,6 +36,7 @@ async function jsonBody(req: IncomingMessage, limit = 2 * 1024 * 1024): Promise<
   try { const value = JSON.parse(Buffer.concat(chunks).toString("utf8")); assert(value && typeof value === "object" && !Array.isArray(value), "invalidBody", "请求体必须是 JSON 对象"); return value; }
   catch (error) { if (error instanceof PaneError) throw error; throw new PaneError("invalidJson", "请求体不是合法 JSON"); }
 }
+function subscriptionKey(kind: string, source: string, id = ""): string { return JSON.stringify([kind, source, id]); }
 function sendJson(res: ServerResponse, status: number, value: unknown): void { res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify(value)); }
 function bearer(req: IncomingMessage): string { return req.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]+)$/)?.[1] ?? ""; }
 function rejectUpgrade(socket: Duplex, status: 403 | 503): void {
@@ -64,7 +69,8 @@ async function upload(req: IncomingMessage): Promise<{ image: Buffer; mimeType: 
 }
 export class PaneServer {
   readonly auth = new AuthStore(); readonly broker = new BridgeBroker(); readonly assets: AssetStore;
-  readonly sessions: Sessions; readonly trust: TrustDecisions; readonly http: http.Server;
+  readonly sessions: Sessions; readonly trust: TrustDecisions; readonly http: http.Server; readonly plugins: PluginHost; readonly mainTree: MainTree;
+  private mainTreeMetadata = new Map<string, { lastActivityAt?: string; messageCount?: number }>();
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024, perMessageDeflate: false });
   private readonly upgrades = new Set<Duplex>(); private stopping = false;
   private readonly clients = new Set<Client>(); private port = 0; private lock?: HeldLock; private sweep?: ReturnType<typeof setInterval>; private closePromise?: Promise<void>;
@@ -73,7 +79,19 @@ export class PaneServer {
     this.trust = new TrustDecisions(store, () => [...this.clients].some((c) => c.state === "authed"), (request) => this.broadcast({ type: "project_trust", request }));
     this.sessions = new Sessions(this.assets, store, this.trust, this.broker, {
       ...options, pi: store.install, instanceId: this.auth.instanceId, bridgeUrl: "", extensionPath: options.extensionPath ?? fileURLToPath(new URL("../../bridge-extension/dist/index.js", import.meta.url)),
-    }, (id, request) => { for (const client of this.clients) if (client.subscriptions.has(id)) this.push(client, { type: "ui_request", ref: { source: "pane", id }, request }); });
+    }, (id, request) => { for (const client of this.clients) if (client.subscriptions.has(subscriptionKey("session", "pane", id))) this.push(client, { type: "ui_request", ref: { source: "pane", id }, request }); });
+    this.mainTree = new MainTree({
+      load: async () => {
+        const rows = await this.sessions.list();
+        this.mainTreeMetadata = new Map(rows.map((row) => [row.id, {
+          lastActivityAt: row.modified instanceof Date ? row.modified.toISOString() : typeof row.modified === "string" ? row.modified : undefined,
+          messageCount: Number.isSafeInteger(row.messageCount) ? row.messageCount : undefined,
+        }]));
+        return this.mainTreeRows();
+      }, current: () => this.mainTreeRows(), watch: (listener) => this.sessions.mainSessions("pane").onChange(listener),
+    });
+    this.plugins = new PluginHost({ home: options.home, plugins: options.plugins ?? [], assets: this.assets,
+      mainSessions: (source) => this.sessions.mainSessions(source), emit: (message) => this.broadcast(message), timeoutMs: options.pluginTimeoutMs });
     this.http = http.createServer((req, res) => { void this.request(req, res).catch((error) => this.error(res, error)); });
     this.http.requestTimeout = 65000; this.http.headersTimeout = 10000; this.http.keepAliveTimeout = 5000;
     this.http.on("upgrade", (req, socket, head) => {
@@ -95,6 +113,8 @@ export class PaneServer {
     try {
       const lock = await server.sessions.inflight.run("server.acquireInstanceLock", () => observeHostkit(() => acquireInstanceLock("pi-pane", options.home), (error) => server.sessions.recordCleanupFailure(error))); assert(lock, "instanceBusy", "同一数据目录已有 pi-pane 服务端", 409); server.lock = lock;
       await server.sessions.recover();
+      if (options.plugins?.length) await server.sessions.list();
+      await server.plugins.start();
       await new Promise<void>((resolve, reject) => { server.http.once("error", reject); server.http.listen(options.port ?? 4319, "127.0.0.1", () => { server.http.off("error", reject); resolve(); }); });
       server.port = (server.http.address() as { port: number }).port;
       // 驱动延迟到第一次发送才启动，监听端口确定后设置回连地址。
@@ -132,6 +152,13 @@ export class PaneServer {
       if (req.method === "POST" && pathname === "/api/ws-ticket") { sendJson(res, 200, { ticket: this.auth.issueTicket(credential) }); return; }
       if (req.method === "POST" && pathname === "/api/auth/logout") { this.auth.revoke(credential); sendJson(res, 200, { status: "done" }); return; }
       if (req.method === "POST" && pathname === "/api/auth/code") { sendJson(res, 200, { code: this.auth.issuePairCode() }); return; }
+      if (req.method === "POST" && pathname === "/api/tree/snapshot") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.mainTree.snapshot({ openNodeIds: body.openNodeIds ?? [], recentSince: body.recentSince ?? new Date(Date.now() - 7 * 86400000).toISOString() })); return; }
+      if (req.method === "GET" && pathname === "/api/tree/children") { sendJson(res, 200, await this.mainTree.children(url.searchParams.get("parentId") ?? "", { epoch: url.searchParams.get("epoch") ?? "", cursor: url.searchParams.get("cursor") ?? undefined, limit: Number(url.searchParams.get("limit") ?? 50) })); return; }
+      if (pathname === "/api/plugins" || pathname.startsWith("/api/plugins/") || pathname === "/api/forms" || pathname.startsWith("/api/presence/") || pathname.startsWith("/api/banners/")) {
+        const pluginResult = await pluginHttp({ host: this.plugins, request: req, url, credential, body: () => jsonBody(req), assertAccepting: () => this.assertAccepting() });
+        if (pluginResult !== NOT_PLUGIN_ROUTE) { sendJson(res, 200, pluginResult); return; }
+        this.assertAccepting();
+      }
       if (req.method === "GET" && pathname === "/api/sessions") { sendJson(res, 200, { sessions: await this.sessions.list() }); return; }
       if (req.method === "GET" && pathname === "/api/trust") { sendJson(res, 200, { requests: this.trust.list() }); return; }
       const trust = pathname.match(/^\/api\/trust\/([^/]+)$/);
@@ -190,7 +217,7 @@ export class PaneServer {
     const timeout = setTimeout(() => this.closeClient(client, 4401, "首帧鉴权超时"), 5000); timeout.unref();
     const flush = setInterval(() => this.flush(client), 25); flush.unref();
     ws.on("error", () => this.closeClient(client, 1011, "连接故障"));
-    ws.on("close", () => { clearTimeout(timeout); clearInterval(flush); client.state = "closed"; for (const off of client.subscriptions.values()) off(); client.subscriptions.clear(); this.clients.delete(client); });
+    ws.on("close", () => { clearTimeout(timeout); clearInterval(flush); this.disposeClient(client); client.state = "closed"; this.clients.delete(client); });
     ws.on("message", (raw, binary) => {
       if (this.stopping) { this.closeClient(client, 1001, "服务端停止"); ws.terminate(); return; }
       if (client.state === "closed") return;
@@ -200,35 +227,61 @@ export class PaneServer {
           assert(message.type === "auth" && typeof message.ticket === "string", "invalidFirstFrame", "第一帧必须是 ticket 鉴权");
           const credential = this.auth.redeemTicket(message.ticket); const paneProtocol = negotiateProtocol(message.paneProtocol === undefined ? [1, 1] : message.paneProtocol);
           client.credential = credential; client.state = "authed"; clearTimeout(timeout);
-          this.push(client, { type: "banners", banners: [], paneProtocol, connectionId: client.id }); return;
+          this.push(client, { type: "banners", banners: this.plugins.banners.list(), paneProtocol, connectionId: client.id });
+          this.plugins.presence.connect(client.id, credential, (message) => this.push(client, message));
+          for (const form of this.plugins.operations.pending()) this.push(client, { type: "form", form });
+          return;
         }
         assert(this.auth.useCredential(client.credential!), "unauthorized", "凭证已失效");
         if (message.type === "subscribe") {
-          assert(message.ref?.source === "pane" && typeof message.ref.id === "string", "invalidRef", "只支持主会话订阅");
-          client.subscriptions.get(message.ref.id)?.();
-          const off = this.sessions.subscribe(message.ref.id, message.after as StreamCursor, (event) => this.push(client, { type: "session", ...event }));
-          client.subscriptions.set(message.ref.id, off);
-        } else if (message.type === "unsubscribe") { client.subscriptions.get(message.ref?.id)?.(); client.subscriptions.delete(message.ref?.id); }
+          assert(typeof message.ref?.source === "string" && typeof message.ref.id === "string", "invalidRef", "会话来源无效");
+          const key = subscriptionKey("session", message.ref.source, message.ref.id);
+          client.subscriptions.get(key)?.();
+          const emit = (event: any) => this.push(client, { type: "session", ...event });
+          const off = message.ref.source === "pane" ? this.sessions.subscribe(message.ref.id, message.after as StreamCursor, emit) : this.plugins.subscribe(message.ref, message.after, emit);
+          client.subscriptions.set(key, off);
+        } else if (message.type === "unsubscribe") { const key = subscriptionKey("session", message.ref?.source, message.ref?.id); client.subscriptions.get(key)?.(); client.subscriptions.delete(key); }
+        else if (message.type === "treeSubscribe") {
+          assert(typeof message.source === "string", "invalidRef", "树来源无效");
+          const key = subscriptionKey("tree", message.source); client.subscriptions.get(key)?.();
+          const emit = (change: any) => this.push(client, { type: "tree", source: message.source, change });
+          const off = message.source === "pane" ? this.mainTree.subscribe(message.after, emit) : this.plugins.treeSubscribe(message.source, message.after, emit);
+          client.subscriptions.set(key, off);
+        } else if (message.type === "treeUnsubscribe") { const key = subscriptionKey("tree", message.source); client.subscriptions.get(key)?.(); client.subscriptions.delete(key); }
+        else if (message.type === "device") this.plugins.presence.device(client.id, message.device);
+        else if (message.type === "presenceResponse") this.plugins.presence.respond(client.id, message.id, message.response);
         else if (message.type === "ping") this.push(client, { type: "pong" });
         else throw new PaneError("invalidFrame", "不支持此 WebSocket 消息");
       } catch { this.closeClient(client, 4401, "鉴权或消息格式无效"); }
     });
   }
-  private closeClient(client: Client, code: number, reason: string): void { if (client.state === "closed") return; client.state = "closed"; client.pending = []; client.needsResync.clear(); client.ws.close(code, reason); }
+  private mainTreeRows(): MainTreeRow[] {
+    return this.sessions.mainSessionCatalog().map((info) => {
+      let holds: { source: string; reason: string }[] | undefined;
+      try { holds = this.sessions.snapshot(info.ref.id).holds; } catch { /* 未打开的存档只有目录元数据。 */ }
+      return { info, ...this.mainTreeMetadata.get(info.ref.id), ...(holds ? { holds } : {}) };
+    });
+  }
+  private disposeClient(client: Client): void {
+    this.plugins.presence.disconnect(client.id);
+    for (const off of client.subscriptions.values()) { try { off(); } catch (error) { console.error("浏览器订阅清理失败：", error); } }
+    client.subscriptions.clear();
+  }
+  private closeClient(client: Client, code: number, reason: string): void { if (client.state === "closed") return; client.state = "closed"; this.disposeClient(client); client.pending = []; client.needsResync.clear(); client.ws.close(code, reason); }
   private broadcast(message: unknown): void { for (const client of this.clients) this.push(client, message); }
   private push(client: Client, message: any): void {
     if (client.state !== "authed" || client.ws.readyState !== WebSocket.OPEN) return;
     const text = JSON.stringify(message);
     if (!client.pending.length && client.ws.bufferedAmount < 1024 * 1024) { client.ws.send(text); return; }
-    if (message.type === "session" && client.needsResync.size) { client.needsResync.set(message.ref.id, { ...message, event: { type: "resync" } }); return; }
+    if (message.type === "session" && client.needsResync.size) { client.needsResync.set(subscriptionKey("session", message.ref.source, message.ref.id), { ...message, event: { type: "resync" } }); return; }
     const last = client.pending.at(-1); const delta = message.event?.assistantMessageEvent; const prev = last?.event?.assistantMessageEvent;
-    if (message.type === "session" && last?.ref?.id === message.ref.id && message.cursor?.epoch === last.cursor?.epoch && delta?.type === "text_delta" && prev?.type === "text_delta" && delta.contentIndex === prev.contentIndex) {
+    if (message.type === "session" && last?.ref?.source === message.ref.source && last?.ref?.id === message.ref.id && message.cursor?.epoch === last.cursor?.epoch && delta?.type === "text_delta" && prev?.type === "text_delta" && delta.contentIndex === prev.contentIndex) {
       client.pendingBytes -= Buffer.byteLength(JSON.stringify(last));
       const merged = { ...message, event: { ...message.event, assistantMessageEvent: { ...delta, delta: prev.delta + delta.delta } } };
       client.pending[client.pending.length - 1] = merged; client.pendingBytes += Buffer.byteLength(JSON.stringify(merged));
     } else { client.pending.push(message); client.pendingBytes += Buffer.byteLength(text); }
     if (client.pendingBytes + client.ws.bufferedAmount > 8 * 1024 * 1024) {
-      for (const item of client.pending) if (item.type === "session") client.needsResync.set(item.ref.id, { ...item, event: { type: "resync" } });
+      for (const item of client.pending) if (item.type === "session") client.needsResync.set(subscriptionKey("session", item.ref.source, item.ref.id), { ...item, event: { type: "resync" } });
       client.pending = client.pending.filter((item) => item.type !== "session"); client.pendingBytes = client.pending.reduce((n, item) => n + Buffer.byteLength(JSON.stringify(item)), 0);
       if (client.pendingBytes > 1024 * 1024) this.closeClient(client, 1013, "客户端处理过慢，请重新连接");
     }
@@ -249,10 +302,10 @@ export class PaneServer {
     for (const ws of this.wss.clients) ws.terminate();
   }
   private async performClose(): Promise<void> {
-    clearInterval(this.sweep);
+    clearInterval(this.sweep); this.mainTree.close();
     this.terminateConnections();
     const errors: unknown[] = []; const inflight = this.sessions.inflight;
-    try { await this.sessions.close(); } catch (error) { errors.push(error); }
+    await Promise.allSettled([this.plugins.close(), this.sessions.close()].map((operation) => operation.catch((error) => { errors.push(error); })));
     // 网络收尾前再次终结连接，覆盖关闭等待期间的迟到交付。
     this.terminateConnections();
     // 同时关闭监听与 WebSocket；任一回调缺失都不能阻止另一项开始收尾。

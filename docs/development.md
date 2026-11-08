@@ -1,4 +1,4 @@
-# 开发与 M1 验收
+# 开发与服务端验收
 
 ## 环境与构建
 
@@ -11,7 +11,7 @@
 | `npm run build` | 按 TypeScript project references 构建三个包 |
 | `npm test` | 先构建，再用 node --test 顺序运行测试文件 |
 | `node --test test/<文件>.test.mjs` | 运行单个测试文件；修改源码后先构建 |
-| `npm start` | 启动只有 API 的 M1 服务端 |
+| `npm start` | 启动主会话和插件 API 服务端 |
 
 `PI_PACKAGE` 可在测试时指定 pi 包目录。未设置时用 hostkit 的定位规则，先查官方安装目录，再查全局 npm。测试使用真实 pi 1.5.0 和本地假 provider，不访问模型服务。测试的 HOME、USERPROFILE、agent 目录、锁目录和会话文件位于临时现场；Chrome 使用独立的临时配置目录。设置 `KEEP_FIXTURES=1` 可保留现场。
 
@@ -33,9 +33,10 @@
 | `packages/server/src/assets.ts` | 上传资源、草稿编码、历史图片引用、缓存与清理 |
 | `packages/server/src/bridge.ts` | 独立的 Agent 级回连凭证和实例 fencing |
 | `packages/server/src/trust.ts` | 启动前及进程内切换时的信任预判与询问 |
+| `packages/server/src/plugins/` | 插件加载与隔离、按需主会话树、上下文资源、事务幂等、持久表单、用户在场确认和横幅 |
 | `packages/bridge-extension/src/` | 会话替换和写锁回报、信任决定、就绪握手、图片顺序还原 |
 
-不建立 `packages/web`。多题表单通道保留事件名称和 BridgeFormOutcome 类型，未启用时返回协议已有的 aborted；完整适配在 M2 联调。设备签名和插件运行时不在 M1。
+本分支不建立 `packages/web`。多题表单通道保留事件名称和 BridgeFormOutcome 类型，未启用时返回协议已有的 aborted；完整适配在 M2 联调。插件宿主通过通用 HTTP 和 WebSocket 提供能力，设备密钥与签名界面另行交付。
 
 ## M1 HTTP 接口
 
@@ -78,9 +79,11 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 
 ## WebSocket
 
-连接 `/ws` 后，第一帧为 `{type:"auth",ticket,paneProtocol:[1,1]}`。五秒内没有有效首帧即关闭，拒绝后不再处理任何帧。鉴权后第一条消息为 `banners`，M1 的数组为空，并附上协商版本和 connectionId。
+连接 `/ws` 后，第一帧为 `{type:"auth",ticket,paneProtocol:[1,1]}`。五秒内没有有效首帧即关闭，拒绝后不再处理任何帧。鉴权后第一条消息为 `banners`，包含当前横幅、协商版本和 connectionId，随后逐条重发当前持久表单。
 
 订阅：`{type:"subscribe",ref:{source:"pane",id},after:{epoch,seq}}`。取消订阅：`{type:"unsubscribe",ref}`。事件使用 plugin-api.md 的会话流形状。信任询问通过 `{type:"project_trust",request:{id,cwd,expiresAt}}` 推送；没有浏览器时返回 undecided，不把它等同于不信任。
+
+插件的 HTTP 路由、非 `pane` 会话订阅、树订阅、设备注册与用户在场回应统一定义在 [architecture.md](architecture.md#插件-http-接口)。M3 的 v1 兼容扩展包括 `formRemoved.source` 与 `presenceClosed.reason`；持久表单按完整 `(source, formId)` 隔离，签名由插件后台验证。
 
 每会话保留最近 2000 条事件，并用 32 MiB 字节限额限制缓冲；单条事件仍可保留。发送缓冲达到 1 MiB 时合并连续文本增量；达到 8 MiB 时以 resync 替换待发会话增量。非会话消息仍积压超过 1 MiB 时关闭慢连接。浏览器慢不会阻塞 RPC stdout。
 
@@ -114,6 +117,24 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 
 测试文件路径均为 `test/<名称>.test.mjs`。三平台都运行服务端测试，不用模拟进程替代真实 pi。Chrome 路径由本机安装或 CHROME_PATH/CHROME_BIN 定位；本机不存在时明确跳过。CI 的 Linux auto 任务设置 PANE_TEST_REQUIRE_CHROME=1，找不到 Chrome 必须失败。
 
+## M3 服务端自动化验收
+
+验收仅使用 `test/fixtures/pane-plugin/` 的测试插件，不依赖 agora，也不包含浏览器界面验收。源码构建后可运行 `node --test --test-concurrency=1 test/plugins-*.test.mjs test/plugin-api-contract.test.mjs`；完整回归使用 `npm test`。
+
+| 验收项 | 测试文件与断言 |
+| --- | --- |
+| 加载、版本与生命周期 | `plugins-runtime`：本地和 npm 定位符、包与实例双重版本范围、拒绝无效或重复 id、按配置顺序加载、激活失败、迟到 fence、私有目录、来源映射和幂等停用。 |
+| 超时与异常隔离 | `plugins-runtime`、`plugins-operations`：同步抛错、异步拒绝、超时后迟到成功或失败；`plugins-http`：插件失败后真实主会话仍能发送并完成 RPC。 |
+| 按需树与重连 | `plugins-main-tree`：热节点及祖先、keyset 分页、epoch、修订号、删除与 2000 条重放边界；`plugin-api-contract`：插件树与流的快照切点、分页、reset；`plugins-host`：循环与无效能力；`plugins-http`：HTTP 快照和 WS 实时变化。 |
+| 只读子会话、面板与渲染目录 | `plugins-http`：快照、流、面板与静态动作目录；`plugins-host`：会话图片提取、来源隔离、渲染器冲突按配置顺序选择及停用清理。 |
+| 动作、发送和表单幂等 | `plugins-operations`：共享键命名空间、内容冲突、并发 pending、返回 pending 后查询、真正迟到的最终结果、24 小时保留、容量限制与原样来源传递；`plugins-http`：浏览器同键重试。 |
+| 持久表单与待处理区 | `plugins-operations`：排序、revision、权威对齐和并发事件、双标签页 claim、失败释放、cancel、过期由插件裁定；`plugins-http`：两标签页提交仅一次接受，`formRemoved` 包含来源。 |
+| 用户在场确认 | `plugins-presence`：凭证与连接绑定、origin 优先与广播回退、首个有效回应、连接断开、严格 JSON、超时/拒绝/停用关闭帧；`plugins-http`：真实 HTTP/WS 路由，其他连接不能结束挑战。 |
+| 保活与主动关闭 | `plugins-holds`：仅列托管、读取历史、预登记 hold、多重 hold、空闲回收、关闭二次确认、旧 release 空操作、进程切换不迁移 hold；`plugins-host`：失败和停用释放插件资源。 |
+| 横幅故障 | `plugins-banners`：原子写、重启、加载失败/停用保留 persistent 并标注不可用、来源恢复后 listBanners 与显式清除、配置移除二次确认/审计、I/O 失败保留旧状态；`plugins-http`：新连接重发、停用和重启、禁止删除仍配置来源。 |
+| 通知、鉴权与关闭门禁 | `plugins-host`：通知按来源去重；`plugins-http`：所有读写使用浏览器凭证；`shutdown-ingress`：插件全路由统一拒绝关闭后的请求，multipart 解析前不插入无关异步路由；`backpressure`：同名不同来源的增量与 resync 隔离。 |
+| 公共 API 契约 | `plugin-api-contract`：导出类型与真实示例实现的 TypeScript 编译、原生 RPC 不外泄、当前与上一版本范围协商、畸形范围拒绝，以及测试插件完整能力与故障。 |
+
 ## 图片上限观测
 
 M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一次完整测试使用合法 PNG tEXt 块补齐字节数，关闭 pi 自动缩放，以观察原始字节上限，不代表高分辨率照片或真实模型语义验证。
@@ -141,4 +162,4 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 Windows Job 模式在停止返回前独立确认已知成员退出；platform 测试在 StopReport 返回后立即核对已知后代身份，不设置额外退出观察窗口，也不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
 
-M1 没有前端，未验证真实输入框、BroadcastChannel、浏览器设备密钥和持久表单；这些属于 M2/M3。HTML 导出的图片排列仍由 pi 决定。插件接口类型完整导出不表示插件宿主已实现。
+本分支未验证真实输入框、BroadcastChannel、浏览器设备密钥、持久表单界面和 agora 联调；这些属于前端与集成验收。HTML 导出的图片排列仍由 pi 决定。插件宿主的合作式超时不能隔离同步死循环或阻塞计算，也不能强制撤销插件后台已经受理的操作。

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { MainSessionInfo, TreeChange, TreeChildrenPage, TreeCursor, TreeNode, TreeSnapshot, TreeSnapshotRequest } from "@pi-pane/plugin-api";
 import { assert } from "../errors.js";
+import { fileKey } from "../store.js";
 
 export interface MainTreeRow { info: MainSessionInfo; lastActivityAt?: string; messageCount?: number; holds?: { source: string; reason: string }[] }
 export interface MainTreeOptions { load(): Promise<MainTreeRow[]>; current(): MainTreeRow[]; watch(listener: () => void): () => void }
@@ -21,7 +22,10 @@ export class MainTree {
     this.unwatch = options.watch(() => {
       if (this.closed || this.dirty) return;
       this.dirty = true;
-      queueMicrotask(() => { this.dirty = false; if (!this.closed) this.rebuild(options.current()); });
+      queueMicrotask(() => {
+        this.dirty = false;
+        if (!this.closed) { try { this.rebuild(options.current()); } catch (error) { console.error("主会话目录刷新失败：", error); } }
+      });
     });
   }
   refresh(): Promise<void> {
@@ -39,7 +43,7 @@ export class MainTree {
     next.set(unassigned.id, unassigned);
     for (const row of rows) {
       const { info } = row;
-      const cwd = path.resolve(info.cwd); const key = process.platform === "win32" ? cwd.toLowerCase() : cwd;
+      const cwd = path.resolve(info.cwd); const key = fileKey(cwd);
       const parentId = "pane:project:" + createHash("sha256").update(key).digest("hex");
       let project = next.get(parentId);
       if (!project) {

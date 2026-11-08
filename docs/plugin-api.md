@@ -23,8 +23,10 @@ pi-pane 的插件运行在服务端，通过通用接口向界面提供会话树
   ```
 
 - 插件把 `@pi-pane/plugin-api` 声明为 peer 依赖，不打包自己的副本。
+- 插件 `id` 是跨平台数据目录名，只允许 1–64 个字符，符合 `^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)*$`。每个点分段都不能是 `pane`、`con`、`prn`、`aux`、`nul`、`com1`–`com9` 或 `lpt1`–`lpt9`。所有平台都使用小写和同一套保留名，避免大小写不敏感文件系统及 Windows 设备名冲突。不合规的插件加载失败并写入日志，不影响其他插件。
 - pi-pane 启动时逐个加载。`paneProtocol` 与自己支持的范围没有交集时拒绝加载，在设置页显示原因，见“版本”。
 - 插件只能提供声明式 UI，不能向浏览器注入脚本或样式。
+- 配置中的插件运行状态、HTTP 路由和 WebSocket 订阅帧见 [插件 HTTP 接口](architecture.md#插件-http-接口) 与 [WebSocket](architecture.md#websocket)。插件不需要自行监听浏览器连接。
 
 ### 运行方式与超时
 
@@ -39,7 +41,7 @@ pi-pane 是否把每个插件放进独立的 worker 线程隔离，**待定**（
 ```ts
 // 草案，P0 后冻结
 export interface PanePlugin {
-  id: string;                         // 即 TreeNode.source，如 "agora"；"pane" 保留给 pi-pane 自己
+  id: string;                         // 即 TreeNode.source，如 "agora"；须符合“插件的加载”中的小写目录名规则
   paneProtocol: [number, number];
   activate(ctx: PaneHostContext): Promise<void>;
   deactivate?(): Promise<void>;
@@ -199,6 +201,7 @@ export interface UserPresenceError extends Error {
 2. 带 `origin` 且该标签页仍连接时，只在该标签页弹出；否则在所有已登录的标签页弹出，第一个确认的生效，其余关闭。
 3. 确认框显示 `title`、`summary`、发起的插件名，以及可展开的 `payload` 原文。用户点“确认”后浏览器签名并返回；点“拒绝”以 `rejected` 失败；超时以 `timeout` 失败；浏览器不支持 WebCrypto ECDSA 或 IndexedDB 时以 `unsupported` 失败。
 4. 确认框不会自动确认，也不能由插件或服务端代为点击。
+5. 服务端向相关标签页发送 `{ type: "presenceClosed", id, reason }` 关闭同一确认框；`reason` 为 `confirmed`、`cancelled` 或 `timeout`。首个确认、拒绝、插件停用和超时均会结束该次确认；迟到的回应不能替换结果。这是 M3 的 pane v1 兼容扩展。
 
 ### 设备密钥
 
@@ -755,7 +758,7 @@ export type FormRemovedReason = "handled" | "cancelled" | "expired" | "withdrawn
 - **过期**：由插件（或它的后台服务）统一裁定，到期后调用 `ctx.formRemoved(id, "expired")`。pi-pane 不因为 `expiresAt` 到了就自行移除或提交。
 - **并发提交**：同一表单可能在两个标签页、两台设备上同时提交（不同的 `idempotencyKey`）。插件按 `formId` + `revision` 只接受第一个，其余返回 `alreadyHandled`（pi-pane 显示“已处理”并关闭）；`revision` 落后时返回 `stale` 和新表单。同一个 key 的重试按“幂等规则”返回当前状态。
 - **等待确认**：`submit` 返回 `pending` 时（如插件在等 `userPresence` 确认或后台处理），表单保持“处理中”，直到插件调用 `formRemoved` 或用同一 key 查询得到最终结果。确认超时不等于拒绝。
-- **移除**：插件在表单被处理、取消、过期或撤回后调用 `ctx.formRemoved()`，所有标签页关闭该表单。
+- **移除**：插件在表单被处理、取消、过期或撤回后调用 `ctx.formRemoved()`，所有标签页关闭该表单。浏览器以 `(source, formId)` 作为表单标识，不能只按 `formId` 查找。服务端的移除帧为 `{ type: "formRemoved", source, formId, reason }`；`source` 是 M3 的 pane v1 兼容扩展，不改变插件的 `ctx.formRemoved(formId, reason)` 签名。提交路由也带来源，其他插件的同名表单不受影响。
 - **需要用户在场确认的提交**：插件可以在 `forms.submit()` 里用调用方的 `origin` 调 `ctx.userPresence.confirm()`，确认框出现在提交的那个标签页。
 
 ### 动作附带的表单

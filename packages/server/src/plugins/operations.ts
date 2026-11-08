@@ -336,9 +336,10 @@ export class PluginOperations {
     // 原始事务始终被观察；HTTP 等待结束不改变其状态，也不取消插件执行。
     const running = Promise.resolve().then(run).then(result => {
       const copy = snapshot(result); checkResult(kind, source, copy); return copy;
-    }).catch((): Result => kind === "send"
-      ? { status: "rejected", message: "插件操作失败" }
-      : { status: "failed", message: "插件操作失败" }).then(result => {
+    }).catch((error): Result => {
+      try { console.error(`插件 ${source} 的 ${kind} 操作失败：`, error); } catch { /* 日志故障不影响事务结果。 */ }
+      return kind === "send" ? { status: "rejected", message: "插件操作失败" } : { status: "failed", message: "插件操作失败" };
+    }).then(result => {
       record.result = result; record.running = undefined;
       if (result.status !== "pending") record.finalAt = this.now();
       settled?.(record, result);
@@ -352,7 +353,10 @@ export class PluginOperations {
         done = true; clearTimeout(timer); this.waits.delete(stop); resolve(snapshot(result) as R);
       };
       const stop = () => finish();
-      const timer = setTimeout(stop, timeoutMs);
+      const timer = setTimeout(() => {
+        try { console.warn(`插件 ${source} 的 ${kind} 操作等待超过 ${timeoutMs} 毫秒，结果未知`); } catch { /* 日志故障不影响超时返回。 */ }
+        stop();
+      }, timeoutMs);
       this.waits.add(stop);
       // 同步和异步异常均转为该操作的结果，不向主会话传播拒绝。
       void running.then(finish, () => finish(kind === "send"

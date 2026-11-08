@@ -101,6 +101,15 @@ test("加载目录插件、协商双重范围并在激活前创建私有上下�
   assert.deepEqual(loaded.events.at(-1), ["unavailable", "sample", false]);
 });
 
+test("插件按照配置顺序完成加载，不并行激活后续来源", async t => {
+  const f = await fixture(t); const entered = deferred(); const gate = deferred(); const order = [];
+  const loaded = f.runtime(["first", "second"]);
+  loaded.runtime.load = async entry => { order.push(entry.view.locator); if (entry.view.locator === "first") { entered.resolve(); await gate.promise; } };
+  const starting = loaded.runtime.start(); await entered.promise;
+  assert.deepEqual(order, ["first"]); gate.resolve(); await starting;
+  assert.deepEqual(order, ["first", "second"]);
+});
+
 test("npm 包定位兼容未公开 package.json 的 exports", async t => {
   const f = await fixture(t);
   const previous = process.cwd();
@@ -133,12 +142,15 @@ test("元数据和实例范围必须同时支持协议 1", async t => {
 
 test("拒绝保留 id、目录穿越和跨平台危险路径", async t => {
   const f = await fixture(t);
-  const ids = ["pane", "Pane", "..", "../escape", "a/b", "a\\b", "C:drive", "con", "trailing.", ""];
+  const ids = ["pane", "Pane", "MixedCase", "..", "../escape", "a/b", "a\\b", "C:drive", "con", "trailing.", "", "-start", "_start", "a..b", "a.con", "com9.feature", "safe.pane", "a".repeat(65)];
   const plugins = await Promise.all(ids.map(id => f.plugin(id)));
-  const loaded = f.runtime(plugins.map(plugin => plugin.directory));
+  const healthy = await f.plugin("a".repeat(64));
+  const loaded = f.runtime([...plugins.map(plugin => plugin.directory), healthy.directory]);
   await loaded.runtime.start();
-  assert.ok(loaded.runtime.list().every(state => state.state === "failed"));
-  assert.equal(loaded.contexts.size, 0);
+  assert.ok(loaded.runtime.list().slice(0, -1).every(state => state.state === "failed"));
+  assert.equal(loaded.runtime.list().at(-1).state, "active");
+  assert.ok(loaded.logs.some(log => log[0] === "error"));
+  assert.equal(loaded.contexts.size, 1);
   assert.ok(plugins.every(plugin => plugin.control.deactivations === 0));
 });
 

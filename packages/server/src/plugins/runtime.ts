@@ -35,9 +35,9 @@ interface Entry {
 }
 
 function validSource(value: unknown): value is string {
-  return typeof value === "string" && value.toLowerCase() !== "pane"
-    && /^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$/.test(value)
-    && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(value);
+  return typeof value === "string" && value.length >= 1 && value.length <= 64
+    && /^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)*$/.test(value)
+    && value.split(".").every(segment => !/^(pane|con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(segment));
 }
 
 function message(error: unknown): string {
@@ -118,7 +118,7 @@ export class PluginRuntime {
   }
 
   private key(source: string): string {
-    return process.platform === "win32" ? source.toLowerCase() : source;
+    return source;
   }
 
   private report(level: "info" | "warn" | "error", ...args: unknown[]): void {
@@ -139,7 +139,10 @@ export class PluginRuntime {
     }
     if (this.closed) return;
     for (const entry of this.entries) entry.view.source = this.sources.get(entry.view.locator);
-    await Promise.all(this.entries.map(entry => this.load(entry)));
+    for (const entry of this.entries) {
+      if (this.closed) break;
+      await this.load(entry);
+    }
   }
 
   private async readSources(): Promise<Map<string, string>> {

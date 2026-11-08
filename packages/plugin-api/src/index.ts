@@ -1,6 +1,6 @@
 // 草案，P0 后冻结
 export interface PanePlugin {
-  id: string;                         // 即 TreeNode.source，如 "agora"；"pane" 保留给 pi-pane 自己
+  id: string;                         // 即 TreeNode.source，如 "agora"；须符合文档中的小写目录名规则
   paneProtocol: [number, number];
   activate(ctx: PaneHostContext): Promise<void>;
   deactivate?(): Promise<void>;
