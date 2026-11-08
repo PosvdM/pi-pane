@@ -6,6 +6,14 @@ import { api } from "./api.ts";
 import type { PaneTrustRequest } from "./types.ts";
 
 let editorSeq = 0;
+/** 信任询问列表的实时变更次数：HTTP 快照与 WebSocket 推送没有共同顺序，快照请求期间有推送时重新获取。 */
+let trustVersion = 0;
+function syncTrust(): void {
+  const version = trustVersion;
+  void api<{ requests: PaneTrustRequest[] }>("/api/trust").then(({ requests }) => {
+    if (version === trustVersion) trustRequests.set(requests); else syncTrust();
+  }).catch(() => {});
+}
 
 function update(id: string, change: (ui: ReturnType<typeof emptyUi>) => void): void {
   extensionUi.set((all) => {
@@ -34,12 +42,14 @@ export function installEventHandlers(): void {
     } else if (message.type === "ui_resolved") {
       update(message.ref.id, (ui) => { ui.dialogs = ui.dialogs.filter((d) => d.id !== message.id); });
     } else if (message.type === "project_trust") {
+      trustVersion++;
       trustRequests.set((list) => list.some((r) => r.id === message.request.id) ? list : [...list, message.request]);
     } else if (message.type === "project_trust_resolved") {
+      trustVersion++;
       trustRequests.set((list) => list.filter((r) => r.id !== message.id));
     } else if (message.type === "banners") {
       // 重连后补取连接断开期间发出的信任询问。
-      void api<{ requests: PaneTrustRequest[] }>("/api/trust").then(({ requests }) => trustRequests.set(requests)).catch(() => {});
+      syncTrust();
     }
   });
 }

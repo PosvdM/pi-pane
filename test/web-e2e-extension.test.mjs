@@ -95,6 +95,7 @@ test("Chrome 扩展对话框、超时、通知、组件及跨标签页回应", {
 
 test("Chrome 斜杠命令补全支持方向键、Tab 并拒绝终端专用命令", { timeout: 90_000 }, async t => {
   const s = await hosted(t); if (!s) return;
+  s.allowedErrors.push(/status of 400 \(Bad Request\)/); // 终端专用命令由服务端以 400 拒绝。
   const { page } = s;
   await byId(page, "composer").fill("/");
   await byId(page, "completion").waitFor();

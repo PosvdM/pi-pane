@@ -33,7 +33,10 @@ export async function api<T>(path: string, body?: unknown): Promise<T> {
   const response = await request(path, body === undefined ? {} : {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
-  return response.json() as Promise<T>;
+  // 响应头已到而响应体读取中断时，结果同样未知，按网络错误处理；完整但无法解析的响应单独标出。
+  let text: string;
+  try { text = await response.text(); } catch { throw new ApiError(0, "network", "无法连接 pi-pane 服务端"); }
+  try { return JSON.parse(text) as T; } catch { throw new ApiError(response.status, "invalidResponse", "服务端响应无法解析"); }
 }
 
 export function newId(): string { return crypto.randomUUID(); }

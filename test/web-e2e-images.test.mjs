@@ -71,15 +71,15 @@ test("Chrome 两张图片占位符的上传、复制、发送和退格重新编�
   await editor.fill("第一张");
   await byId(page, "image-input").setInputFiles({ name: "red.png", mimeType: "image/png", buffer: red });
   await editor.locator(".chip").waitFor();
-  await editor.press("Control+z");
+  await editor.press("ControlOrMeta+z");
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="composer"] .chip').length === 0);
-  await editor.press("Control+Shift+z");
+  await editor.press("ControlOrMeta+Shift+z");
   await editor.locator(".chip").waitFor();
-  await editor.press("Control+End");
+  await editor.evaluate(el => { el.focus(); const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }); // 光标移到末尾（不依赖平台快捷键）
   await page.keyboard.insertText("中间");
   await byId(page, "image-input").setInputFiles({ name: "blue.png", mimeType: "image/png", buffer: blue });
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="composer"] .chip').length === 2);
-  await editor.press("Control+End");
+  await editor.evaluate(el => { el.focus(); const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }); // 光标移到末尾（不依赖平台快捷键）
   await page.keyboard.insertText("结尾");
   const ids = await editor.locator(".chip").evaluateAll(chips => chips.map(chip => chip.dataset.assetId));
   assert.notEqual(ids[0], ids[1], "两张不同的 PNG 必须产生不同资源");
@@ -134,10 +134,10 @@ test("Chrome 两张图片占位符的上传、复制、发送和退格重新编�
   assert.equal(await editor.locator(".chip").getAttribute("data-asset-id"), ids[1]);
   await numberedChips(page, cdp, ["[Image #1]"]);
   assert.equal((await copyDraft(page)).text, "第一张中间[Image #1]结尾");
-  await editor.press("Control+z");
+  await editor.press("ControlOrMeta+z");
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="composer"] .chip').length === 2);
   await numberedChips(page, cdp, ["[Image #1]", "[Image #2]"]);
-  await editor.press("Control+Shift+z");
+  await editor.press("ControlOrMeta+Shift+z");
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="composer"] .chip').length === 1);
   await numberedChips(page, cdp, ["[Image #1]"]);
   await screenshot(page, "e2e-images-renumbered");

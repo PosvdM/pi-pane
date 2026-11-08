@@ -1,12 +1,12 @@
 // 输入框（image-placeholders.md“输入框”、architecture.md“斜杠命令”“停止与控制队列”）。
 // contenteditable 中的图片是 contenteditable=false 的原子节点，编号由 CSS 计数器按位置实时计算；
 // 插入、删除和移动都经 execCommand 完成，撤销、重做由浏览器原生处理。
-import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
 import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { closeSession, control, current, editorText, restoredDrafts, stopRun, type ControlOutcome } from "../lib/session.ts";
+import { closeSession, control, current, editorText, navigation, restoredDrafts, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
 import { ask, overlay, toast } from "../lib/ui-state.ts";
@@ -29,8 +29,6 @@ export const BUILTIN: { name: string; description: string }[] = [
   { name: "session", description: "会话信息与用量" },
   { name: "quit", description: "关闭会话" },
 ];
-/** architecture.md“斜杠命令”表中只能在终端使用的 pi 内置命令。 */
-const TERMINAL_ONLY = new Set(["settings", "tree", "reload", "login", "logout", "hotkeys", "changelog", "share", "copy", "scoped-models", "debug", "exit"]);
 const THINKING: PaneThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 function escapeHtml(text: string): string {
@@ -115,7 +113,8 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   };
 
   // 切换会话时恢复该会话保存在 localStorage 的草稿；离开时先写入尚未保存的编辑。
-  useEffect(() => {
+  // 用 layout effect 在浏览器绘制和用户输入之前完成恢复，避免覆盖挂载后立即输入的内容。
+  useLayoutEffect(() => {
     let nodes: DraftNode[] = [];
     try { nodes = JSON.parse(localStorage.getItem(draftKey(sessionId)) ?? "[]"); } catch { /* 草稿损坏时丢弃。 */ }
     setNodes(Array.isArray(nodes) ? nodes : []);
@@ -279,16 +278,17 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
       case "clone": return ran({ type: "clone" });
       case "resume": sidebarOpen.set(true); return "ok";
       case "session": overlay.set("session-info"); return "ok";
-      case "quit": await closeSession(); return "ok";
+      case "quit": return (await closeSession()) ? "ok" : "failed";
     }
-    // 会话启动前拿不到命令列表：已知只在终端可用的命令直接拒绝，其余交给 pi 判断。
-    if (!TERMINAL_ONLY.has(name) && (!view.hosted || commands?.some((c) => c.name === name))) return "prompt";
-    toast(`pi-pane 不支持 /${name}，请在终端中使用 pi`, "warning");
-    return "failed";
+    // 其余命令原样用 prompt 发送；只能在终端使用的 pi 内置命令由服务端拒绝（unsupportedCommand）。
+    return "prompt";
   }
 
   async function send(delivery?: "steer" | "follow_up") {
     const el = editor.current; if (!el || busy || blocked) return;
+    // 操作归属：等待期间导航到其他会话后，不再弹确认框或重发到新会话。
+    const owner = navigation();
+    const stale = () => navigation() !== owner || !el.isConnected;
     const nodes = readNodes(el);
     if (isEmpty(nodes)) return;
     setCompletion(null);
@@ -309,15 +309,19 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     const problem = checkImages(ids); if (problem) { toast(problem, "warning"); return; }
     if (ids.length && view.state?.model && !view.state.model.images) { toast("当前模型不支持图片，请切换模型", "warning"); return; }
     let type: "prompt" | "steer" | "follow_up" = running && !viaPrompt ? delivery ?? "steer" : "prompt";
+    // 运行中经 prompt 展开的技能、提示模板需要送达方式；扩展命令立即执行，服务端忽略此字段。
+    const promptDelivery = viaPrompt && running ? (delivery === "follow_up" ? "followUp" as const : "steer" as const) : undefined;
     setBusy(true);
     try {
       for (;;) {
-        const outcome = await control({ type }, nodes);
+        const outcome = await control(type === "prompt" && promptDelivery ? { type, delivery: promptDelivery } : { type }, nodes);
+        if (stale()) return;
         if (outcome.ok) {
           if (el.isConnected && JSON.stringify(readNodes(el)) === JSON.stringify(nodes)) { el.innerHTML = ""; refresh(); }
           if (outcome.result.status === "accepted" && outcome.result.result?.handled) toast("消息已由扩展处理");
           return;
         }
+        if (outcome.error.code === "unsupportedCommand") { toast(outcome.error.message, "warning"); return; }
         if (outcome.error.code !== "revisionChanged") { toast(outcome.error.message, "error"); return; }
         if (viaPrompt) { toast("会话状态已变化，请确认后重新执行命令", "warning"); return; }
         // 用户看到的状态已过期：按最新状态请用户重新确认，草稿保留，不自动重发。
@@ -327,7 +331,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
         const answer = nowRunning
           ? await ask("会话已开始运行", "另一个标签页刚刚改变了会话状态。这条消息怎么发送？", [{ label: "取消", value: "cancel" }, { label: "排队（follow-up）", value: "follow_up" }, { label: "追加（steer）", value: "steer", primary: true }])
           : await ask("会话已停下", "另一个标签页刚刚改变了会话状态。是否作为新消息发送？", [{ label: "取消", value: "cancel" }, { label: "发送", value: "prompt", primary: true }]);
-        if (!answer || answer === "cancel") return;
+        if (!answer || answer === "cancel" || stale()) return;
         type = answer as typeof type;
       }
     } finally { setBusy(false); }

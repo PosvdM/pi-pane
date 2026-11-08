@@ -59,6 +59,8 @@ export async function send(page, text, button) {
   await byId(page, "composer").fill(text);
   // 完整命令直接发送，避免将 Enter 解释为补全选择。
   await byId(page, "composer").press("Escape");
+  // 上一次控制请求未结束时输入框处于 busy，Enter 不会发送；先等发送按钮可用。
+  await page.waitForFunction(() => { const b = document.querySelector('[data-testid="send"],[data-testid="steer"]'); return b && !b.disabled; });
   if (button) await byId(page, button).click(); else await byId(page, "composer").press("Enter");
   await until(async () => {
     if (await byId(page, "trust-yes").isVisible()) await byId(page, "trust-yes").click();

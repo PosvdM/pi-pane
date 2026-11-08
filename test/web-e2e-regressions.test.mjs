@@ -101,7 +101,7 @@ test("R1 Chrome 图片草稿先显示，慢 touch 只标记过期图片且保留
     await until(() => captured);
     assert.equal(await byId(page, "composer").locator(".chip").getAttribute("data-asset-id"), assetId);
     assert.equal(await byId(page, "composer").innerText(), "图片草稿");
-    await byId(page, "composer").press("Control+End");
+    await byId(page, "composer").evaluate(el => { el.focus(); const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const s = getSelection(); s.removeAllRanges(); s.addRange(r); });
     await page.keyboard.insertText("等待期间的新编辑");
     const delivered = page.waitForResponse(response => response.url().endsWith("/api/assets/touch"));
     gate.release(); await delivered;
@@ -115,6 +115,8 @@ test("R1 Chrome 图片草稿先显示，慢 touch 只标记过期图片且保留
 
 test("R2 Chrome 未启动会话拒绝 settings 并保留输入，不调用模型", { timeout: 60_000 }, async t => {
   const s = await setup(t, replyScript("不应调用")); if (!s) return;
+  // 服务端以 400 unsupportedCommand 拒绝终端专用命令，Chrome 会记录该响应。
+  s.allowedErrors.push(/status of 400 \(Bad Request\)/);
   const { page, fixture } = s;
   await newSession(page, fixture);
   await byId(page, "composer").fill("/settings");
