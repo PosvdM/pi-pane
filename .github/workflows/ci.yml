@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 25
     env:
       HOSTKIT_TEST_CONTAINMENT: ${{ matrix.containment }}
+      PANE_TEST_REQUIRE_CHROME: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -46,7 +47,4 @@ jobs:
           echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
           if [ "${{ matrix.containment }}" = auto ]; then echo "HOSTKIT_TEST_REQUIRE_CGROUP=1" >> "$GITHUB_ENV"; fi
-      - name: 要求 Linux 实际执行 Chrome 重连验证
-        if: runner.os == 'Linux' && matrix.containment == 'auto'
-        run: echo "PANE_TEST_REQUIRE_CHROME=1" >> "$GITHUB_ENV"
       - run: npm test

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { locatePi } from "pi-hostkit";
 export const here = path.dirname(fileURLToPath(import.meta.url));
 export const providerPath = path.join(here, "fake-provider.ts");
+export const uiExtensionPath = path.join(here, "ui-extension.ts");
 export const extensionPath = path.resolve(here, "../../packages/bridge-extension/dist/index.js");
 export const isWin = process.platform === "win32";
 export const containment = process.env.HOSTKIT_TEST_CONTAINMENT || "auto";

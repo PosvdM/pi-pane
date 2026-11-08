@@ -1,14 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import path from "node:path";
-import { chromium } from "playwright-core";
+import { requireChrome, launch } from "./fixtures/browser.mjs";
 import { piFixture, until, delay } from "./fixtures/helpers.mjs";
 import { startServer, pair, open, control, snapshot } from "./fixtures/client.mjs";
 import { connect } from "./fixtures/ws-client.mjs";
 import { readSession } from "../packages/server/dist/store.js";
-const browserEnv = { ...process.env };
 const reply = "真实断线重连不能重复或遗漏，结束后必须与会话文件一致。";
 const script = { fallback: { segments: [{ type: "text", chunks: [...reply].map(text => ({ text, delayMs: 60 })) }] } };
 function projection(initial, records) {
@@ -54,17 +52,14 @@ window.harness = { events: [], credential: null, cursor: null, socket: null,
   socket.onmessage = event => { const data = JSON.parse(event.data); if(data.type === 'banners') { socket.send(JSON.stringify({type:'subscribe',ref,after})); resolve(); } if(data.type === 'session') { this.events.push(data); this.cursor = data.cursor; } }; }); },
  disconnect() { this.socket.close(); this.socket = null; }
 };`;
-function chromePath() {
-  return [process.env.CHROME_PATH, process.env.CHROME_BIN, "C:/Program Files/Google/Chrome/Application/chrome.exe", "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe", process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google/Chrome/Application/chrome.exe"), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/opt/google/chrome/chrome"].find(file => file && existsSync(file));
-}
 test("Chrome 在真实离线窗口后按游标重连，增量视图与磁盘一致", { timeout: 90000 }, async t => {
-  const executablePath = chromePath();
-  if (!executablePath) { assert.notEqual(process.env.PANE_TEST_REQUIRE_CHROME, "1", "CI 必须安装并实际运行 Chrome"); t.skip("本机未找到 Google Chrome；CI 的 Linux auto 任务要求实际执行"); return; }
+  const executablePath = requireChrome(t);
+  if (!executablePath) return;
   const f = await piFixture(script); const webRoot = path.join(f.root, "page"); await mkdir(webRoot);
   await writeFile(path.join(webRoot, "index.html"), '<!doctype html><meta charset="utf-8"><script src="/harness.js"></script>'); await writeFile(path.join(webRoot, "harness.js"), browserScript);
   const server = await startServer(f, { webRoot }); let browser;
   try {
-    browser = await chromium.launch({ executablePath, env: browserEnv, headless: true, args: ["--no-proxy-server", "--no-sandbox"] }); const context = await browser.newContext(); const page = await context.newPage();
+    browser = await launch(executablePath); const context = await browser.newContext(); const page = await context.newPage();
     await page.goto(server.origin); await page.evaluate(code => window.harness.pair(code), server.auth.issuePairCode());
     const token = await pair(server); const initial = await open(server, token, f); const result = await control(server, token, initial, { type: "prompt", message: "Chrome 重连测试" }); assert.equal(result.code, 200);
     const id = result.value.snapshot.ref.id; const cut = await until(async () => { const s = await snapshot(server, token, id); return s.inFlight?.assistant?.blocks.some(b => b.text?.length) && s; });
