@@ -157,7 +157,6 @@ export class Sessions {
   }
   private setName(session: HostedSession, value: string | undefined): void {
     session.name = { value };
-    if (session.state) session.state = { ...session.state, sessionName: value };
   }
   private readName(session: HostedSession, entries: Entry[]): void {
     const info = entries.findLast((entry) => entry.type === "session_info");

@@ -13,6 +13,13 @@ test("清空名称后的回退标题按完整字符截取，不拆开 Unicode �
   assert.equal(Sessions.prototype.fallbackTitle(session), "😀".repeat(200));
 });
 
+test("名称刷新不替换普通 RPC 状态对象", () => {
+  const state = { sessionName: "旧的状态快照", model: { id: "model" } }; const session = { state };
+  Sessions.prototype.setName(session, "较新的名称"); assert.strictEqual(session.state, state); assert.equal(session.name.value, "较新的名称");
+  Sessions.prototype.readName(session, [{ type: "session_info", name: "只读元数据名称" }]);
+  assert.strictEqual(session.state, state); assert.equal(session.name.value, "只读元数据名称");
+});
+
 test("真实主会话改名与清空名称同步更新插件上下文、树和只读目录", { timeout: 60000 }, async () => {
   const f = await piFixture(script); const extension = path.join(f.root, "clear-name.mjs");
   await writeFile(extension, "export default function(pi){pi.registerCommand('pane-test-clear-name',{description:'清空测试名称',handler:async()=>{pi.setSessionName('')}})}");
@@ -43,9 +50,11 @@ test("真实主会话改名与清空名称同步更新插件上下文、树和�
     await until(() => events.some(change => change.type === "upsert" && change.node.id === "pane:session:named" && change.node.title === "名称测试"));
     current = await snapshot(server, token, "named");
     assert.equal((await control(server, token, current, { type: "close" })).value.status, "done");
+    const cachedState = server.sessions.records.get("named").state;
     const parentId = server.sessions.records.get("named").model.entries.at(-1)?.id ?? null;
     await appendFile(file, JSON.stringify({ type: "session_info", id: "external-name", parentId, name: "只读名称 C", timestamp: new Date().toISOString() }) + "\n");
     await until(() => api.get("named").title === "只读名称 C");
+    assert.strictEqual(server.sessions.records.get("named").state, cachedState);
     await until(() => events.some(change => change.type === "upsert" && change.node.id === "pane:session:named" && change.node.title === "只读名称 C"));
   } finally { off?.(); await server.close(); await f.cleanup(); }
 });
