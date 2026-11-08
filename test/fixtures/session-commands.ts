@@ -1,8 +1,14 @@
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+
 export default function(pi) {
   pi.on("input", (event) => event.text === "pane-test-handled-input" ? { action: "handled" } : undefined);
   pi.on("session_before_compact", (event) => event.customInstructions === "pane-test-cancel" ? { cancel: true } : undefined);
   pi.registerCommand("pane-test-wait", { handler: async (args) => { await new Promise(resolve => setTimeout(resolve, Number(args) || 1000)); } });
-  pi.registerCommand("pane-test-hang", { handler: async () => { await new Promise(() => {}); } });
+  pi.registerCommand("pane-test-hang", { handler: async () => {
+    await writeFile(path.join(process.env.DRIVER_TEST_ROOT!, "hang-entered"), "entered");
+    await new Promise(() => {});
+  } });
   pi.registerCommand("pane-test-new", { handler: async (_args, ctx) => { await ctx.newSession(); } });
   pi.registerCommand("pane-test-resume", { handler: async (file, ctx) => { await ctx.switchSession(file); } });
   pi.registerCommand("pane-test-resume-hang", { handler: async (file, ctx) => { await ctx.switchSession(file); await new Promise(() => {}); } });
