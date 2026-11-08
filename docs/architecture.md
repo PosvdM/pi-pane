@@ -324,7 +324,7 @@ interface DriverHandle {
 
 浏览器接口由 `packages/server/src/web-api.ts` 定义，`web-adapter.ts` 在服务端转换 pi 原始数据。M2 协议变更：/query、/ui、控制结果、会话列表改为 web-api.ts 的 pane 类型。会话流与 entries 保持 plugin-api.md 的 pane 协议。
 
-`POST /api/sessions/:id/query` 接受 `{type}`，`type` 仅为 `state`、`models`、`commands`、`stats`、`forkPoints`，服务端分别调用 `get_state`、`get_available_models`、`get_commands`、`get_session_stats`、`get_fork_messages`，返回对应的 `PaneQueryResults[type]`，pi 拒绝时返回 409 `rpcRejected`。快照和打开响应包含 `hosted`，并在存在最近状态时附带 `PaneSessionState`。
+`POST /api/sessions/:id/query` 接受 `{type}`，`type` 仅为 `state`、`models`、`commands`、`stats`、`forkPoints`，服务端分别调用 `get_state`、`get_available_models`、`get_commands`、`get_session_stats`、`get_fork_messages`，返回对应的 `PaneQueryResults[type]`，pi 拒绝时返回 409 `rpcRejected`。快照和打开响应包含 `hosted`，并在存在最近状态时附带 `PaneSessionState`。缓存状态在托管初始化、状态查询、`set_model`、`set_thinking_level`、`set_session_name`、`compact` 成功后，以及 `session_info_changed`、`model_select`、`thinking_level_select`、`model_changed`、`thinking_level_changed` 事件后通过 `get_state` 刷新；事件刷新合并执行，仅在写者、模型和 epoch 未变且写者仍接受输入时提交，名称、模型或思考级别变化后递增 `controlRevision` 并发送 `pane_status`，事件或控制操作后的刷新失败仅发送 `pane_diagnostic`，不覆盖已确认的控制结果。
 
 控制受理结果为 `{status:"accepted",snapshot,result?}`，不含 pi `response`；`result` 按命令提供 `handled`、`cancelled` 或 `exportId`。`stop`/`close` 返回 `{status:"done",clearedText,clearedDrafts}`，停止报告仅用于服务端诊断。
 

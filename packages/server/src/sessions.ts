@@ -33,6 +33,7 @@ export class Sessions {
   private state: Record<string, unknown> = {};
   private stateQueue = new ControlQueue();
   private recoveredFiles = new Set<string>();
+  private stateRefreshes = new WeakMap<HostedSession, { handle: DriverHandle; model: SessionModel; epoch: string; dirty: boolean; promise: Promise<void> }>();
   private recovering = true; private closing = false; readonly reports: StopReport[] = [];
   private starts = new Map<AbortController, Promise<void>>(); private closePromise?: Promise<void>;
   private handles = new Map<DriverHandle, Promise<void>>(); private cleanupErrors: unknown[] = [];
@@ -204,12 +205,11 @@ export class Sessions {
       if (session.handle !== handle) return { status: "accepted", ...(result ? { result } : {}), snapshot: this.view(session) };
       try {
         await this.sync(session);
-        if (["set_model", "set_thinking_level", "compact"].includes(command.type) && session.handle?.acceptingInput) {
+        if (["set_model", "set_thinking_level", "set_session_name", "compact"].includes(command.type) && session.handle?.acceptingInput) {
           const currentModel = session.model; const epoch = currentModel.epoch; const currentHandle = session.handle;
-          const state = (await currentHandle.send({ type: "get_state" })).data as any;
+          await this.refreshState(session);
           if (session.handle === currentHandle && currentHandle.acceptingInput && session.model === currentModel && currentModel.epoch === epoch) {
-            session.state = state;
-            if (command.type === "compact" && !state.isCompacting && !state.isStreaming) currentModel.control("idle", "idle");
+            if (command.type === "compact" && !session.state.isCompacting && !session.state.isStreaming) currentModel.control("idle", "idle");
           }
         }
       } catch (error) {
@@ -225,7 +225,7 @@ export class Sessions {
     const handle = session.handle; const model = session.model; const epoch = model.epoch;
     const response = await handle.send({ type: queryCommands[type] });
     assert(response.success, "rpcRejected", response.error ?? "pi 拒绝查询", 409);
-    if (type === "state" && session.handle === handle && session.model === model && model.epoch === epoch) session.state = response.data;
+    if (type === "state" && session.handle === handle && handle.acceptingInput && session.model === model && model.epoch === epoch) this.commitState(session, response.data);
     return toPaneQuery(type, response.data);
   }
   respondUi(id: string, body: PaneUiAnswerRequest): PaneUiAnswerResult {
@@ -358,7 +358,35 @@ export class Sessions {
       return;
     }
     session.model.apply(event);
+    if (["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type)) void this.refreshState(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     if (["message_end", "entry_appended", "compaction_end", "session_info_changed", "agent_settled"].includes(event.type)) void this.sync(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
+  }
+  private commitState(session: HostedSession, state: any): void {
+    const previous = session.state;
+    const changed = previous?.sessionName !== state.sessionName || previous?.thinkingLevel !== state.thinkingLevel || JSON.stringify(previous?.model) !== JSON.stringify(state.model);
+    session.state = state;
+    if (changed) session.model.control(session.model.status, session.model.inFlight.phase, undefined, true);
+  }
+  private refreshState(session: HostedSession): Promise<void> {
+    const handle = session.handle; const model = session.model; const epoch = model.epoch;
+    if (!handle?.acceptingInput || session.closed) return Promise.resolve();
+    const pending = this.stateRefreshes.get(session);
+    if (pending?.handle === handle && pending.model === model && pending.epoch === epoch) {
+      pending.dirty = true; return pending.promise;
+    }
+    const current = () => session.handle === handle && handle.acceptingInput && session.model === model && model.epoch === epoch && !session.closed;
+    const job = { handle, model, epoch, dirty: true, promise: Promise.resolve() };
+    // 同一轮事件合并查询；查询期间的变化只追加一次刷新，不阻塞事件接收。
+    job.promise = Promise.resolve().then(async () => {
+      while (job.dirty && current()) {
+        job.dirty = false;
+        const response = await handle.send({ type: "get_state" });
+        assert(response.success, "rpcRejected", response.error ?? "pi 拒绝查询", 409);
+        if (current()) this.commitState(session, response.data);
+      }
+    }).finally(() => { if (this.stateRefreshes.get(session) === job) this.stateRefreshes.delete(session); });
+    this.stateRefreshes.set(session, job);
+    return job.promise;
   }
   private sync(session: HostedSession): Promise<void> {
     session.dirty = true;
