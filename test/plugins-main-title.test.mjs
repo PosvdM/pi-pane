@@ -87,11 +87,15 @@ test("真实主会话改名、清空及重启只读打开同步更新插件上�
     await utimes(file, new Date(0), new Date(0));
     let current = await open(server, token, f, { sessionFile: file });
     let api = server.sessions.mainSessions("test-plugin"); assert.equal(api.get("named").title, "名称 A");
+    const tree = await server.mainTree.snapshot({ openNodeIds: ["pane:session:named"], recentSince: new Date(0).toISOString() });
+    const events = []; off = server.mainTree.subscribe({ epoch: tree.epoch, revision: tree.revision }, change => events.push(change));
+    assert.equal(tree.nodes.find(node => node.id === "pane:session:named").messageCount, 0);
     const started = await control(server, token, current, { type: "prompt", message }); assert.equal(started.code, 200);
     current = await until(async () => { const value = await snapshot(server, token, "named"); return value.status === "idle" && value.inFlight.phase === "idle" && value; });
     assert.equal(server.sessions.records.get("named").state.sessionName, "名称 A");
-    const tree = await server.mainTree.snapshot({ openNodeIds: ["pane:session:named"], recentSince: new Date(0).toISOString() });
-    const events = []; off = server.mainTree.subscribe({ epoch: tree.epoch, revision: tree.revision }, change => events.push(change));
+    await server.sessions.sync(server.sessions.records.get("named"));
+    const messageCount = server.sessions.mainSessionDetails("named").messageCount; assert.ok(messageCount >= 2);
+    await until(() => events.some(change => change.type === "upsert" && change.node.id === "pane:session:named" && change.node.messageCount === messageCount));
     const renamed = await control(server, token, current, { type: "set_session_name", name: "名称 B" });
     assert.equal(renamed.code, 200); assert.equal(renamed.value.status, "accepted");
     assert.equal(api.get("named").title, "名称 B"); assert.equal(api.list().find(info => info.ref.id === "named").title, "名称 B");

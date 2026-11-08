@@ -353,6 +353,7 @@ type ServerMessage =
 - 从 pi stdout 按顺序读到的每条记录（会话事件或命令响应）在同一次处理中更新模型；会话事件和 pane 自己产生的事件（`pane_entries`、`pane_status` 等）分配下一个 `seq`。
 - 收到 `message_end`、`entry_appended`、`compaction_end`、`session_info_changed`、`agent_settled`，以及 `fork`、`compact` 等改变条目的命令响应后，服务端调用 `get_entries` 并带上已知最后一个条目 id 作为 `since`，把新条目作为 `pane_entries` 事件发出。返回的 `leafId` 不在已知叶子的后代上时，说明活动分支变了，服务端重建模型并发 `resync`。
 - `message_end` 在 pi 写入会话文件之前发出（依据：`dist/core/agent-session.js` 第 760–779 行），这段时间里消息放在 `inFlight.completed`，等 `pane_entries` 到达后替换。
+- 增量条目在模型中提交后通知主会话目录监听器；已登记会话的树节点从模型取得最终消息数、保活原因和活动时间，首条文本标题及消息数不依赖后续状态事件或重新枚举目录才刷新。
 - 用户聊天视图（② 投影）由模型从叶子沿父链算出；会话视图不用 `get_messages`。三种投影的定义见 [plugin-api.md](plugin-api.md#三种投影)。
 - 重绑定为旧文件复制只读记录时清空 syncing、重置 dirty；旧记录重新托管后独立发起条目同步，不复用迁走对象的同步 Promise。
 

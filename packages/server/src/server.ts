@@ -266,11 +266,9 @@ export class PaneServer {
     }
   }
   private mainTreeRows(): MainTreeRow[] {
-    return this.sessions.mainSessionCatalog().map((info) => {
-      let holds: { source: string; reason: string }[] | undefined;
-      try { holds = this.sessions.snapshot(info.ref.id).holds; } catch { /* 未打开的存档只有目录元数据。 */ }
-      return { info, ...this.mainTreeMetadata.get(info.ref.id), ...(holds ? { holds } : {}) };
-    });
+    return this.sessions.mainSessionCatalog().map((info) => ({
+      info, ...this.mainTreeMetadata.get(info.ref.id), ...this.sessions.mainSessionDetails(info.ref.id),
+    }));
   }
   private disposeClient(client: Client): void {
     this.plugins.presence.disconnect(client.id);

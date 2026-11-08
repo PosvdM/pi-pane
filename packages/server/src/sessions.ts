@@ -169,6 +169,12 @@ export class Sessions {
     for (const session of this.records.values()) all.set(session.id, this.mainInfo(session));
     return structuredClone([...all.values()]);
   }
+  mainSessionDetails(id: string): { holds: { source: string; reason: string }[]; messageCount: number; lastActivityAt: string } | undefined {
+    const session = this.records.get(id); if (!session) return undefined;
+    return { holds: [...session.holds.values()].map((hold) => ({ ...hold })),
+      messageCount: session.model.entries.filter((entry) => entry.type === "message").length,
+      lastActivityAt: new Date(session.lastActive).toISOString() };
+  }
   mainSessions(source: string): MainSessionsApi {
     return {
       list: () => [...this.records.values()].filter((session) => !!session.handle).map((session) => this.mainInfo(session)),
@@ -366,7 +372,7 @@ export class Sessions {
         session.dirty = false; const model = session.model; const epoch = model.epoch; const since = model.entries.at(-1)?.id; const handle = session.handle;
         const response = await handle.send({ type: "get_entries", ...(since ? { since } : {}) });
         if (epoch !== model.epoch || session.model !== model || session.handle !== handle) continue;
-        const data = response.data as any; model.append(data.entries, data.leafId);
+        const data = response.data as any; model.append(data.entries, data.leafId); this.mainChanged();
       }
     })().finally(() => { session.syncing = undefined; });
     return session.syncing;
