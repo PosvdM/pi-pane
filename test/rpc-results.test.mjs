@@ -45,7 +45,7 @@ for (const type of ["stop", "close"]) test(`挂起的扩展 RPC 经 pane ${type}
     let result = await request(server, token, route, stop);
     if (result.value.status === "pending") result = await until(async () => { const r = await request(server, token, route, stop); return r.value.status !== "pending" && r; });
     assert.equal(result.code, 200, JSON.stringify(result)); assert.equal(result.value.status, "done");
-    assert.ok(result.value.stopReport); assert.deepEqual(result.value.stopReport.leftovers, []);
+    assert.ok(server.sessions.reports.at(-1)); assert.deepEqual(server.sessions.reports.at(-1).leftovers, []); assert.equal("stopReport" in result.value, false);
     assert.equal(await isSameProcess(writer), "gone"); assert.equal((await probeSessionWriterLock(state.sessionFile)).held, false);
     const final = await until(async () => { const r = await request(server, token, route, body); return r.value.status !== "pending" && r; });
     assert.equal(final.code, 503); assert.equal(final.value.error, "rpcResultUnknown");
