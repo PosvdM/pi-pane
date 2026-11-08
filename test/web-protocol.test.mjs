@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID, randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile, utimes, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile, utimes, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TrustDecisions } from "../packages/server/dist/trust.js";
@@ -20,6 +20,104 @@ async function subscribed(client, state) {
   client.subscribe(state); client.ws.send(JSON.stringify({ type: "ping" }));
   await until(() => client.messages.filter(m => m.type === "pong").length > count);
 }
+
+test("终端专用命令在未托管时拒绝，不启动 pi 或请求模型", { timeout: 30000 }, async () => {
+  const f = await piFixture(quick); const server = await startServer(f);
+  try {
+    const token = await pair(server); const state = await open(server, token, f);
+    const names = ["settings", "trust", "tree", "reload", "login", "logout", "import", "bug", "scoped-models",
+      "share", "copy", "changelog", "hotkeys", "llama", "mcp", "debug", "arminsayshi", "dementedelves"];
+    for (const type of ["prompt", "steer", "follow_up"]) for (const name of names) {
+      for (const draft of [undefined, [{ type: "text", text: "/" + name + " 参数" }]]) {
+        const result = await control(server, token, state, { type, message: draft ? "不能覆盖草稿" : "/" + name }, draft ? { draft } : {});
+        assert.equal(result.code, 400, JSON.stringify(result));
+        assert.equal(result.value.error, "unsupportedCommand");
+        assert.equal(result.value.message, "pi-pane 不支持 /" + name + "，请在终端中使用 pi");
+      }
+    }
+    const current = await snapshot(server, token, state.ref.id);
+    assert.equal(current.hosted, false); assert.equal(current.controlRevision, state.controlRevision);
+    assert.equal(server.sessions.records.get(state.ref.id).handle, undefined);
+    assert.deepEqual(await readdir(path.join(f.root, "pane/run")), []);
+    await assert.rejects(stat(path.join(f.root, "requests.jsonl")), { code: "ENOENT" });
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+test("delivery 只接受 prompt 的两种取值，拒绝时不启动 pi", { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f);
+  try {
+    const token = await pair(server); const state = await open(server, token, f);
+    const types = ["steer", "follow_up", "stop", "close", "restart", "set_model", "set_thinking_level",
+      "compact", "new_session", "fork", "clone", "set_session_name", "export"];
+    for (const type of types) {
+      const result = await control(server, token, state, { type, message: "输入", delivery: "followUp" });
+      assert.equal(result.code, 400, JSON.stringify(result)); assert.equal(result.value.error, "invalidCommand");
+    }
+    for (const delivery of ["follow_up", "", null, 1, true]) {
+      const result = await control(server, token, state, { type: "prompt", message: "输入", delivery });
+      assert.equal(result.code, 400); assert.equal(result.value.error, "invalidCommand");
+    }
+    assert.deepEqual(await readdir(path.join(f.root, "pane/run")), []);
+    await assert.rejects(stat(path.join(f.root, "requests.jsonl")), { code: "ENOENT" });
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+test("已托管的同名扩展命令优先于终端限制，提示模板按 delivery 排队", { timeout: 30000 }, async () => {
+  const f = await piFixture({ fallback: { segments: [{ type: "hang" }] } });
+  await mkdir(path.join(f.agentDir, "prompts"));
+  await writeFile(path.join(f.agentDir, "prompts", "pane-queue.md"), "模板展开：$ARGUMENTS");
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  try {
+    const token = await pair(server); let state = await ready(server, token, f);
+    const route = "/api/sessions/" + state.ref.id + "/query";
+    const commands = await request(server, token, route, { type: "commands" });
+    assert.ok(commands.value.commands.some(command => command.name === "debug" && command.source === "extension"));
+    assert.ok(commands.value.commands.some(command => command.name === "pane-queue" && command.source === "prompt"));
+    const records = async () => (await readFile(path.join(f.root, "requests.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+    let result = await control(server, token, state, { type: "prompt", message: "保持运行" });
+    assert.equal(result.code, 200, JSON.stringify(result));
+    state = result.value.snapshot;
+    await until(async () => (await records()).some(record => record.kind === "hang"));
+    const source = server.sessions.records.get(state.ref.id); const calls = []; const responses = [];
+    const send = source.handle.send.bind(source.handle);
+    source.handle.send = async (command, options) => {
+      const response = await send(command, options); calls.push(command); responses.push(response); return response;
+    };
+    result = await control(server, token, await snapshot(server, token, state.ref.id), { type: "prompt", message: "/debug 扩展已执行", delivery: "followUp" });
+    assert.equal(result.code, 200, JSON.stringify(result)); assert.deepEqual(result.value.result, { handled: true });
+    assert.equal((await request(server, token, route, { type: "state" })).value.sessionName, "扩展已执行");
+    assert.equal(calls.filter(command => command.type === "get_commands").length, 1);
+    for (const type of ["prompt", "steer", "follow_up"]) {
+      const before = calls.length;
+      result = await control(server, token, await snapshot(server, token, state.ref.id), { type, message: "/settings" });
+      assert.equal(result.code, 400); assert.equal(result.value.error, "unsupportedCommand");
+      assert.deepEqual(calls.slice(before).map(command => command.type), ["get_commands"]);
+    }
+    result = await control(server, token, await snapshot(server, token, state.ref.id), { type: "prompt", message: "/pane-queue 未指定" });
+    assert.equal(result.code, 409); assert.equal(result.value.error, "rpcRejected");
+    assert.match(result.value.message, /already processing/);
+    const controlRoute = "/api/sessions/" + state.ref.id + "/control";
+    for (const delivery of ["followUp", "steer"]) {
+      state = await snapshot(server, token, state.ref.id);
+      const body = { requestId: randomUUID(), expectedEpoch: state.cursor.epoch, expectedRevision: state.controlRevision,
+        command: { type: "prompt", delivery }, draft: [{ type: "text", text: "/pane-queue " + delivery }] };
+      result = await request(server, token, controlRoute, body);
+      assert.equal(result.code, 200, JSON.stringify(result));
+      const index = calls.findLastIndex(command => command.type === "prompt");
+      assert.equal(calls[index].streamingBehavior, delivery); assert.equal("delivery" in calls[index], false);
+      assert.equal(responses[index].data.disposition, "queued");
+      assert.deepEqual((await request(server, token, controlRoute, body)).value, result.value);
+      const conflict = await request(server, token, controlRoute, { ...body,
+        command: { ...body.command, delivery: delivery === "steer" ? "followUp" : "steer" } });
+      assert.equal(conflict.code, 409); assert.equal(conflict.value.error, "idempotencyConflict");
+    }
+    assert.equal((await request(server, token, route, { type: "state" })).value.pendingMessages, 2);
+    assert.equal((await records()).filter(record => record.kind === "request").length, 1);
+    const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped));
+    assert.deepEqual([...stopped.value.clearedText].sort(), ["模板展开：followUp", "模板展开：steer"].sort());
+  } finally { await server.close(); await f.cleanup(); }
+});
 
 test("HTTP 会话列表、快照与所有查询只返回 pane 类型", { timeout: 30000 }, async () => {
   const f = await piFixture(quick); const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });

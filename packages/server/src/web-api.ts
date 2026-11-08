@@ -84,7 +84,10 @@ export interface PaneOpenResult extends PaneSessionView {
 
 /** POST /api/sessions/:id/control 的请求。命令名沿用 development.md 的控制命令表。 */
 export type PaneControlCommand =
-  | { type: "prompt" | "steer" | "follow_up"; message?: string }
+  | { type: "prompt"; message?: string;
+      // 会话运行中发送技能、提示模板等经 prompt 展开的输入时使用；扩展命令立即执行，忽略此字段。
+      delivery?: "steer" | "followUp" }
+  | { type: "steer" | "follow_up"; message?: string }
   | { type: "stop" }
   | { type: "close"; confirmHolds?: boolean }
   | { type: "restart"; assumeNoWriter?: boolean }

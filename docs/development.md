@@ -33,6 +33,7 @@
 | `packages/server/src/hostkit-cleanup.ts` | hostkit 拒绝中的清理事实识别及同步、异步调用观察 |
 | `packages/server/src/inflight.ts` | 实例共用的关闭门禁、在途操作与资源 owner 登记、限时排空、登记来源诊断、超时失败闩及终止释放检查 |
 | `packages/server/src/pi-rpc.ts` | pi 主会话的原生 RPC 信封；不属于通用插件契约 |
+| `packages/server/src/pi-commands.ts` | pi 1.5.0 终端专用命令名单与消息开头识别；由会话控制在启动前检查 |
 | `packages/server/src/model.ts` | 活动分支、inFlight、同步快照切点、事件缓冲和游标 |
 | `packages/server/src/store.ts` | 只读 v1/v2/v3 解析、pi 会话目录和列表、临时副本 fork |
 | `packages/server/src/assets.ts` | 上传资源、草稿编码、历史图片引用、缓存与清理 |
@@ -124,6 +125,10 @@ node --test --test-concurrency=1 test/web-*.test.mjs test/ui-extension.test.mjs 
 
 控制命令包括 prompt、steer、follow_up、stop、close、restart、set_model、set_thinking_level、compact、new_session、fork、clone、set_session_name、export。`export` 使用普通控制队列，校验 `expectedEpoch` 和 `expectedRevision`；服务端向 pi 发送 `export_html`，固定 `outputPath` 为数据目录下 `tmp/exports/<128 位随机 base64url id>.html`。下载标识必须为规范的 22 字符 base64url，且已由本实例生成；响应类型为 `text/html; charset=utf-8`，以 `pi-session.html` 作为附件文件名。
 
+`prompt` 可带 `delivery: "steer" | "followUp"`，由 `web-adapter.ts` 映射为 pi RPC 的 `streamingBehavior`，用于运行中技能、提示模板展开后的送达。扩展命令立即执行，忽略送达字段。非 `prompt` 命令携带 `delivery`，或字段值无效时，返回 400 `invalidCommand`。`delivery` 参与原请求的幂等内容摘要；同一 `requestId` 改变该字段返回 409 `idempotencyConflict`。
+
+`Sessions.command` 在启动 pi 前检查 `prompt`、`steer`、`follow_up` 的实际消息文本，草稿按编码结果检查。命中终端专用名单时，未托管会话直接返回 400 `unsupportedCommand`，不创建运行记录、不发给模型；已托管会话每次查询 `get_commands`，同名扩展、技能或提示模板优先，否则拒绝。名单依据、命令分工和拒绝提示见 [architecture.md 的“斜杠命令”](architecture.md#斜杠命令)。
+
 控制受理结果为 `{status:"accepted",snapshot,result?}`。`result` 仅包含 `handled`、`cancelled` 或 `exportId`；输入被扩展消费时 `handled` 为 true，`new_session`、`fork`、`clone` 被取消时 `cancelled` 为 true。`stop`/`close` 的 `done` 结果只含 `clearedText` 和 `clearedDrafts`，停止诊断由服务端内部 `reports` 保存。图片使用草稿节点，不接受命令中直接提供 base64 images。restart 只用于中断的会话，不允许借重启绕过最近修改警告或其他宿主写锁。上一个写者状态不明时，浏览器须经用户确认后才能在 restart 命令中附上 assumeNoWriter: true。
 
 `/bridge/launch` 和 `/bridge/event` 是独立的进程级 Agent 通道，不能使用浏览器凭证；其 token 也不能调用 `/api/*`。
@@ -202,7 +207,7 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 | 审查回归 R1–R7、R9 | `test/web-e2e-regressions.test.mjs`：快速切换提交末次草稿、慢 touch 保留编辑（R1）；命令分发与冲突（R2）；两页名称/思考同步（R3）；离线待答对账、UI/信任回答失败保留与同请求重试（R4）；真实执行后丢弃 HTTP 响应仍只执行一次（R5）；迟到 open 不改当前选择与 lastSession（R6）；持久化工具卡片显示第二次等长 partialResult（R7）；旧快照挂起时同会话新导航和另一会话均继续收取最终事件（R9） |
 | 审查回归 R8、R10、R11 | `test/web-device-key.test.mjs` 检查登录初始化、跨页串行化与生产签名路径（R8、R10、R11）；`test/web-e2e-images.test.mjs` 比较原图与磁盘图片字节哈希，交换两图必须失败（R11） |
 
-`test/web-api.test.mjs`、`test/web-protocol.test.mjs` 验证 pane 类型转换、查询、控制结果、导出鉴权和 UI 回答生命周期；`test/web-state-sync.test.mjs` 验证状态缓存提交、事件合并及代次隔离。这些接口测试不能替代对应的浏览器交互测试。
+`test/web-api.test.mjs`、`test/web-protocol.test.mjs` 验证 pane 类型转换、查询、控制结果、导出鉴权和 UI 回答生命周期。`web-protocol` 还验证未托管终端命令被服务端拒绝且无运行记录和模型请求、已托管的同名 `debug` 扩展命令立即执行、隔离 agent 目录下 `prompts/*.md` 模板在运行中按两种 `delivery` 展开排队、缺少送达字段时由 pi 拒绝，以及字段校验与幂等内容冲突；`test/web-state-sync.test.mjs` 验证状态缓存提交、事件合并及代次隔离。这些接口测试不能替代对应的浏览器交互测试。
 
 ### 共用测试约定
 

@@ -6,8 +6,9 @@ import { stopByIdentity, probeSessionWriterLock, type ProcessIdentity, type Stop
 import type { DraftNode, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
 import type { ControlRequest } from "./pi-rpc.js";
 import type { PaneSessionList, PaneSessionView, PaneQueryResults, PaneQueryType, PaneUiAnswerRequest, PaneUiAnswerResult, PaneUiRequest, PaneServerMessage } from "./web-api.js";
-import { isPaneQueryType, isUiDialog, queryCommands, toPaneOutcome, toPaneQuery, toPaneSessionListItem, toPaneState, toPaneUiRequest, toPiUiAnswer, type PaneUiDialog } from "./web-adapter.js";
+import { isPaneQueryType, isUiDialog, queryCommands, toPaneOutcome, toPaneQuery, toPaneSessionListItem, toPaneState, toPaneUiRequest, toPiControlCommand, toPiUiAnswer, type PaneUiDialog } from "./web-adapter.js";
 import { ExportStore } from "./exports.js";
+import { terminalOnlyCommand } from "./pi-commands.js";
 import { AssetStore } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { ControlQueue, RequestLedger } from "./control.js";
@@ -164,6 +165,7 @@ export class Sessions {
     return this.ledger.execute(request.requestId, { sessionId: id, ...request }, () => this.inflight.run("sessions.command", () => this.record(id).control.run(async (signal) => {
       let session = this.record(id); const model = session.model; const command = request.command;
       assert(command && mutations.has(command.type), "unsupportedCommand", "不支持此会话控制命令");
+      let rpc = toPiControlCommand(command);
       assert(request.expectedEpoch === model.epoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
       assert(request.expectedRevision === model.controlRevision, "revisionChanged", "会话状态已变化，请重新确认", 409);
       session.lastActive = Date.now(); const requestedFile = fileKey(session.file);
@@ -176,18 +178,33 @@ export class Sessions {
       if (command.type === "stop") return this.stop(session, false, session.control.preempt());
       assert(model.inFlight.phase !== "stopping", "stopping", "正在停止，请稍后重试", 409);
       signal.throwIfAborted();
+      let encoded: ReturnType<AssetStore["encode"]> | undefined;
+      if (["prompt", "steer", "follow_up"].includes(command.type)) {
+        assert(!("images" in command), "invalidImages", "图片必须使用上传后的草稿节点");
+        // 编码后检查实际发送的文本；模型图片能力在启动并读取状态后校验。
+        if (request.draft) { encoded = this.assets.encode(request.draft, true); rpc = { ...rpc, ...encoded }; }
+        assert(typeof rpc.message === "string" && Buffer.byteLength(rpc.message) <= 1024 * 1024, "invalidMessage", "消息文本无效或超过 1 MiB");
+        const name = terminalOnlyCommand(rpc.message);
+        if (name) {
+          const handle = session.handle;
+          let available = false;
+          if (handle?.acceptingInput) {
+            const response = await handle.send({ type: "get_commands" });
+            signal.throwIfAborted();
+            assert(session.handle === handle && handle.acceptingInput && session.model === model && model.epoch === request.expectedEpoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
+            assert(response.success, "rpcRejected", response.error ?? "pi 拒绝查询", 409);
+            available = toPaneQuery("commands", response.data).commands.some(candidate => candidate.name === name);
+          }
+          assert(available, "unsupportedCommand", `pi-pane 不支持 /${name}，请在终端中使用 pi`);
+        }
+      }
       if (!session.handle) await this.start(session, false, signal);
       signal.throwIfAborted();
       assert(fileKey(session.file) === requestedFile, "epochChanged", "会话启动期间已切换，请重新确认目标会话", 409);
       assert(session.handle?.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪，不能发送输入", 409);
-      let rpc = { ...command };
-      if (["prompt", "steer", "follow_up"].includes(command.type)) {
-        assert(!("images" in command), "invalidImages", "图片必须使用上传后的草稿节点");
-        if (request.draft) {
-          const encoded = this.assets.encode(request.draft, session.state?.model?.input?.includes("image") === true);
-          rpc = { ...rpc, ...encoded }; session.drafts.set(encoded.message, structuredClone(request.draft));
-        }
-        assert(typeof rpc.message === "string" && Buffer.byteLength(rpc.message) <= 1024 * 1024, "invalidMessage", "消息文本无效或超过 1 MiB");
+      if (encoded) {
+        assert(!encoded.images.length || session.state?.model?.input?.includes("image") === true, "imageUnsupported", "当前模型不支持图片，请切换模型");
+        session.drafts.set(encoded.message, structuredClone(request.draft!));
       }
       let exported: Awaited<ReturnType<ExportStore["allocate"]>> | undefined;
       if (command.type === "export") {

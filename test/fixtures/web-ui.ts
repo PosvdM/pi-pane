@@ -3,6 +3,7 @@ export default function(pi) {
   pi.on("session_before_switch", () => cancelTransitions ? { cancel: true } : undefined);
   pi.on("session_before_fork", () => cancelTransitions ? { cancel: true } : undefined);
   pi.registerCommand("pane-web-ready", { handler: async () => {} });
+  pi.registerCommand("debug", { handler: async (args) => { pi.setSessionName(args); } });
   pi.registerCommand("pane-web-state", { handler: async (args) => {
     const [kind, value] = args.split(" ");
     if (kind === "thinking") pi.setThinkingLevel(value);

@@ -1,6 +1,6 @@
 import type { NodeStatus } from "@pi-pane/plugin-api";
 import { assert } from "./errors.js";
-import type { ExtensionUiRequest } from "./pi-rpc.js";
+import type { ControlRequest, ExtensionUiRequest } from "./pi-rpc.js";
 import type {
   PaneCommandOutcome, PaneModel, PaneQueryResults, PaneQueryType, PaneSessionListItem,
   PaneSessionState, PaneUiRequest,
@@ -56,6 +56,14 @@ export function toPaneQuery<T extends PaneQueryType>(type: T, data: any): PaneQu
     default: throw new Error("会话查询类型无效");
   }
   return result as PaneQueryResults[T];
+}
+export function toPiControlCommand(command: ControlRequest["command"]): ControlRequest["command"] {
+  const { delivery, ...rpc } = command;
+  if ("delivery" in command) {
+    assert(command.type === "prompt" && (delivery === "steer" || delivery === "followUp"), "invalidCommand", "delivery 仅适用于 prompt，取值为 steer 或 followUp");
+    rpc.streamingBehavior = delivery;
+  }
+  return rpc;
 }
 export function toPaneOutcome(type: string, data: any): PaneCommandOutcome | undefined {
   if (["prompt", "steer", "follow_up"].includes(type) && data?.disposition === "handled") return { handled: true };

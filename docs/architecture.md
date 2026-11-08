@@ -413,8 +413,10 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 | `/resume` | 打开 pi-pane 的会话列表 |
 | `/session` | 显示 `get_state` 和 `get_session_stats` 的信息 |
 | `/quit` | 关闭会话 |
-| `get_commands` 返回的扩展命令、技能、提示模板 | 原样通过 `prompt` 发送 |
-| 其他（如 `/settings`、`/tree`、`/reload`、`/login`） | 不发送，提示“pi-pane 不支持 /xxx，请在终端中使用 pi” |
+| `get_commands` 返回的扩展命令、技能、提示模板 | 原样通过 pane `prompt` 发送；运行中可携带 `delivery: "steer"` 或 `"followUp"`。技能和模板展开后按该方式排队，扩展命令立即执行并忽略送达字段 |
+| 终端专用内置命令（如 `/settings`、`/tree`、`/reload`、`/login`、`/import`、`/trust`、`/bug`） | 服务端在启动 pi 之前检查；未托管时直接返回 400 `unsupportedCommand`，提示“pi-pane 不支持 /xxx，请在终端中使用 pi”。已托管时先查询 `get_commands`，存在同名资源命令则允许发送，否则拒绝且不发给模型 |
+
+服务端在 `packages/server/src/pi-commands.ts` 维护终端专用命令名单，依据 pi 1.5.0 的内置命令列表和交互命令分发，排除上表中由 pi-pane 实现的命令。检查覆盖 `prompt`、`steer`、`follow_up` 的实际文本，包括草稿编码结果；同名资源命令的存在性每次查询，不缓存到下一次会话绑定。pane `prompt.delivery` 在服务端映射为 pi RPC 的 `streamingBehavior`，只接受 `"steer"` 和 `"followUp"`；其他控制命令携带此字段时返回 400 `invalidCommand`。字段属于幂等命令内容，不能用同一 `requestId` 改变送达方式。
 
 输入 `/` 时，补全列表包含上表的内置命令和 `get_commands` 返回的命令（显示 `description` 和来源）。会话的扩展重新加载或切换后重新获取。
 
