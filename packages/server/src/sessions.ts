@@ -14,6 +14,7 @@ import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
+import { firstUserText, normalizeSessionName, sessionTitle } from "./session-title.js";
 
 interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
@@ -140,7 +141,7 @@ export class Sessions {
     this.knownMain.clear();
     for (const row of rows) if (typeof row.id === "string" && typeof row.path === "string" && typeof row.cwd === "string") this.knownMain.set(row.id, {
       ref: { source: "pane", id: row.id }, nodeId: `pane:session:${row.id}`, cwd: row.cwd,
-      sessionFile: row.path, title: row.name ?? row.firstMessage ?? row.id, hosted: false, status: "idle",
+      sessionFile: row.path, title: sessionTitle(row.name, row.firstUserText ?? row.firstMessage, row.id), hosted: false, status: "idle",
     });
     this.mainChanged(); return rows;
   }
@@ -148,15 +149,10 @@ export class Sessions {
     let holds = this.pluginHolds.get(id); if (!holds) { holds = new Map(); this.pluginHolds.set(id, holds); } return holds;
   }
   private fallbackTitle(session: HostedSession): string {
-    const message = session.model.entries.find((entry) => entry.type === "message" && entry.message?.role === "user")?.message;
-    const content = message?.content;
-    const text = typeof content === "string" ? content : Array.isArray(content) ? content.filter((block: any) => block?.type === "text").map((block: any) => block.text ?? "").join("\n") : "";
-    let title = ""; let length = 0;
-    for (const character of text.trim()) { if (length++ === 200) break; title += character; }
-    return title || session.id;
+    return sessionTitle(undefined, firstUserText(session.model.entries), session.id);
   }
   private setName(session: HostedSession, value: string | undefined): void {
-    session.name = { value: typeof value === "string" ? value.trim() || undefined : undefined };
+    session.name = { value: normalizeSessionName(value) };
   }
   private readName(session: HostedSession, entries: Entry[]): void {
     const info = entries.findLast((entry) => entry.type === "session_info");

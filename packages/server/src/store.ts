@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { readFile, copyFile, mkdtemp, rm, writeFile, mkdir, readdir } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { comparisonKey, realPathOrPending, type PiInstall } from "pi-hostkit";
 import { assert } from "./errors.js";
+import { firstUserText } from "./session-title.js";
 
 export interface Entry { type: string; id: string; parentId: string | null; [key: string]: any }
 export interface SessionFile { header?: Record<string, any>; entries: Entry[]; leafId: string | null; diagnostics: string[] }
@@ -50,6 +53,18 @@ export function branch(entries: readonly Entry[], leafId: string | null): Entry[
 export function fileKey(file: string): string {
   return comparisonKey(realPathOrPending(file));
 }
+/** 目录占位有歧义时，只读到首条文本即关闭文件，不再读余下存档。 */
+async function readFirstUserText(file: string): Promise<string> {
+  const input = createReadStream(file, { encoding: "utf8" }); const lines = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      let entry: Entry; try { entry = JSON.parse(line); } catch { continue; }
+      if (!entry || typeof entry !== "object") continue;
+      const text = firstUserText([entry]); if (text) return text;
+    }
+    return "";
+  } finally { lines.close(); input.destroy(); }
+}
 export class PiStore {
   private modules?: Promise<any>;
   constructor(readonly install: PiInstall, readonly agentDir: string, readonly tmpDir: string, private readonly env: NodeJS.ProcessEnv = process.env) {}
@@ -78,7 +93,20 @@ export class PiStore {
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
     for (const cwd of cwds) add(await pi.SessionManager.list(cwd, await this.sessionDir(cwd)));
-    return [...unique.values()];
+    const rows: any[] = [];
+    for (const row of unique.values()) {
+      let text = typeof row.firstMessage === "string" ? row.firstMessage : "";
+      if (text === "(no messages)") {
+        if (row.messageCount === 0 || typeof row.allMessagesText === "string" && !row.allMessagesText.includes(text)) text = "";
+        else {
+          // 占位值也可能是用户真的输入的文本；仅此歧义需要只读复核。
+          try { text = await readFirstUserText(row.path); }
+          catch (error) { console.warn(`无法读取会话标题：${row.path}`, error); continue; }
+        }
+      }
+      rows.push({ ...row, firstUserText: text });
+    }
+    return rows;
   }
   async fork(source: string, cwd: string, sessionDir: string): Promise<string> {
     await mkdir(this.tmpDir, { recursive: true }); await mkdir(sessionDir, { recursive: true });
