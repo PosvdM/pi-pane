@@ -41,7 +41,40 @@
 | `packages/bridge-extension/src/` | 会话替换和写锁回报、信任决定、就绪握手、图片顺序还原 |
 | `packages/web/` | Vite 与 Preact 浏览器界面、会话事件投影、草稿和 IndexedDB 设备密钥管理 |
 
-设备密钥由浏览器生成，私钥不可导出。签名格式见 [plugin-api.md 的“签名格式”](plugin-api.md#签名格式)。`userPresence` 确认流程和插件运行时未接入。
+## 前端结构
+
+下表路径均相对于 `packages/web/src/`。
+
+| 路径 | 职责 |
+| --- | --- |
+| `app.tsx`、`main.tsx`、`style.css` | 应用入口、配对页与主界面装配、全局样式 |
+| `lib/api.ts`、`lib/auth.ts` | HTTP 调用与错误、配对、标签页凭证共享和失效处理 |
+| `lib/ws.ts` | WebSocket 首帧鉴权、断线重连和游标续订 |
+| `lib/session.ts`、`lib/session-model.ts` | 会话导航、快照、控制命令与状态查询；按游标投影会话事件 |
+| `lib/draft.ts`、`lib/images.ts`、`lib/blobs.ts` | 图文草稿运算、图片缩放与上传、鉴权取图及 blob URL 缓存 |
+| `lib/markdown.ts` | 不可信 Markdown 的链接过滤、远程图片替代和代码高亮 |
+| `lib/device-key.ts`、`lib/jcs.ts` | IndexedDB 设备密钥、签名与 RFC 8785 规范 JSON |
+| `lib/events.ts`、`lib/ui-state.ts` | 扩展 UI 与信任询问事件、对话框和提示状态 |
+| `lib/settings.ts`、`lib/actions.ts` | 本地界面偏好、导出下载和侧栏开关 |
+| `lib/store.ts`、`lib/types.ts` | 可订阅状态容器、前端协议类型出口 |
+| `components/Sidebar.tsx`、`components/Chat.tsx` | 按项目分组的会话列表、聊天记录与会话状态布局 |
+| `components/Composer.tsx`、`components/Message.tsx` | 输入框、图片占位符与命令补全；消息、思考和工具卡片渲染 |
+| `components/Dialogs.tsx`、`components/Overlays.tsx` | 扩展对话框、信任询问和确认；设置、模型、思考级别及会话操作弹层 |
+
+前端只以 `import type` 引用 `web-api.ts` 与 `@pi-pane/plugin-api` 的类型，`lib/types.ts` 用 `export type` 汇总，不把服务端实现打入浏览器包，也不解析 pi 原始 RPC 信封或会话文件。`session-model.ts` 按 [plugin-api.md 的“事件流”](plugin-api.md#事件流)游标规则投影会话事件。
+
+### 运行时约束
+
+修改前端代码时须保持以下行为：
+
+- **快照与续订**：先取得快照，再从其游标订阅；断线按最后游标续订，收到 `resync`、游标跳号或 epoch 不符时重新取快照并重新订阅，避免增量重复或缺失。
+- **导航代次**：打开、重取快照及其事件屏障须绑定会话和导航代次；只有最后一次导航能提交视图、错误、订阅和最近会话记录，旧请求不能覆盖新选择或屏蔽新会话事件。
+- **控制重试**：`pending` 每秒用同一请求体查询结果；网络错误也复用原 `requestId` 和完整请求体，网络重试窗口为发起控制后的 120 秒。超出窗口提示用户先核对会话再决定是否重发，不能把响应丢失直接当成未执行。
+- **并发冲突**：收到 409 `revisionChanged` 后重取快照并保留输入，由用户重新确认送达方式或重新执行命令；不能自动用新 revision 重发，以免把旧意图应用到已变化的状态。
+- **扩展对话框**：服务端保存权威待答记录，每次订阅前清空本地对话框副本并等待服务端重发，避免显示离线期间已被其他标签页回答的问题。HTTP 回答失败时保留问题，相同答案重试复用请求体和 `requestId`。
+- **草稿保存**：编辑时立即捕获节点，延迟 300 毫秒写入按会话区分的 `localStorage`；切换会话或卸载时同步提交捕获内容并取消计时器，不能把缺失的 DOM ref 当成空草稿。恢复图片草稿先显示内容，异步 touch 仅标记仍在 DOM 中的过期图片，不覆盖等待期间的编辑。
+- **图片编辑**：图片节点通过 `execCommand` 插入、删除和移动，保留 Chrome 原生撤销与重做；插入时暂去节点 class，完成后恢复，避免 Chrome 复制计算样式并生成违反 CSP 的内联样式。
+- **设备密钥**：登录后的应用初始化读取或生成不可导出的私钥，不依赖打开设置页；生成和重置通过同源 Web Locks 串行化，避免多个标签页各自写入不同密钥。签名格式见 [plugin-api.md 的“签名格式”](plugin-api.md#签名格式)，`userPresence` 确认流程与插件运行时属于 M3。
 
 ## 浏览器测试
 
@@ -53,19 +86,19 @@
 - `assertNoPageErrors(page, whitelist)` 检查控制台 error、未处理页面异常和 CSP 违规；白名单接受正则或正则数组。
 - `screenshot(page, name)` 仅在 `PANE_SCREENSHOTS` 设置为目录时保存整页截图，文件名为 `<name>.png`。目录不存在时自动创建。
 
-`test/web-logic.test.mjs` 在 Node.js 24 中直接导入前端 `.ts` 模块，验证会话投影、草稿和 RFC 8785 向量。`test/web-device-key.test.mjs` 在真实 Chrome 中验证不可导出私钥的 IndexedDB 往返、JCS 规范数据的签名与 Node.js 验签，以及 CSP 下设置页的设备 ID。
+`test/web-logic.test.mjs` 在 Node.js 24 中直接导入前端 `.ts` 模块。浏览器交互、生产设备密钥与 Node.js 补充签名测试的关键断言见[自动化验收映射](#自动化验收映射)。
 
 `test/fixtures/ui-extension.ts` 提供 `/pane-dialogs`、`/pane-dialog-timeout` 和 `/pane-widgets`，分别触发顺序对话框、1500 毫秒超时选择框和扩展组件请求。调用方从 `helpers.mjs` 导入 `providerPath` 与 `uiExtensionPath`，以 `startServer(fixture, { extraExtensions: [providerPath, uiExtensionPath] })` 加载；`piFixture()` 不默认加载此扩展。对话框测试须在启动服务前将 `fixture.env.PANE_UI_LOG` 设置为临时现场中的日志路径。扩展将每个结果以 `{method,result}` JSONL 追加到该文件，取消或超时的 `undefined` 结果记录为 `null`。
 
 构建后可执行：
 
 ```sh
-node --test --test-concurrency=1 test/web-logic.test.mjs test/ui-extension.test.mjs test/web-device-key.test.mjs test/reconnect.test.mjs
+node --test --test-concurrency=1 test/web-*.test.mjs test/ui-extension.test.mjs test/reconnect.test.mjs
 ```
 
 设置 `PANE_SCREENSHOTS` 可保留浏览器测试截图；`PANE_UI_LOG` 用于核对真实 pi 扩展收到的对话框响应，两者均不改变生产配置。
 
-## M1 HTTP 接口
+## HTTP 接口
 
 所有请求校验 Host；带 Origin 时也校验 Origin。只有 `GET /api/instance`、`POST /api/auth/pair` 和可选的静态 Web 资源无需浏览器凭证。其他 `/api/*` 请求使用 `Authorization: Bearer <credential>`。
 
@@ -87,7 +120,7 @@ node --test --test-concurrency=1 test/web-logic.test.mjs test/ui-extension.test.
 | `POST /api/assets/touch` | `{requestId,assetIds}` 延长资源期限 |
 | `GET /api/assets/:hash`、`GET /api/assets/:hash/thumb`、`GET /api/blobs/:hash` | 带凭证按哈希取图 |
 
-M2 协议变更：/query、/ui、控制结果、会话列表改为 web-api.ts 的 pane 类型。浏览器只依赖 `packages/server/src/web-api.ts`；pi 原始 RPC 形状仅在服务端使用，会话流和 entries 沿用 plugin-api.md。
+`/query`、`/ui`、控制结果和会话列表使用 `web-api.ts` 定义的 pane 类型；pi 原始 RPC 形状仅在服务端使用，会话流和 entries 遵循 plugin-api.md。
 
 控制命令包括 prompt、steer、follow_up、stop、close、restart、set_model、set_thinking_level、compact、new_session、fork、clone、set_session_name、export。`export` 使用普通控制队列，校验 `expectedEpoch` 和 `expectedRevision`；服务端向 pi 发送 `export_html`，固定 `outputPath` 为数据目录下 `tmp/exports/<128 位随机 base64url id>.html`。下载标识必须为规范的 22 字符 base64url，且已由本实例生成；响应类型为 `text/html; charset=utf-8`，以 `pi-session.html` 作为附件文件名。
 
@@ -111,7 +144,7 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 
 ## WebSocket
 
-连接 `/ws` 后，第一帧为 `{type:"auth",ticket,paneProtocol:[1,1]}`。五秒内没有有效首帧即关闭，拒绝后不再处理任何帧。鉴权后第一条消息为 `banners`，M1 的数组为空，并附上协商版本和 connectionId。
+连接 `/ws` 后，第一帧为 `{type:"auth",ticket,paneProtocol:[1,1]}`。五秒内没有有效首帧即关闭，拒绝后不再处理任何帧。鉴权后第一条消息为 `banners`，插件宿主未接入时数组为空，并附上协商版本和 connectionId。
 
 订阅：`{type:"subscribe",ref:{source:"pane",id},after:{epoch,seq}}`。取消订阅：`{type:"unsubscribe",ref}`。事件使用 plugin-api.md 的会话流形状。
 
@@ -149,6 +182,30 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 | 项目信任 | trust：启动前询问、记住选择、保存 false、跨项目切换时及时询问、等待用户超过默认十秒仍保持写锁、无连接和超时返回 undecided |
 | 列表与回收边界 | store：环境/项目/全局目录优先级、默认项目分目录、已知项目在重启后保留；backpressure：慢连接合并与 resync，不阻塞其他连接 |
 
+### M2 前端核心
+
+下表列出真实 Chrome 端到端场景及补充的协议、纯逻辑测试；测试定义不等于本机或三平台 CI 的执行结果，运行时须确认 Chrome 未被跳过。
+
+| M2 验收项 | 测试文件与关键断言 |
+| --- | --- |
+| 配对 | `test/web-e2e-conversation.test.mjs`：配对后显示侧栏，地址栏移除配对码；`test/web-e2e-tabs.test.mjs` 通过共用 fixture 断言新标签页经 BroadcastChannel 取得同一凭证 |
+| 新建会话并完成一次对话 | `test/web-e2e-conversation.test.mjs`：页面新建、首次发送、信任询问后收到假 provider 完整回复，回复与磁盘一致，侧栏显示会话 |
+| 流式中断网再恢复 | `test/web-e2e-conversation.test.mjs`：Chrome 离线期间服务端游标继续推进；恢复后只显示一条完整回复，逐字与磁盘一致；`test/web-logic.test.mjs` 验证重复、跳号、epoch 和 resync |
+| 停止并取回排队消息 | `test/web-e2e-conversation.test.mjs`：两条纯文本 follow-up 按原顺序前置到现有草稿，队列消失，provider 收到 abort 且未执行排队请求；带图片的队列取回由 M1 的 `test/images.test.mjs` 验证服务端草稿，不代表浏览器交互覆盖 |
+| 扩展 UI 对话框 | `test/web-e2e-extension.test.mjs`：select、confirm、input、editor 的值与真实扩展日志一致；1500 毫秒超时关闭并记录 null；通知、widget、编辑器文字及跨标签页回答同步 |
+| 图片占位符往返 | `test/web-e2e-images.test.mjs`：两图上传资源与红、蓝原图哈希对应，复制为交错草稿，发送后磁盘块顺序与图片字节逐一对应，历史图片加载；粘贴恢复、退格重新编号和原生撤销/重做均有断言 |
+| 两个标签页并发发送 | `test/web-e2e-tabs.test.mjs`：真实 409 `revisionChanged` 后保留草稿且不自动重发，用户选择 follow-up 后以新 requestId 发送，模型与页面都只出现一次 |
+| 服务端重启后旧标签页回到配对页 | `test/web-e2e-tabs.test.mjs`：同端口重启改变 instanceId；旧页仍持旧凭证时新页不能继承；旧页收到真实 401 后清除 sessionStorage，两个页面均显示配对页 |
+| 设备密钥 | `test/web-device-key.test.mjs`：首次配对且未打开设置时生产 IndexedDB 已有不可导出 P-256 私钥，重载保留同一密钥，设置 ID 对应公钥哈希，Node 验证浏览器签名；并发初始化等待同一 Web Lock。Node 补充测试直接调用生产 `signPresence`，核对默认域、JCS 字节、P1363/base64url 编码、篡改拒绝和缺失密钥 |
+| 斜杠命令 | `test/web-e2e-extension.test.mjs`：内置与扩展命令补全、方向键、Tab 和拒绝 `/settings`；`test/web-e2e-regressions.test.mjs`：未托管时拒绝终端命令、运行中扩展命令固定走 prompt、内置命令冲突保留参数 |
+| 渲染安全与 CSP | `test/web-e2e-conversation.test.mjs`：恶意 HTML 与 javascript 链接按文本显示，无危险元素、属性或链接，代码块高亮；`test/fixtures/web-e2e.mjs` 在收尾检查页面异常、控制台 error 与 CSP 违规，预期网络或 409 错误须逐项列入白名单，图片编辑场景也使用该检查 |
+| 审查回归 R1–R7、R9 | `test/web-e2e-regressions.test.mjs`：快速切换提交末次草稿、慢 touch 保留编辑（R1）；命令分发与冲突（R2）；两页名称/思考同步（R3）；离线待答对账、UI/信任回答失败保留与同请求重试（R4）；真实执行后丢弃 HTTP 响应仍只执行一次（R5）；迟到 open 不改当前选择与 lastSession（R6）；持久化工具卡片显示第二次等长 partialResult（R7）；旧快照挂起时同会话新导航和另一会话均继续收取最终事件（R9） |
+| 审查回归 R8、R10、R11 | `test/web-device-key.test.mjs` 检查登录初始化、跨页串行化与生产签名路径（R8、R10、R11）；`test/web-e2e-images.test.mjs` 比较原图与磁盘图片字节哈希，交换两图必须失败（R11） |
+
+`test/web-api.test.mjs`、`test/web-protocol.test.mjs` 验证 pane 类型转换、查询、控制结果、导出鉴权和 UI 回答生命周期；`test/web-state-sync.test.mjs` 验证状态缓存提交、事件合并及代次隔离。这些接口测试不能替代对应的浏览器交互测试。
+
+### 共用测试约定
+
 测试的 RPC 输入审计通过观察已有 data 事件记录命令，不添加 stdin 的 data listener，也不调用 resume/read，避免在 pi RPC reader 注册前开启 flowing 并吞掉初始化输入。fixture-audit 验证 reader 注册前缓冲保留、JSONL/UTF-8 分块及字节原样转交；bridge-broker 验证最新实例 fencing 和就绪幂等；hostkit-cleanup 验证嵌套报告、无报告清理错误、多错误聚合、循环上下文、普通拒绝及观察器的原样传播。stop-switch-races 的只读读取 gate 阻塞同源文件的全部 watch 读取，避免后续读取先完成并推进 epoch；只读文件变化导致模型重建时，旧 epoch 的控制请求返回 409 epochChanged 属于正常隔离行为。其初始化拒绝会关闭已经启动的真实写者、HTTP 和实例锁；迟到启动 gate 同时交付就绪成功与失败，避免初始化异常遗留监听服务或让测试永远等待 entered。
 
 测试文件路径均为 `test/<名称>.test.mjs`。三平台都运行服务端测试，不用模拟进程替代真实 pi。Chrome 路径由本机安装或 CHROME_PATH/CHROME_BIN 定位；本机不存在时明确跳过。CI 的全部矩阵项设置 `PANE_TEST_REQUIRE_CHROME=1`，三平台均须实际运行 Chrome，找不到 Chrome 必须失败。
@@ -180,4 +237,4 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 Windows Job 模式在停止返回前独立确认已知成员退出；platform 测试在 StopReport 返回后立即核对已知后代身份，不设置额外退出观察窗口，也不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
 
-浏览器设备密钥的实测范围包括 WebCrypto、IndexedDB、Node.js 验签和设置页设备 ID；该测试不验证真实输入框、BroadcastChannel 或持久表单。HTML 导出的图片排列由 pi 决定。插件接口类型完整导出不表示插件宿主已实现。
+Chrome 测试覆盖真实输入框、BroadcastChannel、流式重连、扩展对话框和生产设备密钥，具体断言见[自动化验收映射](#自动化验收映射)。`userPresence` 确认流程、持久表单和插件宿主属于 M3，未纳入当前端到端验收；浏览器场景也未覆盖带图片的队列停止取回、图片拖动与剪切、全部数量/大小/模型能力边界及所有内置斜杠命令。HTML 导出的图片排列由 pi 决定，插件接口类型完整导出不表示插件宿主已实现。

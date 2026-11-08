@@ -1,6 +1,6 @@
 # 总体架构
 
-> 状态：M1 服务端核心已实现。Web 界面与设备签名在 M2、插件宿主在 M3 实现。本文描述完整架构；M1 的可用接口与验收映射见 [development.md](development.md)。
+> 状态：M1 服务端核心与 M2 前端核心已实现，插件宿主、持久表单和 `userPresence` 确认流程属于 M3，尚未实现。本文描述完整架构；当前可用接口、前端结构与验收映射见 [development.md](development.md)。
 
 pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起一个 `pi --mode rpc` 子进程，把聊天流转发给浏览器；子代理、会议等功能由插件通过通用接口显示，pi-pane 本身不实现这些业务。
 
@@ -35,18 +35,18 @@ pi-pane 服务端（server）
  ├─ 只读会话读取：不拉起进程，直接解析会话文件
  ├─ 扩展 UI 适配：pi 原生 select/confirm/input/editor 等 → 浏览器
  ├─ 附件与图片缓存
- └─ 插件宿主：加载可信的服务端插件（如 pi-agora 的 pane 插件）
+ └─ 插件宿主（M3，尚未实现）：加载可信的服务端插件（如 pi-agora 的 pane 插件）
 ```
 
-| 包（草案） | 职责 |
+| 包 | 职责 |
 | --- | --- |
-| `packages/server` | 服务端：会话托管、RPC 驱动、只读解析、鉴权、WebSocket、附件、插件宿主 |
-| `packages/web` | 前端：会话列表与树、聊天视图、输入框、对话框、面板、设备密钥 |
+| `packages/server` | 服务端：会话托管、RPC 驱动、只读解析、鉴权、WebSocket、附件；插件宿主属于 M3 |
+| `packages/web` | Vite + Preact 前端：会话列表、聊天视图、输入框与图片占位符、斜杠命令、扩展对话框、模型与思考级别、设备密钥；会话树中的插件节点、面板与待处理区属于 M3 |
 | `packages/bridge-extension` | 加载进每个主会话的 pi 扩展（pane-bridge），见“pane-bridge” |
 | `packages/plugin-api` | `@pi-pane/plugin-api`：插件接口和 pane 协议 v1 的 TypeScript 类型，按 [plugin-api.md](plugin-api.md) 导出；插件把它作为 peer 依赖 |
 | `pi-hostkit`（外部依赖） | 平台相关的共享实现，见“平台支持” |
 
-前端技术栈（草案）：Vite + Preact。选择理由是打包体积小；P0 期间可以换，但不改变接口。
+前端使用 Vite + Preact，以控制打包体积；模块职责与运行时约束见 [development.md 的“前端结构”](development.md#前端结构)。
 
 ## 平台支持
 
@@ -322,7 +322,7 @@ interface DriverHandle {
 
 ### 通道
 
-浏览器接口由 `packages/server/src/web-api.ts` 定义，`web-adapter.ts` 在服务端转换 pi 原始数据。M2 协议变更：/query、/ui、控制结果、会话列表改为 web-api.ts 的 pane 类型。会话流与 entries 保持 plugin-api.md 的 pane 协议。
+浏览器接口由 `packages/server/src/web-api.ts` 定义，`web-adapter.ts` 在服务端转换 pi 原始数据。`/query`、`/ui`、控制结果和会话列表使用 web-api.ts 的 pane 类型。会话流与 entries 遵循 plugin-api.md 的 pane 协议。
 
 `POST /api/sessions/:id/query` 接受 `{type}`，`type` 仅为 `state`、`models`、`commands`、`stats`、`forkPoints`，服务端分别调用 `get_state`、`get_available_models`、`get_commands`、`get_session_stats`、`get_fork_messages`，返回对应的 `PaneQueryResults[type]`，pi 拒绝时返回 409 `rpcRejected`。快照和打开响应包含 `hosted`，并在存在最近状态时附带 `PaneSessionState`。缓存状态在托管初始化、状态查询、`set_model`、`set_thinking_level`、`set_session_name`、`compact` 成功后，以及 `session_info_changed`、`model_select`、`thinking_level_select`、`model_changed`、`thinking_level_changed` 事件后通过 `get_state` 刷新；事件刷新合并执行，仅在写者、模型和 epoch 未变且写者仍接受输入时提交，名称、模型或思考级别变化后递增 `controlRevision` 并发送 `pane_status`，事件或控制操作后的刷新失败仅发送 `pane_diagnostic`，不覆盖已确认的控制结果。
 
@@ -464,7 +464,7 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 
 ## 用户在场确认与设备密钥
 
-浏览器第一次登录时用 WebCrypto 生成不可导出的 ECDSA P-256 设备密钥，存在 IndexedDB。插件调用 `ctx.userPresence.confirm()` 时，浏览器弹出确认框，用户点击确认后签名，插件的后台服务验签。pi-pane 只负责生成、保存密钥和签名，不判断设备是否可信；设备的首次信任（TOFU）和批准由插件后台服务负责。接口、签名格式和流程见 [plugin-api.md](plugin-api.md#用户在场确认)。
+浏览器第一次登录时用 WebCrypto 生成不可导出的 ECDSA P-256 设备密钥，存在 IndexedDB；密钥管理和签名能力由 M2 提供。M3 的 `userPresence` 确认流程尚未接入，其协议规定：插件调用 `ctx.userPresence.confirm()` 时，浏览器弹出确认框，用户点击确认后签名，插件的后台服务验签。pi-pane 只负责生成、保存密钥和签名，不判断设备是否可信；设备的首次信任（TOFU）和批准由插件后台服务负责。接口、签名格式和流程见 [plugin-api.md](plugin-api.md#用户在场确认)。
 
 ## 渲染与资源安全
 
