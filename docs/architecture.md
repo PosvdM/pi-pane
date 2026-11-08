@@ -91,7 +91,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 - 存储位置按 pi 的规则确定（依据：pi `docs/sessions.md`、`docs/settings.md`）：环境变量 `PI_CODING_AGENT_SESSION_DIR` 优先，其次是 agent 目录（默认 `~/.pi/agent`，可由 `PI_CODING_AGENT_DIR` 覆盖）下 `settings.json` 的 `sessionDir`，都没有时用 `<agent 目录>/sessions/`。
 - 项目的 `.pi/settings.json` 也可以设置 `sessionDir`（pi 在信任判断之前就读取它，依据：pi `docs/configuration.md`）。pi-pane 对已知的项目目录（打开过或新建过会话的 `cwd`）另外读取这个设置，把那里的会话一并列出。
 - 用 pi 导出的 `SessionManager.listAll(sessionDir)` / `SessionManager.list(cwd, sessionDir)` 读取列表（依据：`dist/core/session-manager.d.ts`）。
-- 名称从会话元数据读取；托管期间收到 `session_info_changed` 时先更新名称，再通知插件上下文和主会话树。名称缓存与普通 RPC 状态对象相互独立，名称刷新不改写该对象，状态查询也不会覆盖较新的名称；只读文件监视同样刷新名称。名称被清空后，标题使用首条用户消息的前 200 个字符，没有文本时使用会话 id。
+- 名称从会话元数据读取；托管期间收到 `session_info_changed` 时先更新名称，再通知插件上下文和主会话树。打开、只读刷新、重绑定和在线事件统一去除名称两端空白，并将空值归一化为未设置。名称缓存与普通 RPC 状态对象相互独立，名称刷新不改写该对象，状态查询也不会覆盖较新的名称；只读文件监视同样刷新名称。名称被清空后，标题使用首条用户消息的前 200 个字符，没有文本时使用会话 id。
 - 按项目（工作目录）分组；每个会话显示名称、最后修改时间、消息数。默认只显示托管中、浏览器里打开着、最近 7 天活动过的会话，其余折叠进各项目下的“历史”，展开时分页加载（与 [plugin-api.md](plugin-api.md#按需加载) 的按需加载规则相同）。
 
 ### 只读查看历史会话

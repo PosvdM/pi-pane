@@ -156,7 +156,7 @@ export class Sessions {
     return title || session.id;
   }
   private setName(session: HostedSession, value: string | undefined): void {
-    session.name = { value };
+    session.name = { value: typeof value === "string" ? value.trim() || undefined : undefined };
   }
   private readName(session: HostedSession, entries: Entry[]): void {
     const info = entries.findLast((entry) => entry.type === "session_info");
