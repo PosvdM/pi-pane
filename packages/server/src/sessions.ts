@@ -33,9 +33,14 @@ export class Sessions {
   private recovering = true; private closing = false; readonly reports: StopReport[] = [];
   private starts = new Map<AbortController, Promise<void>>(); private closePromise?: Promise<void>;
   private handles = new Map<DriverHandle, Promise<void>>(); private cleanupErrors: unknown[] = [];
+  private readonly closeTimeoutMs: number;
   readonly recoveryDiagnostics: string[] = [];
   constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
     private readonly emitUi: (sessionId: string, request: any) => void) {
+    const waits = [options.stopOptions?.abortTimeoutMs ?? 10000, options.stopOptions?.graceMs ?? 5000, options.stopOptions?.termGraceMs ?? 3000];
+    assert(waits.every(ms => Number.isFinite(ms) && ms >= 0), "invalidConfig", "停止宽限必须为非负有限毫秒");
+    // 与固定 hostkit 的 StopOptions 默认值一致；clear_queue 2 秒，身份核查及清理另留 5 秒。
+    this.closeTimeoutMs = duration(Math.ceil(waits.reduce((sum, ms) => sum + ms, 7000)), 25000);
     this.ledger = new RequestLedger(Date.now, duration(options.rpcTimeoutMs, 30000));
     this.driver = new RpcSubprocessDriver(broker, { ...options, onTrust: (cwd) => trust.request(cwd) });
     this.timer = setInterval(() => { void this.reclaim().catch(() => {}); }, 10000); this.timer.unref();
@@ -61,6 +66,7 @@ export class Sessions {
         assert(record.identity && Number.isSafeInteger(record.identity.pid) && record.identity.pid > 0 && typeof record.identity.startTime === "string" && record.identity.startTime.length > 0 && typeof record.identity.runId === "string" && typeof record.identity.instanceId === "string" && typeof record.sessionFile === "string", "invalidRunRecord", "运行记录损坏，不能重新打开会话", 503);
         // 在所有恢复完成前不接受会话打开；身份查询不明或 StopReport 不完整时保留现场。
         const report = await stopByIdentity(record.identity, this.options.stopOptions); await verifyStopped(record.identity, report); this.reports.push(report);
+        this.inflight.assertCleanupAllowed();
         this.recoveredFiles.add(fileKey(record.sessionFile)); await rm(path.join(directory, file));
       }
     } catch (error) { this.cleanupErrors.push(error); throw error; }
@@ -343,18 +349,24 @@ export class Sessions {
     return this.closePromise;
   }
   private async performClose(): Promise<void> {
+    const ending = this.inflight.owner("sessions.close");
     this.inflight.seal(); this.closing = true; clearInterval(this.timer); this.trust.close(); const errors: unknown[] = [];
     const starts = [...this.starts];
     for (const [controller] of starts) controller.abort(new PaneError("interrupted", "会话已关闭", 409));
+    const handles = new Set(this.handles.keys());
     for (const session of this.records.values()) {
       session.closed = true; unwatchFile(session.file);
-      const handle = session.handle;
-      if (handle) try { await handle.stop(); await handle.drain(); } catch (error) { errors.push(error); }
+      if (session.handle) handles.add(session.handle);
     }
-    for (const result of await Promise.allSettled(starts.map(([, settled]) => settled))) if (result.status === "rejected") errors.push(result.reason);
-    for (const [handle, finished] of this.handles) try { await handle.stop(); await finished; } catch (error) { errors.push(error); }
-    // 所有清理事实的生产者结束后才汇总；旧隔离记录仅保留诊断。
-    await this.inflight.drain();
+    // 停止本身也可能挂起；并行发出停止，任何 await 都必须落在限时屏障内。
+    void ending.run("settle", async () => {
+      const work = [...handles].map(async handle => { await handle.stop(); await handle.drain(); });
+      // 单项拒绝立即保存，不能被另一项的永久等待挡在错误汇总之前。
+      await Promise.allSettled([...work, ...starts.map(([, settled]) => settled), ...this.handles.values()]
+        .map(operation => operation.catch(error => { errors.push(error); })));
+    }).then(() => ending.close(), error => { errors.push(error); ending.close(); });
+    // 超时保留真实登记与现场；失败后也必须让 PaneServer 进入 HTTP 收尾。
+    try { await this.inflight.drain(this.closeTimeoutMs); } catch (error) { errors.push(error); }
     errors.push(...this.cleanupErrors);
     if (errors.length) throw new AggregateError(errors, "部分会话未确认停止");
   }

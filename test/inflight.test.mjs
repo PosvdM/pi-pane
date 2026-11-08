@@ -27,6 +27,25 @@ test("资源 owner 允许关闭后的内部收尾，排空覆盖迟到子操作�
   assert.throws(() => inflight.owner("new-writer"), { code: "serverStopping" });
 });
 
+test("限时排空列出未完成来源，不删除登记，迟到完成也不能解除失败闩", async () => {
+  const inflight = new Inflight(); const gate = deferred();
+  const operation = inflight.run("never-until-released", () => gate.promise);
+  inflight.seal();
+  let timeout;
+  await assert.rejects(inflight.drain(20), error => {
+    timeout = error;
+    assert.equal(error.code, "shutdownTimeout");
+    assert.equal(error.detail.pending.length, 1);
+    assert.equal(error.detail.pending[0].kind, "never-until-released");
+    assert.match(error.detail.pending[0].source, /inflight\.test\.mjs/);
+    return true;
+  });
+  assert.equal(inflight.pending.size, 1, "超时不会伪造排空");
+  gate.resolve(); await operation; await inflight.drain(20);
+  assert.throws(() => inflight.assertCleanupAllowed(), e => e === timeout);
+  await assert.rejects(inflight.finalize("release", () => assert.fail()), e => e === timeout);
+});
+
 test("终止阶段要求门禁及完整排空，释放拒绝不能变成排空失败或遗留登记", async () => {
   const inflight = new Inflight(); const owner = inflight.owner("writer");
   await assert.rejects(inflight.finalize("release", () => assert.fail()), /尚未排空/);

@@ -340,8 +340,10 @@ test("服务关闭正在等待较早记录时，后续写者不能重绑定到�
     const stop = first.stop.bind(first); const entered = deferred();
     first.stop = async () => { const report = await stop(); entered.resolve(); await gate.promise; return report; };
     const source = server.sessions.records.get(a.ref.id); handle = source.handle;
+    const sourceStop = handle.proc.stop.bind(handle.proc);
+    handle.proc.stop = async (...args) => { await gate.promise; return sourceStop(...args); };
     closing = server.sessions.close(); await entered.promise;
-    assert.equal(destination.closed, true); assert.equal(destination.handle, undefined); assert.equal(source.closed, false);
+    assert.equal(destination.closed, true); assert.equal(destination.handle, undefined); assert.equal(source.closed, true);
     await assert.rejects(handle.send({ type: "prompt", message: "/pane-test-resume " + target }), { code: "serverStopping" });
     // 已受理操作的迟到回调仍不能绕过会话关闭检查，直接覆盖回调归属边界。
     handle.callbacks.onReady({ sessionFile: target, sessionId: b.ref.id, cwd: f.cwd }, { entries: [] }, "resume", handle);

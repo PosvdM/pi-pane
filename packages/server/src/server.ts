@@ -15,6 +15,7 @@ import { Sessions, type SessionManagerOptions } from "./sessions.js";
 import { PiStore } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
+import { CLOSE_IO_TIMEOUT_MS } from "./inflight.js";
 
 export interface PaneServerOptions extends Partial<Omit<SessionManagerOptions, "pi" | "bridgeUrl" | "instanceId" | "extensionPath">> {
   home: string; piPath?: string; port?: number; agentDir?: string; extensionPath?: string; webRoot?: string;
@@ -227,11 +228,23 @@ export class PaneServer {
   private async performClose(): Promise<void> {
     clearInterval(this.sweep);
     for (const client of this.clients) { this.closeClient(client, 1001, "服务端停止"); client.ws.terminate(); }
-    let error: unknown;
-    try { await this.sessions.close(); } catch (cause) { error = cause; }
-    await new Promise<void>((resolve) => this.wss.close(() => resolve()));
-    if (this.http.listening) { this.http.closeAllConnections(); await new Promise<void>((resolve) => this.http.close(() => resolve())); }
-    if (error) throw error;
-    await this.sessions.inflight.finalize("server.releaseInstanceLock", () => observeHostkit(async () => { await this.lock?.release(); }, (error) => this.sessions.recordCleanupFailure(error), true));
+    const errors: unknown[] = []; const inflight = this.sessions.inflight;
+    try { await this.sessions.close(); } catch (error) { errors.push(error); }
+    // 同时关闭监听与 WebSocket；任一回调缺失都不能阻止另一项开始收尾。
+    try {
+      await inflight.wait(Promise.all([
+        new Promise<void>(resolve => this.wss.close(() => resolve())),
+        new Promise<void>(resolve => {
+          if (!this.http.listening) { resolve(); return; }
+          this.http.closeAllConnections(); this.http.close(() => resolve());
+        }),
+      ]), CLOSE_IO_TIMEOUT_MS, "HTTP/WebSocket 关闭");
+    } catch (error) { errors.push(error); }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length) throw new AggregateError(errors, "服务端关闭未确认");
+    await inflight.wait(inflight.finalize("server.releaseInstanceLock", () => {
+      inflight.assertCleanupAllowed();
+      return observeHostkit(async () => { await this.lock?.release(); }, error => this.sessions.recordCleanupFailure(error), true);
+    }), CLOSE_IO_TIMEOUT_MS, "实例锁释放");
   }
 }

@@ -37,6 +37,7 @@ export interface DriverHandle {
   drain(): Promise<void>;
 }
 export class RpcSubprocessDriver implements SessionDriver {
+  private retainedLocks = new Set<SessionWriterLock>();
   constructor(private readonly broker: BridgeBroker, private readonly options: DriverOptions,
     private readonly acquireWriter = acquireSessionWriterLock) { duration(options.readyTimeoutMs, 10000); }
   async start(spec: DriverSpec, callbacks: DriverCallbacks, signal?: AbortSignal): Promise<DriverHandle> {
@@ -48,7 +49,12 @@ export class RpcSubprocessDriver implements SessionDriver {
     signal?.throwIfAborted();
     const lock = await acquireRecoveredWriter(spec.sessionFile, this.options.home, this.options.instanceId,
       { ...this.options.stopOptions, assumeNoWriter: spec.assumeNoWriter }, this.acquireWriter, callbacks.onCleanupFailure);
-    const release = () => observeHostkit(() => lock.release(), callbacks.onCleanupFailure, true);
+    // 创建 handle 前也持有强引用；关闭超时后不能因对象回收而遗失隔离写锁。
+    this.retainedLocks.add(lock);
+    const release = async () => {
+      this.broker.inflight.assertCleanupAllowed();
+      await observeHostkit(() => lock.release(), callbacks.onCleanupFailure, true); this.retainedLocks.delete(lock);
+    };
     if (signal?.aborted) { await release(); signal.throwIfAborted(); }
     let handle!: RpcHandle; let attachHandle!: () => void; const available = new Promise<void>((resolve) => { attachHandle = resolve; });
     const launch = this.broker.issue(spec.decisions, async (event) => { await available; return handle.bridgeEvent(event); }, callbacks.onCleanupFailure);
@@ -60,12 +66,14 @@ export class RpcSubprocessDriver implements SessionDriver {
     for (const extension of this.options.extraExtensions ?? []) argv.push("-e", extension);
     let proc: ManagedProcess;
     try {
+      this.broker.inflight.assertCleanupAllowed();
       proc = await observeHostkit(() => lock.spawnWriter({ argv, cwd: spec.cwd, env, runId: randomUUID(), instanceId: this.options.instanceId, containment: this.options.containment, snapshotIntervalMs: this.options.snapshotIntervalMs }), callbacks.onCleanupFailure);
       launch.attach(proc.identity);
     } catch (error) {
       launch.close(); await release(); throw error;
     }
-    handle = new RpcHandle(proc, lock, launch.close, spec, callbacks, this.options, this.acquireWriter, this.broker.inflight, owner); attachHandle();
+    handle = new RpcHandle(proc, lock, launch.close, spec, callbacks, this.options, this.acquireWriter, this.broker.inflight, owner);
+    this.retainedLocks.delete(lock); attachHandle();
     try {
       // spawn 可能晚于取消返回；先交付 handle，再检查取消，停止无需等待首次持久化或 ready。
       callbacks.onHandle?.(handle);
@@ -84,6 +92,7 @@ class RpcHandle implements DriverHandle {
   private generation = 0; private initialization = Promise.resolve(); private started = false; private listeners: (() => void)[] = [];
   private readonly recordFile: string; private persistence = Promise.resolve();
   private targets = new Set<Promise<boolean>>(); private cleanupErrors: unknown[] = [];
+  private rpcWaits = new Set<(error: unknown) => void>(); private rpcWaitFailure?: PaneError;
   constructor(private readonly proc: ManagedProcess, lock: SessionWriterLock, private readonly revoke: () => void,
     private readonly spec: DriverSpec, private readonly callbacks: DriverCallbacks, private readonly options: DriverOptions,
     private readonly acquireWriter: typeof acquireSessionWriterLock, private readonly inflight: Inflight, private readonly owner: InflightOwner) {
@@ -103,6 +112,26 @@ class RpcHandle implements DriverHandle {
   }
   private hostkit<T>(operation: () => Promise<T>, cleanup = false): Promise<T> {
     return this.owner.run("hostkit", () => observeHostkit(operation, this.callbacks.onCleanupFailure, cleanup));
+  }
+  private release(lock: SessionWriterLock, switched = false): Promise<void> {
+    this.inflight.assertCleanupAllowed();
+    return this.hostkit(() => lock.release(switched ? { writerSwitchedAway: true } : undefined), !switched);
+  }
+  private rpc(command: RpcCommand, options: { timeoutMs?: number }): Promise<RpcResponse> {
+    return this.owner.run("hostkit", () => {
+      if (this.rpcWaitFailure) return Promise.reject(this.rpcWaitFailure);
+      return new Promise<RpcResponse>((resolve, reject) => {
+        const cancel = (error: unknown) => { this.rpcWaits.delete(cancel); reject(error); };
+        this.rpcWaits.add(cancel);
+        // 仅终结 pane 的等待；底层传输仍独立观察迟到清理错误，不伪造远端结果。
+        void observeHostkit(() => this.proc.rpc.send(command, options), this.callbacks.onCleanupFailure).then(
+          response => { this.rpcWaits.delete(cancel); resolve(response); }, cancel);
+      });
+    });
+  }
+  private endRpcWaits(): void {
+    this.rpcWaitFailure ??= new PaneError("rpcResultUnknown", "停止未确认，无法确认 RPC 操作结果；请核查会话和恢复记录", 503);
+    for (const cancel of this.rpcWaits) cancel(this.rpcWaitFailure);
   }
   get sessionFile(): string { return this.current.sessionFile; }
   get acceptingInput(): boolean { return this.enabled && !this.stopping; }
@@ -142,7 +171,7 @@ class RpcHandle implements DriverHandle {
     // 取锁可能晚于停止返回；迟到锁不登记 writer，仍须在停止确认后清理。
     this.locks.set(key, lock);
     if (this.stopping) {
-      try { await this.stop(); await this.hostkit(() => lock.release(), true); this.locks.delete(key); }
+      try { await this.stop(); await this.release(lock); this.locks.delete(key); }
       catch (error) { this.cleanupErrors.push(error); this.callbacks.onRecord({ type: "pane_diagnostic", message: `迟到目标锁清理未确认：${String(error)}` }); throw error; }
       throw new PaneError("bridgeStopping", "会话正在停止，目标写锁已释放", 409);
     }
@@ -195,7 +224,7 @@ class RpcHandle implements DriverHandle {
             const entries = await this.raw({ type: "get_entries" });
             if (this.stopping || generation !== this.generation) return;
             for (const [key, lock] of this.locks) if (lock !== destination) {
-              await this.hostkit(() => lock.release({ writerSwitchedAway: true })); this.locks.delete(key);
+              await this.release(lock, true); this.locks.delete(key);
               if (this.stopping || generation !== this.generation) return;
             }
             this.current = destination; this.pendingTarget = undefined;
@@ -211,7 +240,7 @@ class RpcHandle implements DriverHandle {
     }
   }
   private raw(command: RpcCommand, timeoutMs = this.options.rpcTimeoutMs ?? 30000, trackResult = false): Promise<any> {
-    return this.hostkit(() => this.proc.rpc.send(command, trackResult ? {} : { timeoutMs })).then((response) => { assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409); return response; });
+    return this.rpc(command, trackResult ? {} : { timeoutMs }).then((response) => { assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409); return response; });
   }
   send(command: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse> {
     return this.inflight.run("driver.send", () => this.performSend(command, opts));
@@ -231,7 +260,7 @@ class RpcHandle implements DriverHandle {
         const state = await this.raw({ type: "get_state" });
         if (!this.stopping && generation === this.generation && this.enabled && !this.pendingTarget && fileKey(state.data.sessionFile) === fileKey(this.current.sessionFile)) {
           for (const [key, lock] of this.locks) if (lock !== this.current) {
-            await this.hostkit(() => lock.release({ writerSwitchedAway: true })); this.locks.delete(key);
+            await this.release(lock, true); this.locks.delete(key);
             if (this.stopping || generation !== this.generation) break;
           }
         }
@@ -273,14 +302,15 @@ class RpcHandle implements DriverHandle {
     let report: StopReport | undefined; let failure: unknown;
     try {
       for (const lock of this.locks.values()) { try { await this.hostkit(() => lock.update({ state: "stopping" })); } catch (error) { failure ??= error; } }
-      try { await this.hostkit(() => this.proc.rpc.send({ type: "clear_queue" }, { timeoutMs: 2000 })); } catch { /* 管道已关闭时仍执行 hostkit 的停止和身份复查。 */ }
+      try { await this.rpc({ type: "clear_queue" }, { timeoutMs: 2000 }); } catch { /* 管道已关闭时仍执行 hostkit 的停止和身份复查。 */ }
       report = await this.hostkit(() => this.proc.stop(this.options.stopOptions), true); await this.hostkit(() => verifyStopped(this.identity, report!));
       if (failure) throw failure;
-      for (const lock of this.locks.values()) await this.hostkit(() => lock.release(), true); this.locks.clear();
+      for (const lock of this.locks.values()) await this.release(lock); this.locks.clear();
       await this.persistence;
-      await rm(this.recordFile + ".tmp", { force: true }); await rm(this.recordFile, { force: true });
+      this.inflight.assertCleanupAllowed(); await rm(this.recordFile + ".tmp", { force: true });
+      this.inflight.assertCleanupAllowed(); await rm(this.recordFile, { force: true });
       return report;
-    } catch (error) { failure = error; throw error; }
+    } catch (error) { failure = error; this.endRpcWaits(); throw error; }
     finally {
       for (const off of this.listeners.splice(0)) off();
       this.rejectReady(new PaneError("interrupted", this.fatalReason ?? "会话已关闭", 409));

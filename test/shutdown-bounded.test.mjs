@@ -28,6 +28,7 @@ for (const failure of ["reject", "leftovers", "healthy"]) test(`真实挂起控�
     assert.deepEqual(await server.sessions.command(session.id, body), { status: "pending" });
     await until(async () => { try { await access(path.join(f.root, "hang-entered")); return true; } catch { return false; } });
     assert.deepEqual(await server.sessions.command(session.id, body), { status: "pending" }, "真实扩展已进入永久等待");
+    const waitingRpc = handle.send({ type: "prompt", message: "/pane-test-hang" }).then(response => ({ response }), error => ({ error }));
     if (failure === "reject") handle.proc.stop = async () => { throw new Error("注入真实 proc.stop 拒绝"); };
     if (failure === "leftovers") handle.proc.stop = async () => ({ coverage: handle.proc.coverage, steps: [], leftovers: [handle.identity] });
     let released = false; const release = server.lock.release.bind(server.lock);
@@ -47,6 +48,9 @@ for (const failure of ["reject", "leftovers", "healthy"]) test(`真实挂起控�
     assert.equal((await probeSessionWriterLock(session.file)).held, failure !== "healthy");
     await assert.rejects(server.sessions.command(session.id, body), { code: "rpcResultUnknown" });
     await assert.rejects(server.sessions.command(session.id, body), { code: "rpcResultUnknown" });
+    const rpcResult = await waitingRpc; assert.ok(rpcResult.error);
+    if (failure !== "healthy") assert.equal(rpcResult.error.code, "rpcResultUnknown");
+    assert.equal(handle.rpcWaits.size, 0, "该 handle 的全部本地 RPC 等待均已结束");
     if (failure === "healthy") assert.equal(await isSameProcess(handle.identity), "gone");
   } finally {
     if (stop) { handle.proc.stop = stop; await stop(); for (const lock of locks) await lock.release(); }
@@ -54,13 +58,42 @@ for (const failure of ["reject", "leftovers", "healthy"]) test(`真实挂起控�
   }
 });
 
-test("永久在途登记超过关闭上限时列出 kind 和来源，保留锁与运行记录", { timeout: 30000 }, async () => {
-  const f = await piFixture(); const server = await startServer(f); let handle; let stop; let locks;
+test("停止失败终结本地 RPC 等待后仍保存 hostkit 迟到清理事实", { timeout: 15000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); let handle; let stop; let locks; let resume; let enter;
+  const gate = new Promise(resolve => { resume = resolve; }); const entered = new Promise(resolve => { enter = resolve; });
+  const failure = new Error("迟到 hostkit 清理拒绝", { cause: { coverage: "snapshot_visible", steps: [{ step: "verify", ok: false }], leftovers: [] } });
+  let sending;
   try {
     const view = await server.sessions.open({ cwd: f.cwd }); const session = server.sessions.records.get(view.ref.id);
     await server.sessions.start(session); handle = session.handle; stop = handle.proc.stop.bind(handle.proc); locks = [...handle.locks.values()];
-    // 真实停止边界永久挂起，与停止后额外的未知生产者分别覆盖有界等待。
-    handle.proc.stop = () => new Promise(() => {});
+    const send = handle.proc.rpc.send.bind(handle.proc.rpc); let armed = true;
+    handle.proc.rpc.send = async (...args) => {
+      const response = await send(...args);
+      if (armed && args[0].type === "get_state") { armed = false; enter(); await gate; throw failure; }
+      return response;
+    };
+    sending = handle.send({ type: "get_state" }, { trackResult: true }).catch(error => error); await entered;
+    handle.proc.stop = async () => { throw new Error("停止拒绝"); };
+    await within(assert.rejects(server.close(), AggregateError), 9000);
+    assert.equal((await sending).code, "rpcResultUnknown"); assert.equal(server.sessions.inflight.pending.size, 0);
+    assert.equal(server.sessions.cleanupErrors.includes(failure), false);
+    resume(); await until(() => server.sessions.cleanupErrors.includes(failure));
+    await assert.rejects(server.close(), AggregateError);
+  } finally {
+    resume(); await sending;
+    if (stop) { handle.proc.stop = stop; await stop(); for (const lock of locks) await lock.release(); }
+    await server.close().catch(() => {}); await server.lock.release(); await f.cleanup();
+  }
+});
+
+test("永久在途登记超过关闭上限时列出 kind 和来源，保留锁与运行记录", { timeout: 30000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); let handle; let stop; let locks; let resumeStop;
+  const stopGate = new Promise(resolve => { resumeStop = resolve; });
+  try {
+    const view = await server.sessions.open({ cwd: f.cwd }); const session = server.sessions.records.get(view.ref.id);
+    await server.sessions.start(session); handle = session.handle; stop = handle.proc.stop.bind(handle.proc); locks = [...handle.locks.values()];
+    // 真实停止边界在关闭超时前不返回，失败后再让真实停止成功。
+    handle.proc.stop = async (...args) => { await stopGate; return stop(...args); };
     void server.sessions.inflight.run("test.never-finishes", () => new Promise(() => {}));
     let released = false; const release = server.lock.release.bind(server.lock);
     server.lock.release = async () => { released = true; await release(); };
@@ -75,10 +108,35 @@ test("永久在途登记超过关闭上限时列出 kind 和来源，保留锁�
     assert.equal((await probeSessionWriterLock(session.file)).held, true);
     assert.ok((await readdir(path.join(f.root, "pane", "run"))).includes(handle.identity.runId + ".json"));
     assert.equal(server.close(), closing); await assert.rejects(server.close(), e => e === error);
+    resumeStop(); await assert.rejects(handle.stop(), { code: "shutdownTimeout" });
+    assert.equal(await isSameProcess(handle.identity), "gone", "迟到的真实 proc.stop 已成功");
+    assert.equal((await probeSessionWriterLock(session.file)).held, true, "终止失败闩保留写锁");
+    assert.ok((await readdir(path.join(f.root, "pane", "run"))).includes(handle.identity.runId + ".json"));
+    await assert.rejects(server.close(), e => e === error);
   } finally {
+    resumeStop();
     if (stop) { handle.proc.stop = stop; await stop(); for (const lock of locks) await lock.release(); }
     await server.lock.release(); await f.cleanup();
   }
+});
+
+for (const phase of ["network", "release"]) test(`${phase} 收尾回调永久挂起时关闭仍有界失败`, { timeout: 15000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); const release = server.lock.release.bind(server.lock);
+  try {
+    let released = false;
+    server.lock.release = phase === "release" ? () => new Promise(() => {}) : async () => { released = true; await release(); };
+    if (phase === "network") {
+      const close = server.wss.close.bind(server.wss);
+      server.wss.close = () => close(() => {});
+    }
+    const closing = server.close();
+    const error = await within(closing.then(() => assert.fail(), error => error), 6500);
+    assert.equal(error.code, "shutdownTimeout");
+    assert.equal(server.http.listening, false); assert.equal(released, false);
+    assert.equal(error.detail.phase, phase === "network" ? "HTTP/WebSocket 关闭" : "实例锁释放");
+    if (phase === "release") assert.ok(error.detail.pending.some(item => item.kind === "server.releaseInstanceLock"));
+    await assert.rejects(server.close(), e => e === error);
+  } finally { await release(); await f.cleanup(); }
 });
 
 test("停止结束后的永久登记也受同一关闭上限约束", { timeout: 15000 }, async () => {
