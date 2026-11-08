@@ -93,10 +93,14 @@ function onEvent(id: string, record: Parameters<typeof apply>[1]): void {
   if (event.type === "pane_session_replaced") {
     if (Date.now() < followUntil && followNav === nav) { followUntil = 0; void open(event.newRef.id); return; }
   }
+  // 写者退出后不能再查询运行态；先重取快照，避免托管标志更新前发送统计或状态查询。
+  if (event.type === "pane_status" && event.readonly === true && state.model.view.hosted) {
+    clearTimeout(stateTimer);
+    void reload(); scheduleListRefresh(); current.touch();
+    return;
+  }
   if (event.type === "pane_status" && event.status === "idle") { void refreshStats(); scheduleListRefresh(); }
   if (event.type === "pane_session_replaced") scheduleListRefresh();
-  // 写者退出（关闭、回收、中断）时 pane_status 变为只读；重取快照以更新托管状态和标题栏。
-  if (event.type === "pane_status" && event.readonly === true && state.model.view.hosted) { void reload(); scheduleListRefresh(); }
   if (state.model.view.hosted && (state.model.view.controlRevision !== revision || ["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type))) scheduleStateRefresh();
   current.touch();
 }
