@@ -753,7 +753,7 @@ export type FormRemovedReason = "handled" | "cancelled" | "expired" | "withdrawn
 - **待处理区**：侧栏只有一个“待处理”区，列出所有插件的持久表单，按插件分组，标题带总数角标。插件不另做“待处理”面板。
 - **排序**：组内按 `(createdAt 升序, id 升序)` 排列，这是一个稳定的全序。`forms.pending()` 按同一顺序返回；待处理区不按到达顺序排列，`formAdded` 推来的新表单按 `createdAt`、`id` 插入对应位置，同一 `id` 的更新保持原位置。
 - **新增和更新**：插件调用 `ctx.formAdded(form)`；同一 `id` 的更高 `revision` 替换旧版本，较低或相同的 `revision` 忽略，正在填写的用户看到“表单已更新”提示。
-- **对齐**：pi-pane 启动和插件重连时调用 `forms.pending()`，以它的结果为准重建该插件的列表：结果里没有的表单移除，`revision` 更高的替换。对齐期间收到的 `formAdded`/`formRemoved` 在对齐完成后按 `revision` 规则再应用一遍。
+- **对齐**：pi-pane 在启动、收到该插件的树 `reset`、每次浏览器连接或重连时调用 `forms.pending()`，以它的结果为准重建该插件的列表：结果里没有的表单移除，`revision` 更高的替换。插件在后台重连后应发树 `reset`，宿主据此对齐表单；没有浏览器订阅时，列表在下次浏览器连接时对齐。同一插件的并发对齐合并为一次查询，某个插件的异常不阻塞其他插件或主会话。对齐期间收到的 `formAdded`/`formRemoved` 在对齐完成后按 `revision` 规则再应用一遍。
 - **关闭显示（dismiss）**：弹窗右上角的“稍后处理”只关闭弹窗，表单留在待处理区，不通知插件，也不是提交结果。
 - **取消（cancel）**：表单带 `cancel` 时显示该按钮，点击后提交 `{ status: "cancelled" }`，这是一个业务结果（如拒绝请求），插件不得当作同意。
 - **过期**：由插件（或它的后台服务）统一裁定，到期后调用 `ctx.formRemoved(id, "expired")`。pi-pane 不因为 `expiresAt` 到了就自行移除或提交。

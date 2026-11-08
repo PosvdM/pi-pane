@@ -229,24 +229,27 @@ export class PaneServer {
           client.credential = credential; client.state = "authed"; clearTimeout(timeout);
           this.push(client, { type: "banners", banners: this.plugins.banners.list(), paneProtocol, connectionId: client.id });
           this.plugins.presence.connect(client.id, credential, (message) => this.push(client, message));
-          for (const form of this.plugins.operations.pending()) this.push(client, { type: "form", form });
+          void this.plugins.alignForms().then(() => {
+            if (this.stopping || client.state !== "authed") return;
+            for (const form of this.plugins.operations.pending()) this.push(client, { type: "form", form });
+          });
           return;
         }
         assert(this.auth.useCredential(client.credential!), "unauthorized", "凭证已失效");
         if (message.type === "subscribe") {
           assert(typeof message.ref?.source === "string" && typeof message.ref.id === "string", "invalidRef", "会话来源无效");
           const key = subscriptionKey("session", message.ref.source, message.ref.id);
-          client.subscriptions.get(key)?.();
+          client.subscriptions.get(key)?.(); client.subscriptions.delete(key);
           const emit = (event: any) => this.push(client, { type: "session", ...event });
-          const off = message.ref.source === "pane" ? this.sessions.subscribe(message.ref.id, message.after as StreamCursor, emit) : this.plugins.subscribe(message.ref, message.after, emit);
-          client.subscriptions.set(key, off);
+          if (message.ref.source === "pane") client.subscriptions.set(key, this.sessions.subscribe(message.ref.id, message.after as StreamCursor, emit));
+          else this.pluginSubscription(client, message.ref.source, key, () => this.plugins.subscribe(message.ref, message.after, emit));
         } else if (message.type === "unsubscribe") { const key = subscriptionKey("session", message.ref?.source, message.ref?.id); client.subscriptions.get(key)?.(); client.subscriptions.delete(key); }
         else if (message.type === "treeSubscribe") {
           assert(typeof message.source === "string", "invalidRef", "树来源无效");
-          const key = subscriptionKey("tree", message.source); client.subscriptions.get(key)?.();
+          const key = subscriptionKey("tree", message.source); client.subscriptions.get(key)?.(); client.subscriptions.delete(key);
           const emit = (change: any) => this.push(client, { type: "tree", source: message.source, change });
-          const off = message.source === "pane" ? this.mainTree.subscribe(message.after, emit) : this.plugins.treeSubscribe(message.source, message.after, emit);
-          client.subscriptions.set(key, off);
+          if (message.source === "pane") client.subscriptions.set(key, this.mainTree.subscribe(message.after, emit));
+          else this.pluginSubscription(client, message.source, key, () => this.plugins.treeSubscribe(message.source, message.after, emit));
         } else if (message.type === "treeUnsubscribe") { const key = subscriptionKey("tree", message.source); client.subscriptions.get(key)?.(); client.subscriptions.delete(key); }
         else if (message.type === "device") this.plugins.presence.device(client.id, message.device);
         else if (message.type === "presenceResponse") this.plugins.presence.respond(client.id, message.id, message.response);
@@ -254,6 +257,13 @@ export class PaneServer {
         else throw new PaneError("invalidFrame", "不支持此 WebSocket 消息");
       } catch { this.closeClient(client, 4401, "鉴权或消息格式无效"); }
     });
+  }
+  private pluginSubscription(client: Client, source: string, key: string, subscribe: () => () => void): void {
+    try { client.subscriptions.set(key, subscribe()); }
+    catch (error) {
+      console.error(`插件 ${source} 的实时订阅失败：`, error);
+      this.push(client, { type: "notification", notification: { id: randomUUID(), source, level: "error", title: "插件订阅失败", body: "该插件的实时订阅不可用，主会话仍可使用。" } });
+    }
   }
   private mainTreeRows(): MainTreeRow[] {
     return this.sessions.mainSessionCatalog().map((info) => {

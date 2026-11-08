@@ -50,9 +50,16 @@ export class PluginHost {
     await this.runtime.start();
     for (const state of this.runtime.list()) if (state.state === "active" && state.source) {
       try { await this.catalog(state.source); } catch (error) { console.error(`插件 ${state.source} 的目录读取失败：`, error); }
-      try { await this.operations.align(state.source); }
-      catch (error) { console.error(`插件 ${state.source} 的持久表单对齐失败：`, error); }
+      await this.alignForms(state.source);
     }
+  }
+  async alignForms(source?: string): Promise<void> {
+    if (this.closing) return;
+    const sources = this.runtime.list().filter((state) => state.state === "active" && state.source && (source === undefined || state.source === source));
+    await Promise.all(sources.map(async (state) => {
+      try { await this.operations.align(state.source!); }
+      catch (error) { console.error(`插件 ${state.source} 的持久表单对齐失败：`, error); }
+    }));
   }
   private context(source: string, paneProtocol: number, dataDir: string, current: () => boolean): PaneHostContext {
     const resource: PluginResources = { releases: new Set(), notifications: new Set() };
@@ -190,6 +197,7 @@ export class PluginHost {
     return this.tracked(source, () => plugin.tree!.subscribe(after, (change) => {
       try {
         const value = change.type === "upsert" ? { ...change, node: this.nodes(source, [change.node], plugin)[0] } : structuredClone(change);
+        if (value.type === "reset") void this.alignForms(source);
         emit(value);
       } catch (error) { console.error(`插件 ${source} 的树事件失败：`, error); emit({ type: "reset", epoch: after.epoch }); }
     }));

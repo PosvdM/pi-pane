@@ -102,6 +102,51 @@ test("请求来源绑定凭证和连接，用户在场确认只路由发起标�
   } finally { for (const client of clients) client.close(); await server.close(); await f.cleanup(); }
 });
 
+test("浏览器重连与插件 tree reset 对齐持久表单，并发登录合并 pending 查询", { timeout: 60000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 1000 }); const clients = [];
+  try {
+    const token = await pair(server); const sample = server.plugins.runtime.get("sample");
+    assert.equal(server.plugins.operations.pending().length, 1); sample.forms.pending = async () => [];
+    const first = await connect(server, token); clients.push(first);
+    await until(() => server.plugins.operations.pending().length === 0);
+    assert.equal(first.messages.some(message => message.type === "form"), false);
+    let treeEmit; sample.tree.subscribe = (_after, emit) => { treeEmit = emit; return () => {}; };
+    first.ws.send(JSON.stringify({ type: "treeSubscribe", source: "sample", after: { epoch: "old", revision: 0 } }));
+    await until(() => treeEmit);
+    const form = { id: "reconnected", source: "sample", revision: 1, title: "重连后的提问", createdAt: "2026-01-02T00:00:00.000Z" };
+    sample.forms.pending = async () => [form]; treeEmit({ type: "reset", epoch: "new-backend" });
+    await until(() => first.messages.some(message => message.type === "form" && message.form.id === form.id));
+    assert.equal(server.plugins.operations.pending()[0].id, form.id);
+    let finish; let calls = 0; const gate = new Promise(resolve => { finish = resolve; });
+    sample.forms.pending = () => { calls++; return gate; };
+    const others = await Promise.all([connect(server, token), connect(server, token)]); clients.push(...others);
+    await until(() => calls === 1); finish([]);
+    await until(() => others.every(client => client.messages.some(message => message.type === "formRemoved" && message.source === "sample" && message.formId === form.id)));
+    assert.equal(calls, 1); assert.equal(server.plugins.operations.pending().length, 0);
+    sample.forms.pending = async () => { throw new Error("表单对齐异常"); };
+    const failed = await connect(server, token); clients.push(failed); failed.ws.send(JSON.stringify({ type: "ping" }));
+    await until(() => failed.messages.some(message => message.type === "pong")); assert.equal(failed.closed, undefined);
+  } finally { for (const client of clients) client.close(); await server.close(); await f.cleanup(); }
+});
+
+test("插件同步订阅异常只显示插件错误，不关闭共享 WebSocket 或主会话订阅", { timeout: 60000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 1000 }); let client;
+  try {
+    const token = await pair(server); client = await connect(server, token); const main = await open(server, token, f); client.subscribe(main);
+    const sample = server.plugins.runtime.get("sample");
+    sample.sessions.subscribe = () => { throw new Error("会话订阅异常"); };
+    sample.tree.subscribe = () => { throw new Error("树订阅异常"); };
+    client.ws.send(JSON.stringify({ type: "subscribe", ref: { source: "sample", id: "child" }, after: { epoch: "e", seq: 0 } }));
+    await until(() => client.closed || client.messages.some(message => message.type === "notification" && message.notification.source === "sample"));
+    assert.equal(client.closed, undefined, "插件异常不能关闭承载主会话的共享连接");
+    client.ws.send(JSON.stringify({ type: "treeSubscribe", source: "sample", after: { epoch: "e", revision: 0 } }));
+    await until(() => client.messages.filter(message => message.type === "notification" && message.notification.source === "sample").length === 2);
+    assert.equal(client.closed, undefined);
+    server.sessions.records.get(main.ref.id).model.emit({ type: "pane_status", status: "idle", phase: "idle", detail: "主会话仍可推送" });
+    await until(() => client.messages.some(message => message.type === "session" && message.ref.source === "pane" && message.event.detail === "主会话仍可推送"));
+  } finally { client?.close(); await server.close(); await f.cleanup(); }
+});
+
 test("persistent 横幅跨停用和重启保留，只有配置移除后可二次确认删除并审计", { timeout: 60000 }, async () => {
   const f = await piFixture(); let server; const clients = [];
   try {

@@ -440,9 +440,10 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 - 握手时校验 `Host` 和 `Origin`，但不在 URL 或握手头里带凭证。
 - 浏览器先用 `Authorization` 头调用 `POST /api/ws-ticket` 取一张一次性 ticket（30 秒有效），连接后发送的第一帧必须是 `{ "type": "auth", "ticket": "…" }`。5 秒内没有收到有效的首帧时服务端关闭连接。
 - 首帧之前服务端不推送任何数据，也不处理其他帧。
-- 鉴权通过后，服务端先发一条 `banners`（当前全部插件横幅，并带 `paneProtocol`、`connectionId`），再逐条发送当前持久表单的 `form`，随后处理订阅。每次重连都一样，所以横幅与待处理表单不依赖事件缓冲。
+- 鉴权通过后，服务端先发一条 `banners`（当前全部插件横幅，并带 `paneProtocol`、`connectionId`），随后对齐插件持久表单并逐条发送 `form`；对齐期间仍可处理其他订阅。每次重连都一样，所以横幅与待处理表单不依赖事件缓冲。
 - 会话订阅帧为 `{ type: "subscribe", ref, after: StreamCursor }`，取消帧为 `{ type: "unsubscribe", ref }`；`ref.source` 可以是 `pane` 或已启用的插件。每个连接以完整的 `(source, id)` 隔离订阅和慢客户端重同步，插件同名会话不会覆盖主会话。
 - 插件树订阅帧为 `{ type: "treeSubscribe", source, after: TreeCursor }`，取消帧为 `{ type: "treeUnsubscribe", source }`。插件负责快照切点和重放边界，服务端转发 `tree` 变更；浏览器按 [树同步规则](plugin-api.md#同步) 合并分页、修订号和 tombstone。
+- 插件的同步订阅异常通过现有 `notification` 错误消息报告，只影响该插件的订阅，不关闭承载主会话的共享连接。
 - 设备注册帧为 `{ type: "device", device: PresenceDevice }`，确认回应帧为 `{ type: "presenceResponse", id, response: { proof?: UserPresenceProof, error?: "rejected" | "unsupported" } }`。设备字段只用于显示和路由，不能替代插件后台的验签。
 - M3 的 v1 兼容扩展包括 `formRemoved.source` 和 `presenceClosed`。浏览器按 `(source, formId)` 识别持久表单；收到 `presenceClosed` 后关闭同一 `id` 的确认框。`confirmed` 表示已有标签页确认，`cancelled` 表示拒绝、取消或来源停用，`timeout` 表示到期。
 
@@ -524,6 +525,8 @@ Agent（主代理和子代理）与用户是同一个操作系统用户，在同
 涉及浏览器来源的请求必须提供首个 `banners` 帧里的 `connectionId`。服务端核对它属于当前 HTTP 凭证且仍在线，再填写 `RequestOrigin`；请求体中的 `origin`、`deviceId` 和时间不能覆盖这些字段。用户在场确认只接受收到该挑战的连接回应，签名内容和设备信任仍由插件后台验证。
 
 动作、表单和发送使用插件来源内共享的幂等键命名空间。重复且仍在执行时返回 `pending`；等待到期不取消底层调用，迟到的最终结果写回同一记录。插件已经返回 `pending` 时，同键查询可再次调用插件查询后台状态。最终结果至少保留 24 小时；同键不同内容返回 `idempotencyConflict`。重启后的最终幂等保证由插件及其后台提供，宿主不把内存记录当作持久事务日志。
+
+持久表单在宿主启动、插件树 `reset` 和浏览器连接或重连时对齐；同一插件的并发查询合并，单插件失败隔离。插件在后台重连后应发树 `reset`；浏览器全部断开时，宿主按约定取消订阅，并在下次浏览器连接时对齐列表。
 
 主会话树由 `main-tree.ts` 从会话目录与当前托管状态构建：项目分组保留在快照中，冷历史按 keyset 游标分页；来源级变更缓冲保留最近 2000 条，游标跨 epoch、超前或缓冲缺口均返回 `reset`。主会话保活可以在尚未打开或托管时登记，不会因此启动进程；hold 始终绑定原 `SessionRef`，进程切换后不会迁到新会话。
 

@@ -83,7 +83,7 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 
 订阅：`{type:"subscribe",ref:{source:"pane",id},after:{epoch,seq}}`。取消订阅：`{type:"unsubscribe",ref}`。事件使用 plugin-api.md 的会话流形状。信任询问通过 `{type:"project_trust",request:{id,cwd,expiresAt}}` 推送；没有浏览器时返回 undecided，不把它等同于不信任。
 
-插件的 HTTP 路由、非 `pane` 会话订阅、树订阅、设备注册与用户在场回应统一定义在 [architecture.md](architecture.md#插件-http-接口)。M3 的 v1 兼容扩展包括 `formRemoved.source` 与 `presenceClosed.reason`；持久表单按完整 `(source, formId)` 隔离，签名由插件后台验证。
+插件的 HTTP 路由、非 `pane` 会话订阅、树订阅、设备注册与用户在场回应统一定义在 [architecture.md](architecture.md#插件-http-接口)。M3 的 v1 兼容扩展包括 `formRemoved.source` 与 `presenceClosed.reason`；持久表单按完整 `(source, formId)` 隔离，并在启动、树 reset 与浏览器连接时对齐；签名由插件后台验证。
 
 每会话保留最近 2000 条事件，并用 32 MiB 字节限额限制缓冲；单条事件仍可保留。发送缓冲达到 1 MiB 时合并连续文本增量；达到 8 MiB 时以 resync 替换待发会话增量。非会话消息仍积压超过 1 MiB 时关闭慢连接。浏览器慢不会阻塞 RPC stdout。
 
@@ -124,11 +124,11 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 | 验收项 | 测试文件与断言 |
 | --- | --- |
 | 加载、版本与生命周期 | `plugins-runtime`：本地和 npm 定位符、包与实例双重版本范围、拒绝无效或重复 id、按配置顺序加载、激活失败、迟到 fence、私有目录、来源映射和幂等停用。 |
-| 超时与异常隔离 | `plugins-runtime`、`plugins-operations`：同步抛错、异步拒绝、超时后迟到成功或失败；`plugins-http`：插件失败后真实主会话仍能发送并完成 RPC。 |
+| 超时与异常隔离 | `plugins-runtime`、`plugins-operations`：同步抛错、异步拒绝、超时后迟到成功或失败；`plugins-http`：插件失败后真实主会话仍能发送并完成 RPC，同步订阅抛错不关闭共享 WebSocket 或主会话订阅。 |
 | 按需树与重连 | `plugins-main-tree`：热节点及祖先、keyset 分页、epoch、修订号、删除与 2000 条重放边界；`plugin-api-contract`：插件树与流的快照切点、分页、reset；`plugins-host`：循环与无效能力；`plugins-http`：HTTP 快照和 WS 实时变化。 |
 | 只读子会话、面板与渲染目录 | `plugins-http`：快照、流、面板与静态动作目录；`plugins-host`：会话图片提取、来源隔离、渲染器冲突按配置顺序选择及停用清理。 |
 | 动作、发送和表单幂等 | `plugins-operations`：共享键命名空间、内容冲突、并发 pending、返回 pending 后查询、真正迟到的最终结果、24 小时保留、容量限制与原样来源传递；`plugins-http`：浏览器同键重试。 |
-| 持久表单与待处理区 | `plugins-operations`：排序、revision、权威对齐和并发事件、双标签页 claim、失败释放、cancel、过期由插件裁定；`plugins-http`：两标签页提交仅一次接受，`formRemoved` 包含来源。 |
+| 持久表单与待处理区 | `plugins-operations`：排序、revision、权威对齐和并发事件、双标签页 claim、失败释放、cancel、过期由插件裁定；`plugins-http`：两标签页提交仅一次接受，`formRemoved` 包含来源，浏览器重连/tree reset 对齐、并发查询合并及异常隔离。 |
 | 用户在场确认 | `plugins-presence`：凭证与连接绑定、origin 优先与广播回退、首个有效回应、连接断开、严格 JSON、超时/拒绝/停用关闭帧；`plugins-http`：真实 HTTP/WS 路由，其他连接不能结束挑战。 |
 | 保活与主动关闭 | `plugins-holds`：仅列托管、读取历史、预登记 hold、多重 hold、空闲回收、关闭二次确认、旧 release 空操作、进程切换不迁移 hold；`plugins-host`：失败和停用释放插件资源。 |
 | 横幅故障 | `plugins-banners`：原子写、重启、加载失败/停用保留 persistent 并标注不可用、来源恢复后 listBanners 与显式清除、配置移除二次确认/审计、I/O 失败保留旧状态；`plugins-http`：新连接重发、停用和重启、禁止删除仍配置来源。 |
