@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/plugin-api"
+    },
+    {
+      "path": "./packages/bridge-extension"
+    },
+    {
+      "path": "./packages/server"
+    }
+  ]
+}

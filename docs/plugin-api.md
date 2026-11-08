@@ -833,6 +833,8 @@ export interface BannerState extends PaneBanner {
 
 ## pi 原生扩展 UI 的适配
 
+`ExtensionUiRequest` 和主会话 `ControlRequest` 是 pi RPC 适配器内部的传输信封，定义在 `packages/server/src/pi-rpc.ts`，不从 `@pi-pane/plugin-api` 导出。插件只实现本文定义的通用方法和字段，无需提供 pi 原生 RPC、扩展 UI 请求或主会话控制命令；可用通用会话事件、动作和表单表达自身能力。pane 作为 pi 的界面负责适配原生能力，不把这些能力作为其他来源的前置条件。
+
 主会话里的 pi 扩展调用 `ctx.ui.*` 时，pi 在 RPC 模式下发出 `extension_ui_request`（依据：pi `docs/rpc-extension-ui.md`），pi-pane 转给浏览器：
 
 | pi 方法 | 浏览器中的表现 | 回应 |
@@ -857,6 +859,7 @@ export interface BannerState extends PaneBanner {
 
 pane 协议的版本由 pi-pane 定义和维护：
 
+- 版本范围必须是长度恰好为 2 的数组，两个端点均为正的安全整数，且下界不大于上界；畸形范围直接拒绝。WebSocket 首帧使用实际协商结果。
 - pi-pane 声明自己支持的范围（当前 `[1, 1]`），插件在 `package.json` 和 `PanePlugin.paneProtocol` 里声明自己的范围；取交集中的最大值作为协商结果，通过 `ctx.paneProtocol` 告诉插件。没有交集时拒绝加载。
 - 新增可选字段、新增 `capabilities` 值、新增 `PanelContent.type`、新增会话事件类型不升版本；pi-pane 和插件都忽略不认识的字段、能力值和事件。删除字段或改变字段语义才升版本，pi-pane 至少同时支持当前和上一个版本。
 - 改协议先改本文，再改 `@pi-pane/plugin-api`，并在发布说明里写明。

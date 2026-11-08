@@ -1,0 +1,33 @@
+{
+  "name": "pi-pane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "pi 编码智能体的 Web 界面",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "pretest": "npm run build",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\"",
+    "start": "node packages/server/dist/cli.js"
+  },
+  "dependencies": {
+    "pi-hostkit": "github:PosvdM/pi-hostkit#36f97ae683d5b0fb8ee495eecc04df7ab381f66a",
+    "ws": "^8.18.3",
+    "busboy": "^1.6.0",
+    "image-size": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/ws": "^8.18.1",
+    "@types/busboy": "^1.5.4",
+    "typescript": "^7.0.2",
+    "playwright-core": "^1.58.2"
+  }
+}
