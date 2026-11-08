@@ -137,7 +137,12 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     el.focus();
     if (range) { const sel = getSelection()!; sel.removeAllRanges(); sel.addRange(range); }
     else if (!el.contains(getSelection()?.anchorNode ?? null)) { const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); getSelection()!.removeAllRanges(); getSelection()!.addRange(r); }
-    document.execCommand("insertHTML", false, html);
+    // Chrome 插入带样式的原子节点时会复制计算样式，触发内联样式 CSP 限制。
+    // 先插入无样式节点，再恢复 class，同时保留浏览器原生撤销记录。
+    const fragment = document.createElement("div"); fragment.innerHTML = html;
+    fragment.querySelectorAll<HTMLElement>(".chip").forEach((chip) => { chip.dataset.chipClass = chip.className; chip.removeAttribute("class"); });
+    document.execCommand("insertHTML", false, fragment.innerHTML);
+    el.querySelectorAll<HTMLElement>("[data-chip-class]").forEach((chip) => { chip.className = chip.dataset.chipClass!; delete chip.dataset.chipClass; });
     refresh();
   }
   async function addFiles(files: File[], range?: Range | null) {
