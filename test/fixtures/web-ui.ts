@@ -3,6 +3,11 @@ export default function(pi) {
   pi.on("session_before_switch", () => cancelTransitions ? { cancel: true } : undefined);
   pi.on("session_before_fork", () => cancelTransitions ? { cancel: true } : undefined);
   pi.registerCommand("pane-web-ready", { handler: async () => {} });
+  pi.registerCommand("pane-web-state", { handler: async (args) => {
+    const [kind, value] = args.split(" ");
+    if (kind === "thinking") pi.setThinkingLevel(value);
+    else if (kind === "name") pi.setSessionName(value);
+  } });
   pi.registerCommand("pane-web-cancel-transitions", { handler: async () => { cancelTransitions = true; } });
   pi.registerCommand("pane-web-dialog", { handler: async (args, ctx) => {
     const [kind, timeout] = args.split(" ");
