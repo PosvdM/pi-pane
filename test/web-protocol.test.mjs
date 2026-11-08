@@ -4,6 +4,7 @@ import { randomUUID, randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile, utimes, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { png } from "../experiments/p0/b-bridge/images.mjs";
 import { TrustDecisions } from "../packages/server/dist/trust.js";
 import { ExportStore } from "../packages/server/dist/exports.js";
 import { piFixture, providerPath, until } from "./fixtures/helpers.mjs";
@@ -116,6 +117,88 @@ test("已托管的同名扩展命令优先于终端限制，提示模板按 deli
     const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
     assert.equal(stopped.code, 200, JSON.stringify(stopped));
     assert.deepEqual([...stopped.value.clearedText].sort(), ["模板展开：followUp", "模板展开：steer"].sort());
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+test("Q1 HTTP 模板展开后的图片队列停止时 clearedDrafts 保留原图片节点与顺序", { timeout: 60_000 }, async () => {
+  const f = await piFixture({ fallback: { segments: [{ type: "hang" }] } });
+  await mkdir(path.join(f.agentDir, "prompts"));
+  await writeFile(path.join(f.agentDir, "prompts", "pane-image.md"), "模板展开 $ARGUMENTS");
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  try {
+    const token = await pair(server); let state = await ready(server, token, f);
+    const form = new FormData();
+    form.append("image", new Blob([png(0, 1, 1)], { type: "image/png" }), "original.png");
+    form.append("thumb", new Blob([Buffer.from("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA", "base64")], { type: "image/webp" }), "thumb.webp");
+    const uploaded = await fetch(server.origin + "/api/assets", { method: "POST", headers: { Authorization: "Bearer " + token, "X-Request-Id": randomUUID() }, body: form });
+    assert.equal(uploaded.status, 200);
+    const { assetId } = await uploaded.json();
+    const running = await control(server, token, state, { type: "prompt", message: "等待附图排队" });
+    assert.equal(running.code, 200, JSON.stringify(running)); state = running.value.snapshot;
+    await until(async () => (await readFile(f.env.FAKE_REQUEST_LOG, "utf8")).includes('"kind":"hang"'));
+    const drafts = ["followUp", "steer"].map(delivery => [
+      { type: "text", text: `/pane-image ${delivery} 图片之前 ` },
+      { type: "image", assetId },
+      { type: "text", text: " 图片之后" },
+    ]);
+    for (const [i, delivery] of ["followUp", "steer"].entries()) {
+      const queued = await control(server, token, await snapshot(server, token, state.ref.id), { type: "prompt", delivery }, { draft: drafts[i] });
+      assert.equal(queued.code, 200, JSON.stringify(queued));
+      assert.equal(queued.value.status, "accepted");
+    }
+    const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped));
+    assert.equal(stopped.value.status, "done");
+    assert.equal(stopped.value.clearedText.length, 2);
+    for (const text of stopped.value.clearedText) {
+      assert.match(text, /^模板展开 (?:followUp|steer) 图片之前 ⟦pane-img:[a-z0-9]{8}:1⟧ 图片之后$/);
+      assert.equal(text.includes("/pane-image"), false, "实际队列必须经过模板展开，不能以原文字匹配掩盖问题");
+    }
+    // clear_queue 按追加、排队的顺序返回；同一 assetId 的不同 nonce 必须匹配各自原始文字。
+    assert.deepEqual(stopped.value.clearedDrafts, [drafts[1], drafts[0]]);
+    assert.deepEqual(stopped.value.clearedDrafts.map(draft => draft.map(node => node.type)), [["text", "image", "text"], ["text", "image", "text"]]);
+    assert.deepEqual(stopped.value.clearedDrafts.map(draft => draft[1]), [{ type: "image", assetId }, { type: "image", assetId }]);
+    const log = (await readFile(f.env.FAKE_REQUEST_LOG, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(log.filter(row => row.kind === "request").length, 1, "停止前排队的两条图片消息均不得消费");
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+test("Q1 HTTP 固定模板的相同队列文字按先进先出恢复两张不同图片，覆盖四种送达命令", { timeout: 60_000 }, async () => {
+  const f = await piFixture({ fallback: { segments: [{ type: "hang" }] } });
+  const fixed = "固定模板正文，不包含参数占位符";
+  await mkdir(path.join(f.agentDir, "prompts"));
+  await writeFile(path.join(f.agentDir, "prompts", "pane-fixed.md"), fixed);
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  try {
+    const token = await pair(server); let state = await ready(server, token, f);
+    const assetIds = [];
+    for (const i of [0, 1]) {
+      const form = new FormData();
+      form.append("image", new Blob([png(i, 1, 1)], { type: "image/png" }), `original-${i}.png`);
+      form.append("thumb", new Blob([Buffer.from("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA", "base64")], { type: "image/webp" }), "thumb.webp");
+      const response = await fetch(server.origin + "/api/assets", { method: "POST", headers: { Authorization: "Bearer " + token, "X-Request-Id": randomUUID() }, body: form });
+      assert.equal(response.status, 200); assetIds.push((await response.json()).assetId);
+    }
+    assert.notEqual(assetIds[0], assetIds[1]);
+    const commands = [{ type: "steer" }, { type: "follow_up" }, { type: "prompt", delivery: "steer" }, { type: "prompt", delivery: "followUp" }];
+    for (const [round, command] of commands.entries()) {
+      const running = await control(server, token, await snapshot(server, token, state.ref.id), { type: "prompt", message: `固定模板排队现场 ${round}` });
+      assert.equal(running.code, 200, JSON.stringify(running)); state = running.value.snapshot;
+      await until(async () => (await readFile(f.env.FAKE_REQUEST_LOG, "utf8")).trim().split("\n").map(JSON.parse).filter(row => row.kind === "hang").length === round + 1);
+      const drafts = assetIds.map((assetId, i) => [{ type: "text", text: `/pane-fixed 图片 ${i + 1} 之前 ` }, { type: "image", assetId }, { type: "text", text: ` 图片 ${i + 1} 之后` }]);
+      for (const draft of drafts) {
+        const queued = await control(server, token, await snapshot(server, token, state.ref.id), command, { draft });
+        assert.equal(queued.code, 200, JSON.stringify({ command, queued }));
+        assert.equal(queued.value.status, "accepted");
+      }
+      const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
+      assert.equal(stopped.code, 200, JSON.stringify(stopped));
+      assert.deepEqual(stopped.value.clearedText, [fixed, fixed], "队列中两条相同的固定正文均没有图片 nonce，不能回退到 nonce 查找");
+      assert.deepEqual(stopped.value.clearedDrafts, drafts, JSON.stringify(command) + " 必须按顺序恢复各自原草稿");
+      assert.deepEqual(stopped.value.clearedDrafts.map(draft => draft[1]), assetIds.map(assetId => ({ type: "image", assetId })));
+    }
+    const log = (await readFile(f.env.FAKE_REQUEST_LOG, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(log.filter(row => row.kind === "request").length, commands.length, "每轮只有慢速回合调用模型，固定模板图片均未消费");
   } finally { await server.close(); await f.cleanup(); }
 });
 
