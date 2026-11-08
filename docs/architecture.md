@@ -227,6 +227,29 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 
 - 本实例取得写锁后的恢复失败、启动清理释放失败及启动时运行记录恢复失败，由实例级清理错误集合保存，关闭时汇总并保留实例锁；记录隔离诊断失败也不能覆盖该错误。启动前已有的 `recovery/` 隔离标记仅列入 `Sessions.recoveryDiagnostics`，CLI 输出其文件名，正常关闭不因此失败；标记仍阻止对应会话自动托管，须按会话写锁节的维护流程处理。
 
+### 关闭期间的网络入口
+
+`PaneServer.close()` 在返回 Promise 之前同步设置 HTTP/WebSocket 关闭门禁，门禁持续到实例退出。停止与排空期间 HTTP 暂时保持监听：除规范源下的 `GET /api/instance` 外，所有新 HTTP 请求均返回 503 `serverStopping`，不消费配对码、不签发 ticket、不登记幂等操作。保留实例探测便于识别仍在退出的实例；其他只读接口及静态文件也拒绝，避免继续读取会话或触发 blob 缓存重建。Host/Origin 校验仍适用于普通 HTTP 请求。进入网络收尾后停止监听，请求可能直接遭到连接拒绝或断开。
+
+| HTTP/WebSocket 入口 | 停止与排空期间的行为 |
+| --- | --- |
+| `GET /api/instance` | 返回 200 和当前实例标识；只读且不取得资源。 |
+| `POST /api/auth/pair`、`POST /api/auth/code`、`POST /api/auth/logout` | 返回 503 `serverStopping`，不修改凭证。 |
+| `POST /api/ws-ticket` | 返回 503 `serverStopping`，不签发 ticket。 |
+| `GET /api/sessions`、`POST /api/sessions/open` | 返回 503 `serverStopping`，不枚举或打开会话。 |
+| `GET /api/trust`、`POST /api/trust/:id` | 返回 503 `serverStopping`，不读取或提交信任决定。 |
+| `GET /api/sessions/:id/snapshot`、`GET /api/sessions/:id/history` | 返回 503 `serverStopping`。 |
+| `POST /api/sessions/:id/control`、`POST /api/sessions/:id/query`、`POST /api/sessions/:id/ui` | 返回 503 `serverStopping`，不提交控制、RPC 查询或 UI 回应。 |
+| `POST /api/assets`、`POST /api/assets/touch` | 返回 503 `serverStopping`，不上传或刷新附件。 |
+| `GET /api/assets/:hash`、`GET /api/assets/:hash/thumb`、`GET /api/blobs/:hash`、`GET /api/blobs/:hash/thumb` | 返回 503 `serverStopping`，不读取附件或重建缓存。 |
+| `POST /bridge/launch`、`POST /bridge/event` | 返回 503 `serverStopping`，不兑换 bridge ticket 或受理新桥接事件；已登记事件按关闭屏障收尾。 |
+| 静态文件、未知路径及其他方法 | 返回 503 `serverStopping`。 |
+| WebSocket upgrade（包括 `/ws`） | 返回 HTTP 503 并关闭 socket，不建立新连接。 |
+| 已进入 upgrade 的 socket、握手完成后迟到的 connection 回调 | 关闭入口销毁在途 socket，并终结 `wss.clients` 中的连接；迟到回调直接终结连接，不登记客户端。 |
+| WebSocket 首帧 ticket 鉴权、subscribe、unsubscribe、ping 及其他消息 | 关闭入口终结全部现存连接；迟到消息直接终结连接，不兑换 ticket 或修改订阅。 |
+
+关闭前开始读取 JSON 或 multipart 请求体的请求，在读取完成后、执行副作用之前复查门禁；上传还在异步模块加载后复查。已进入会话/driver/bridge 屏障的工作遵循其既定取消与排空规则。网络收尾开始前再次销毁在途 upgrade 并终结全部现存 WebSocket，覆盖停止等待期间的迟到交付；不能仅依赖关闭入口时的客户端快照。成功关闭要求 HTTP/WebSocket 收尾完成且实例锁释放得到确认，客户端无须主动回应 WebSocket 关闭握手。
+
 ### 统一关闭屏障
 
 同一实例的 Sessions、driver、BridgeBroker 和 PaneServer 共用 `BridgeBroker.inflight`。`Inflight.run(kind, operation)` 在执行 operation 前同步检查关闭门禁并登记，无论成功、同步抛错或异步拒绝都移除登记。控制操作登记的是底层控制队列的完整 Promise；HTTP 等待返回 pending 不结束登记。
