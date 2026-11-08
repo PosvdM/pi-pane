@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { api, ApiError, newId } from "../lib/api.ts";
 import { current } from "../lib/session.ts";
 import { useStore } from "../lib/store.ts";
+import { trustChanged } from "../lib/events.ts";
 import { choice, dismissToast, extensionUi, toast, toasts, trustRequests, type DialogRequest } from "../lib/ui-state.ts";
 import type { PaneUiAnswerResult } from "../lib/types.ts";
 
@@ -115,7 +116,7 @@ export function TrustDialog() {
   const request = requests[0];
   const [remember, setRemember] = useState(false);
   const left = useCountdown(request?.expiresAt);
-  useEffect(() => { if (request && left === 0) trustRequests.set((list) => list.filter((r) => r.id !== request.id)); }, [left]);
+  useEffect(() => { if (request && left === 0) (trustChanged(), trustRequests.set((list) => list.filter((r) => r.id !== request.id))); }, [left]);
   if (!request) return null;
   async function decide(trusted?: boolean) {
     const body = trusted === undefined ? {} : { decision: { trusted, remember } };
@@ -123,10 +124,10 @@ export function TrustDialog() {
     const requestId = attempts.get(key) ?? newId(); attempts.set(key, requestId);
     try {
       await api(`/api/trust/${encodeURIComponent(request.id)}`, { requestId, ...body });
-      attempts.delete(key); trustRequests.set((list) => list.filter((r) => r.id !== request.id));
+      attempts.delete(key); (trustChanged(), trustRequests.set((list) => list.filter((r) => r.id !== request.id)));
     } catch (error) {
       // 询问已处理或过期时关闭；其他失败保留询问以便重试。
-      if (error instanceof ApiError && error.code === "trustExpired") { attempts.delete(key); trustRequests.set((list) => list.filter((r) => r.id !== request.id)); }
+      if (error instanceof ApiError && error.code === "trustExpired") { attempts.delete(key); (trustChanged(), trustRequests.set((list) => list.filter((r) => r.id !== request.id))); }
       else toast(`回答未送达：${(error as Error).message}，可以重试`, "warning");
     }
   }

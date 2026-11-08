@@ -295,9 +295,12 @@ export async function stopRun(): Promise<void> {
 }
 
 export async function restart(): Promise<void> {
+  const owner = nav;
   let outcome = await control({ type: "restart" });
   if (!outcome.ok && /assumeNoWriter|状态不明|writerUnknown/.test(outcome.error.code + outcome.error.message)) {
     const answer = await ask("确认重启", "上一个写者的状态无法确认。请确认没有其他程序在写这个会话后再重启。", [{ label: "取消", value: "cancel" }, { label: "确认重启", value: "ok", danger: true }]);
+    // 确认期间用户可能已切换到其他会话：确认只对原会话有效。
+    if (nav !== owner) return;
     if (answer === "ok") outcome = await control({ type: "restart", assumeNoWriter: true });
   }
   if (!outcome.ok) toast(outcome.error.message, "error");
@@ -306,11 +309,12 @@ export async function restart(): Promise<void> {
 /** 关闭会话；返回是否已关闭（失败或用户取消时为 false）。 */
 export async function closeSession(): Promise<boolean> {
   const state = current.get(); if (!state?.model) return false;
+  const owner = nav;
   let outcome = await control({ type: "close" });
   if (!outcome.ok && outcome.error.code === "holdsConfirmation") {
     const holds = current.get()?.model?.view.holds.map((h) => `· ${h.reason}（${h.source}）`).join("\n") ?? "";
     const answer = await ask("关闭会话", `会话仍被保活：\n${holds}\n仍要关闭吗？`, [{ label: "取消", value: "cancel" }, { label: "关闭", value: "ok", danger: true }]);
-    if (answer !== "ok") return false;
+    if (answer !== "ok" || nav !== owner) return false;
     outcome = await control({ type: "close", confirmHolds: true });
   }
   if (!outcome.ok) { toast(outcome.error.code === "revisionChanged" ? "会话状态已变化，请确认后重新关闭" : outcome.error.message, "error"); return false; }

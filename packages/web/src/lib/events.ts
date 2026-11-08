@@ -8,9 +8,14 @@ import type { PaneTrustRequest } from "./types.ts";
 let editorSeq = 0;
 /** 信任询问列表的实时变更次数：HTTP 快照与 WebSocket 推送没有共同顺序，快照请求期间有推送时重新获取。 */
 let trustVersion = 0;
+/** 同步代次：只有最后一次发起的快照请求可以提交，跨重连晚到的旧快照被丢弃。 */
+let trustSync = 0;
+/** 本地删除（回答、超时）也计入变更，避免同期快照让已处理的询问复活。 */
+export function trustChanged(): void { trustVersion++; }
 function syncTrust(): void {
-  const version = trustVersion;
+  const version = trustVersion; const seq = ++trustSync;
   void api<{ requests: PaneTrustRequest[] }>("/api/trust").then(({ requests }) => {
+    if (seq !== trustSync) return;
     if (version === trustVersion) trustRequests.set(requests); else syncTrust();
   }).catch(() => {});
 }
