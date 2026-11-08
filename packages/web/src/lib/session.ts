@@ -81,7 +81,7 @@ function scheduleStateRefresh(): void {
 
 function onEvent(id: string, record: Parameters<typeof apply>[1]): void {
   const state = current.get();
-  if (!state || state.id !== id || !state.model || reloading?.id === id) return;
+  if (!state || state.id !== id || !state.model || (reloading?.id === id && reloading.nav === nav)) return;
   const revision = state.model.view.controlRevision;
   if (retiredEpochs.has(record.cursor.epoch)) return;
   const result = apply(state.model, record);
