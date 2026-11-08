@@ -111,5 +111,3 @@ function updateAssistant(inFlight: InFlightState, event: any): void {
   assistant.blocks = assistant.blocks.map((b) => b.contentIndex === i ? next : b);
 }
 
-/** 聊天视图的条目：持久化条目 + 尚未落盘的完整消息。 */
-export function messageEntries(state: ModelState): Entry[] { return state.entries; }

@@ -47,6 +47,13 @@ export async function refreshList(): Promise<void> {
   }
 }
 
+let listTimer: ReturnType<typeof setTimeout> | undefined;
+/** 会话文件在首次回复后才落盘，运行结束或会话替换后刷新侧栏列表。 */
+function scheduleListRefresh(): void {
+  clearTimeout(listTimer);
+  listTimer = setTimeout(() => { void refreshList(); }, 500);
+}
+
 function setModel(id: string, view: PaneSessionView, extra: Partial<Current> = {}): void {
   const previous = current.get();
   const keep = previous?.id === id ? { stats: previous.stats, commands: previous.commands, warning: previous.warning, heldBy: previous.heldBy } : {};
@@ -71,7 +78,8 @@ function onEvent(id: string, record: Parameters<typeof apply>[1]): void {
   if (event.type === "pane_session_replaced") {
     if (Date.now() < followUntil) { followUntil = 0; void open(event.newRef.id); return; }
   }
-  if (event.type === "pane_status" && event.status === "idle") void refreshStats();
+  if (event.type === "pane_status" && event.status === "idle") { void refreshStats(); scheduleListRefresh(); }
+  if (event.type === "pane_session_replaced") scheduleListRefresh();
   current.touch();
 }
 
