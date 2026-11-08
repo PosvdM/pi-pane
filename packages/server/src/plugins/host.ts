@@ -30,6 +30,7 @@ export class PluginHost {
   private readonly subscriptions = new Map<string, Set<() => void>>();
   private readonly rendererOwners = new Map<string, string>();
   private closing = false;
+  private closePromise?: Promise<void>;
   constructor(private readonly options: PluginHostOptions) {
     this.banners = new BannerStore(options.home, options.emit, (source) => this.runtime.configured(source));
     this.runtime = new PluginRuntime({
@@ -218,9 +219,12 @@ export class PluginHost {
       } catch (error) { console.error(`插件 ${ref.source} 的会话事件失败：`, error); emit({ ref, cursor: after, event: { type: "resync" } }); }
     }));
   }
-  async close(): Promise<void> {
-    if (this.closing) return; this.closing = true;
-    this.presence.close(); this.operations.close();
-    await this.runtime.close(); this.banners.close();
+  close(): Promise<void> {
+    if (!this.closePromise) this.closePromise = this.performClose();
+    return this.closePromise;
+  }
+  private async performClose(): Promise<void> {
+    this.closing = true; this.presence.close(); this.operations.close();
+    try { await this.runtime.close(); } finally { this.banners.close(); }
   }
 }

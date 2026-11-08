@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -54,7 +54,7 @@ export class PluginRuntime {
   private readonly sources = new Map<string, string>();
   private readonly timeoutMs: number;
   private readonly home: string;
-  private readonly cwd = process.cwd();
+  private readonly installation = createRequire(import.meta.url);
   private readonly log: NonNullable<PluginRuntimeOptions["log"]>;
   private started?: Promise<void>;
   private closing?: Promise<void>;
@@ -171,25 +171,26 @@ export class PluginRuntime {
     return this.writes;
   }
 
-  private async metadata(locator: string): Promise<{ directory: string; entry: string; protocol: number }> {
-    let directory = resolve(this.cwd, locator);
-    let contents: string;
-    try { contents = await readFile(join(directory, "package.json"), "utf8"); }
-    catch (error) {
-      if (!missing(error) || isAbsolute(locator) || locator.startsWith(".")) throw error;
-      if (!/^(?:@[^/\\]+\/)?[^/\\]+$/.test(locator)) throw new Error("插件定位符必须为目录或 npm 包名");
-      const require = createRequire(join(this.cwd, "package.json"));
-      let found: string | undefined;
-      // 直接寻找包目录，兼容未在 exports 中公开 package.json 的 npm 包。
-      for (const base of require.resolve.paths(locator) ?? []) {
+  private async metadata(locator: string): Promise<{ directory: string; entry: string; protocol: number; version: string }> {
+    if (typeof locator !== "string" || !locator.length) throw new Error("插件定位符必须为目录或 npm 包名");
+    const packageName = /^(?:@[^/\\]+\/)?[^/\\]+$/.test(locator) && !locator.startsWith(".") && !isAbsolute(locator);
+    let directory: string; let contents: string;
+    if (!packageName) {
+      directory = resolve(this.home, locator);
+      contents = await readFile(join(directory, "package.json"), "utf8");
+    } else {
+      let found: string | undefined; let packageDirectory: string | undefined;
+      // 仅从服务端安装位置寻找包，不能执行启动项目中的同名插件。
+      for (const base of this.installation.resolve.paths(locator) ?? []) {
         const candidate = join(base, locator);
-        try { found = await readFile(join(candidate, "package.json"), "utf8"); directory = candidate; break; }
+        try { found = await readFile(join(candidate, "package.json"), "utf8"); packageDirectory = candidate; break; }
         catch (candidateError) { if (!missing(candidateError)) throw candidateError; }
       }
-      if (found === undefined) throw new Error(`找不到插件 ${locator}`);
-      contents = found;
+      if (found === undefined || packageDirectory === undefined) throw new Error(`在 pane 安装位置找不到插件 ${locator}`);
+      contents = found; directory = packageDirectory;
     }
-    const metadata = JSON.parse(contents)?.piPane;
+    directory = await realpath(directory);
+    const manifest = JSON.parse(contents); const metadata = manifest?.piPane;
     if (!metadata || typeof metadata.entry !== "string" || !metadata.entry) throw new Error("插件缺少 piPane.entry");
     const entry = resolve(directory, metadata.entry);
     const inside = relative(directory, entry);
@@ -197,12 +198,13 @@ export class PluginRuntime {
       throw new Error("插件入口必须位于包目录内");
     }
     const protocol = negotiateProtocol(metadata.paneProtocol);
-    return { directory, entry, protocol };
+    return { directory, entry, protocol, version: typeof manifest.version === "string" ? manifest.version : "未声明" };
   }
 
   private async load(entry: Entry): Promise<void> {
     try {
       const metadata = await this.run(entry, "解析入口", () => this.metadata(entry.view.locator));
+      this.report("info", `插件 ${entry.view.locator} 解析到 ${metadata.directory}，版本 ${metadata.version}，入口 ${metadata.entry}`);
       const module = await this.run(entry, "导入入口", () => import(pathToFileURL(metadata.entry).href));
       const plugin = await this.run(entry, "createPlugin", () => {
         if (typeof module.default !== "function") throw new Error("插件必须默认导出同步 createPlugin 工厂");

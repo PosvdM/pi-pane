@@ -25,6 +25,13 @@ async function fixture(t, entries) {
 }
 const node = (id, parentId = null, extra = {}) => ({ id, source: "sample", kind: "group", parentId, title: id, status: "idle", availability: "online", hasChildren: true, sortKey: id, revision: 1, capabilities: [], ...extra });
 
+test("重复关闭共享同一清理屏障，不会在 deactivate 完成前返回", async t => {
+  const f = await fixture(t, [`export let finish;const done=new Promise(resolve=>{finish=resolve});export const state={calls:0};export default function(){return{id:'sample',paneProtocol:[1,1],async activate(){},async deactivate(){state.calls++;await done}}}`]);
+  const first = f.host.close(); const second = f.host.close(); assert.strictEqual(first, second);
+  let completed = false; void second.then(() => { completed = true; }); await Promise.resolve(); assert.equal(completed, false);
+  f.modules[0].finish(); await first; assert.equal(f.modules[0].state.calls, 1);
+});
+
 test("激活失败先使上下文失效，再释放 hold 与监听，持久横幅保留且临时横幅移除", async t => {
   const f = await fixture(t, [`export let context;
     export default function() { return {id:'sample',paneProtocol:[1,1],async activate(ctx){context=ctx;

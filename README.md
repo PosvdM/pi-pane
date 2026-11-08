@@ -73,7 +73,7 @@ npm test
 npm start
 ```
 
-`npm start` 提供服务端接口，默认监听 `127.0.0.1:4319`，终端显示一次性配对地址。当前没有可操作的首页。配置文件为 `~/.pi/pane/config.json`，可设置 `piPath`、`port`、`idleReclaimMs` 和 `plugins`；`PI_PANE_HOME` 可覆盖数据目录。`plugins` 只填写可信服务端插件的 npm 包名或本地目录，因为插件与服务端有相同的系统权限，不是沙箱。加载约定见 [插件接口](docs/plugin-api.md#插件的加载)，接口与测试入口见 [开发文档](docs/development.md)。
+`npm start` 提供服务端接口，默认监听 `127.0.0.1:4319`，终端显示一次性配对地址。当前没有可操作的首页。配置文件为 `~/.pi/pane/config.json`，可设置 `piPath`、`port`、`idleReclaimMs` 和 `plugins`；`PI_PANE_HOME` 可覆盖数据目录。`plugins` 只填写可信服务端插件的 npm 包名或本地目录，因为插件与服务端有相同的系统权限，不是沙箱。npm 包从 pane 安装位置查找，相对本地目录以配置目录为基准，启动 cwd 不参与解析。加载约定见 [插件接口](docs/plugin-api.md#插件的加载)，接口与测试入口见 [开发文档](docs/development.md)。
 
 ## 文档
 

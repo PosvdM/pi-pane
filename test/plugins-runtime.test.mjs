@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
@@ -32,7 +34,7 @@ async function fixture(t) {
     const control = { factories: 0, deactivations: 0, notifications: [], ...options.control };
     controls.set(token, control);
     const metadata = options.metadata ?? { entry: "./entry.mjs", paneProtocol: options.metadataProtocol ?? [1, 1] };
-    await writeFile(join(directory, "package.json"), JSON.stringify({ name: options.name ?? `plugin-${token}`, type: "module", piPane: metadata, exports: "./entry.mjs" }));
+    await writeFile(join(directory, "package.json"), JSON.stringify({ name: options.name ?? `plugin-${token}`, version: "1.2.3", type: "module", piPane: metadata, exports: "./entry.mjs" }));
     await writeFile(join(directory, "entry.mjs"), `
 const control = globalThis[${JSON.stringify(key)}].get(${JSON.stringify(token)});
 ${options.topLevel ?? ""}
@@ -80,7 +82,7 @@ const timeout = error => error instanceof PaneError && error.code === "pluginTim
 test("加载目录插件、协商双重范围并在激活前创建私有上下文", async t => {
   const f = await fixture(t);
   const plugin = await f.plugin("sample", { metadataProtocol: [1, 3], protocol: [1, 2] });
-  const loaded = f.runtime([relative(process.cwd(), plugin.directory)]);
+  const loaded = f.runtime([relative(f.home, plugin.directory)]);
   const starting = loaded.runtime.start();
   assert.strictEqual(loaded.runtime.start(), starting);
   await starting;
@@ -110,16 +112,39 @@ test("插件按照配置顺序完成加载，不并行激活后续来源", async
   assert.deepEqual(order, ["first", "second"]);
 });
 
-test("npm 包定位兼容未公开 package.json 的 exports", async t => {
-  const f = await fixture(t);
-  const previous = process.cwd();
-  const plugin = await f.plugin("npm-source", { directory: join(f.root, "node_modules", "@fixture", "plugin"), name: "@fixture/plugin" });
+test("npm 包仅从服务端安装位置解析，启动项目的同名包不能覆盖", async t => {
+  const f = await fixture(t); const scope = "pane-runtime-fixture-" + randomUUID(); const name = `@${scope}/plugin`;
+  const directory = fileURLToPath(new URL(`../node_modules/@${scope}/plugin/`, import.meta.url));
+  t.after(() => rm(fileURLToPath(new URL(`../node_modules/@${scope}/`, import.meta.url)), { recursive: true, force: true }));
+  const plugin = await f.plugin("npm-source", { directory, name });
+  const shadow = await f.plugin("shadow", { directory: join(f.root, "node_modules", `@${scope}`, "plugin"), name });
+  const previous = process.cwd(); let loaded;
   process.chdir(f.root);
-  let loaded;
-  try { loaded = f.runtime(["@fixture/plugin"]); }
-  finally { process.chdir(previous); }
+  try { loaded = f.runtime([name]); } finally { process.chdir(previous); }
   await loaded.runtime.start();
   assert.strictEqual(loaded.runtime.get("npm-source"), plugin.control.instance);
+  assert.equal(shadow.control.factories, 0);
+  const resolved = await realpath(directory);
+  assert.ok(loaded.logs.some(log => log.some(value => String(value).includes(resolved) && String(value).includes("1.2.3"))));
+});
+
+test("只存在于启动项目的 npm 插件不会作为回退加载", async t => {
+  const f = await fixture(t); const name = "pane-cwd-only-" + randomUUID();
+  const shadow = await f.plugin("shadow", { directory: join(f.root, "node_modules", name), name });
+  const previous = process.cwd(); let loaded; process.chdir(f.root);
+  try { loaded = f.runtime([name]); } finally { process.chdir(previous); }
+  await loaded.runtime.start();
+  assert.equal(loaded.runtime.list()[0].state, "failed"); assert.equal(shadow.control.factories, 0);
+});
+
+test("相对本地路径以配置目录为基准，与启动 cwd 无关", async t => {
+  const f = await fixture(t); const project = join(f.root, "project");
+  const trusted = await f.plugin("local", { directory: join(f.home, "trusted") });
+  const shadow = await f.plugin("shadow", { directory: join(project, "trusted") });
+  const previous = process.cwd(); let loaded; process.chdir(project);
+  try { loaded = f.runtime(["./trusted"]); } finally { process.chdir(previous); }
+  await loaded.runtime.start(); assert.strictEqual(loaded.runtime.get("local"), trusted.control.instance);
+  assert.equal(shadow.control.factories, 0);
 });
 
 test("元数据和实例范围必须同时支持协议 1", async t => {
