@@ -99,7 +99,14 @@ export default function (pi) {
             if (segment.delayMs) await delay(segment.delayMs, undefined, { signal });
             checkAbort();
             if (segment.type === 'error') throw new Error(segment.message ?? '测试脚本错误');
-            if (segment.type === 'hang') {
+            if (segment.type === 'waitForFile') {
+              // 文件门闩让浏览器测试决定当前回合何时结束，不依赖固定的模型延迟。
+              log({ kind: 'waiting', request, file: segment.file });
+              while (!existsSync(segment.file)) {
+                await delay(25, undefined, { signal });
+                checkAbort();
+              }
+            } else if (segment.type === 'hang') {
               log({ kind: 'hang', request, ignoreAbort });
               await new Promise((_resolve, reject) => {
                 if (!signal) return;

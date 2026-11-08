@@ -91,6 +91,8 @@
 
 `test/fixtures/ui-extension.ts` 提供 `/pane-dialogs`、`/pane-dialog-timeout` 和 `/pane-widgets`，分别触发顺序对话框、1500 毫秒超时选择框和扩展组件请求。调用方从 `helpers.mjs` 导入 `providerPath` 与 `uiExtensionPath`，以 `startServer(fixture, { extraExtensions: [providerPath, uiExtensionPath] })` 加载；`piFixture()` 不默认加载此扩展。对话框测试须在启动服务前将 `fixture.env.PANE_UI_LOG` 设置为临时现场中的日志路径。扩展将每个结果以 `{method,result}` JSONL 追加到该文件，取消或超时的 `undefined` 结果记录为 `null`。
 
+`test/fixtures/fake-provider.ts` 的 `waitForFile` 片段等待指定文件出现，并响应取消信号；日志中的 `waiting` 记录表示模型已进入门闩。浏览器回归通过临时现场中的文件解除门闩，控制当前回合的结束时机，避免用固定延迟猜测排队窗口。
+
 构建后可执行：
 
 ```sh
@@ -206,6 +208,8 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 | 渲染安全与 CSP | `test/web-e2e-conversation.test.mjs`：恶意 HTML 与 javascript 链接按文本显示，无危险元素、属性或链接，代码块高亮；`test/fixtures/web-e2e.mjs` 在收尾检查页面异常、控制台 error 与 CSP 违规，预期网络或 409 错误须逐项列入白名单，图片编辑场景也使用该检查 |
 | 审查回归 R1–R7、R9 | `test/web-e2e-regressions.test.mjs`：快速切换提交末次草稿、慢 touch 保留编辑（R1）；命令分发与冲突（R2）；两页名称/思考同步（R3）；离线待答对账、UI/信任回答失败保留与同请求重试（R4）；真实执行后丢弃 HTTP 响应仍只执行一次（R5）；迟到 open 不改当前选择与 lastSession（R6）；持久化工具卡片显示第二次等长 partialResult（R7）；旧快照挂起时同会话新导航和另一会话均继续收取最终事件（R9） |
 | 审查回归 R8、R10、R11 | `test/web-device-key.test.mjs` 检查登录初始化、跨页串行化与生产签名路径（R8、R10、R11）；`test/web-e2e-images.test.mjs` 比较原图与磁盘图片字节哈希，交换两图必须失败（R11） |
+| 审查回归 N1–N4 | `test/web-e2e-regressions-2.test.mjs`：运行中提示模板分别通过“排队”与 Enter 送达，展开后进入队列并在当前回合结束后执行；未启动时 `/trust` 被服务端拒绝且保留输入，同名 `debug` 扩展正常执行，`/quit` 的真实 409 保留输入（N1）；挂起旧 state 查询和旧 accepted 快照，另一页更新后思考按钮仍保持新值（N2）；真实 200 控制响应的 JSON 截断后以完整相同请求体重试，provider、磁盘与页面均仅执行或显示一次（N3，覆盖 `invalidResponse`，不模拟 TCP 读取中断）；A 的真实 409 晚于导航 B 到达时，不弹重发确认、不重取 B、不向 B 发消息（N4） |
+| 草稿初始化与信任快照 | `test/web-e2e-regressions-2.test.mjs`：连续五次新建后立即 fill 和 Enter，核对首次提交目标、provider 次数和磁盘消息；重连的旧空信任快照晚于新项目 `.pi/settings.json` 触发的实时询问，补取快照后保留信任框，回答后真实 pi 完成启动 |
 
 `test/web-api.test.mjs`、`test/web-protocol.test.mjs` 验证 pane 类型转换、查询、控制结果、导出鉴权和 UI 回答生命周期。`web-protocol` 还验证未托管终端命令被服务端拒绝且无运行记录和模型请求、已托管的同名 `debug` 扩展命令立即执行、隔离 agent 目录下 `prompts/*.md` 模板在运行中按两种 `delivery` 展开排队、缺少送达字段时由 pi 拒绝，以及字段校验与幂等内容冲突；`test/web-state-sync.test.mjs` 验证状态缓存提交、事件合并及代次隔离。这些接口测试不能替代对应的浏览器交互测试。
 
