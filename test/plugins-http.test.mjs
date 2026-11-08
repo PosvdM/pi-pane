@@ -15,7 +15,7 @@ function invoke(server, token, client, action, extra = {}) {
 }
 
 test("插件通过已鉴权 HTTP 和 WS 提供树、只读流、面板、动作与持久表单", { timeout: 60000 }, async () => {
-  const f = await piFixture(); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 20 }); const clients = [];
+  const f = await piFixture(); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 1000 }); const clients = [];
   try {
     const token = await pair(server); const first = await connect(server, token); const second = await connect(server, token); clients.push(first, second);
     assert.equal((await request(server, "invalid", "/api/plugins")).code, 401);
@@ -54,7 +54,7 @@ test("插件通过已鉴权 HTTP 和 WS 提供树、只读流、面板、动作�
 });
 
 test("插件超时和异常不影响主会话，迟到结果按原 key 查询", { timeout: 60000 }, async () => {
-  const f = await piFixture({ turns: [{ segments: [{ type: "text", text: "运行正常" }] }] }); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 10 }); let client;
+  const f = await piFixture({ turns: [{ segments: [{ type: "text", text: "运行正常" }] }] }); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 1000 }); let client;
   try {
     const token = await pair(server); client = await connect(server, token);
     const idempotencyKey = randomUUID();
@@ -77,7 +77,7 @@ test("插件超时和异常不影响主会话，迟到结果按原 key 查询", 
 });
 
 test("请求来源绑定凭证和连接，用户在场确认只路由发起标签页并关闭提示", { timeout: 60000 }, async () => {
-  const f = await piFixture(); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 10 }); const clients = [];
+  const f = await piFixture(); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 1000 }); const clients = [];
   try {
     const token = await pair(server); const foreign = await pair(server);
     const first = await connect(server, token); const second = await connect(server, token); clients.push(first, second);

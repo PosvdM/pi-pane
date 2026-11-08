@@ -15,7 +15,7 @@ function deferred() {
 }
 
 async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), "pane-runtime-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pane-runtime-")));
   const home = join(root, "home");
   const controls = new Map();
   const runtimes = [];

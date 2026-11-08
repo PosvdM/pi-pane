@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,13 +8,13 @@ import { PluginHost } from "../packages/server/dist/plugins/host.js";
 import { AssetStore } from "../packages/server/dist/assets.js";
 
 async function fixture(t, entries) {
-  const home = await mkdtemp(path.join(tmpdir(), "pane-plugin-host-")); const messages = []; const holds = new Map(); const listeners = new Set(); const directories = [];
+  const home = await realpath(await mkdtemp(path.join(tmpdir(), "pane-plugin-host-"))); const messages = []; const holds = new Map(); const listeners = new Set(); const directories = [];
   for (let i = 0; i < entries.length; i++) {
     const directory = path.join(home, "module-" + i); await mkdir(directory); directories.push(directory);
     await writeFile(path.join(directory, "package.json"), JSON.stringify({ type: "module", piPane: { entry: "./plugin.mjs", paneProtocol: [1, 1] } }));
     await writeFile(path.join(directory, "plugin.mjs"), entries[i]);
   }
-  const host = new PluginHost({ home, plugins: directories, assets: new AssetStore(home), timeoutMs: 50, emit: message => messages.push(message), mainSessions: source => ({
+  const host = new PluginHost({ home, plugins: directories, assets: new AssetStore(home), timeoutMs: 1000, emit: message => messages.push(message), mainSessions: source => ({
     list: () => [], get: () => undefined,
     onChange: listener => { listeners.add(listener); return () => listeners.delete(listener); },
     hold: (ref, reason) => { const key = Symbol(); holds.set(key, { source, ref, reason }); return () => holds.delete(key); },

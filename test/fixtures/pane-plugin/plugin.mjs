@@ -175,7 +175,7 @@ export default function createPlugin() {
         return ['echo', 'slow', 'throw', 'form', 'presence', 'emit'].map(name => ({
           id: 'sample.' + name, source: 'sample', title: '测试动作：' + name, scope: ['global', 'node'],
           ...(name === 'form' ? { hasForm: true } : {}),
-          ...(name === 'slow' ? { timeoutMs: 10 } : {}),
+          ...(['slow', 'presence'].includes(name) ? { timeoutMs: 10 } : {}),
         }));
       },
       async resolveForm(actionId) {
