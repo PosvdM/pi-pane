@@ -34,6 +34,13 @@ async function jsonBody(req: IncomingMessage, limit = 2 * 1024 * 1024): Promise<
 }
 function sendJson(res: ServerResponse, status: number, value: unknown): void { res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify(value)); }
 function bearer(req: IncomingMessage): string { return req.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]+)$/)?.[1] ?? ""; }
+function rejectUpgrade(socket: Duplex, status: 403 | 503): void {
+  if (socket.destroyed) return;
+  // 拒绝后不能只发送 FIN；半开对端无需配合关闭写侧。
+  const timeout = setTimeout(() => socket.destroy(), 1000); timeout.unref();
+  socket.once("close", () => clearTimeout(timeout));
+  socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy());
+}
 async function upload(req: IncomingMessage): Promise<{ image: Buffer; mimeType: string; thumb: Buffer }> {
   return new Promise((resolve, reject) => {
     let image: Buffer | undefined; let thumb: Buffer | undefined; let mimeType = ""; let failed: unknown;
@@ -70,10 +77,12 @@ export class PaneServer {
     this.http = http.createServer((req, res) => { void this.request(req, res).catch((error) => this.error(res, error)); });
     this.http.requestTimeout = 65000; this.http.headersTimeout = 10000; this.http.keepAliveTimeout = 5000;
     this.http.on("upgrade", (req, socket, head) => {
-      if (this.stopping) { socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", () => socket.destroy()); return; }
-      if (!checkOrigin(req.headers, this.port) || req.url !== "/ws") { socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return; }
+      // HTTP 在交付 upgrade 时移除原错误监听；任何拒绝分支之前接管 socket。
+      const onError = () => socket.destroy(); socket.on("error", onError);
       this.upgrades.add(socket); socket.once("close", () => this.upgrades.delete(socket));
-      this.wss.handleUpgrade(req, socket, head, (ws) => { this.upgrades.delete(socket); this.connection(ws); });
+      if (this.stopping) { rejectUpgrade(socket, 503); return; }
+      if (!checkOrigin(req.headers, this.port) || req.url !== "/ws") { rejectUpgrade(socket, 403); return; }
+      this.wss.handleUpgrade(req, socket, head, (ws) => { this.upgrades.delete(socket); socket.off("error", onError); this.connection(ws); });
     });
     this.auth.onRevoke((credential) => { for (const client of this.clients) if (client.credential === credential) this.closeClient(client, 4403, "凭证已失效"); });
   }
