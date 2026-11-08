@@ -1,6 +1,7 @@
 // 当前打开的会话：取快照、订阅事件、发送控制命令、处理冲突与会话替换。
 import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
+import { prependDrafts } from "./draft.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
@@ -298,14 +299,23 @@ export async function stopRun(): Promise<void> {
   if (outcome.result.status === "done") await restoreCleared(state.id, outcome.result);
 }
 
-/** 把清出的排队消息放回输入框；归属不明、可能已发送的草稿先请用户确认。 */
+/**
+ * 把清出的排队消息放回该会话的输入框。归属不明、可能已发送的草稿也放回（排在后面）并提示用户检查，
+ * 不弹确认框：确认框可能被关闭、被替换或出现在已切换的会话里，会丢失草稿。
+ */
 async function restoreCleared(sessionId: string, result: { clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }): Promise<void> {
-  let drafts = result.clearedDrafts;
-  if (result.uncertainDrafts?.length) {
-    const answer = await ask("是否放回这些草稿", `有 ${result.uncertainDrafts.length} 条带图片的消息被扩展改写过，无法确认是否已经发送。放回输入框后可以检查再决定是否重发。`, [{ label: "不放回", value: "no" }, { label: "放回输入框", value: "yes", primary: true }]);
-    if (answer === "yes") drafts = [...drafts, ...result.uncertainDrafts];
+  const drafts = [...result.clearedDrafts, ...(result.uncertainDrafts ?? [])];
+  if (result.uncertainDrafts?.length) toast(`有 ${result.uncertainDrafts.length} 条带图片的消息被扩展改写过，无法确认是否已发送，已一并放回输入框，请检查后再发送`, "warning", true);
+  if (!drafts.length) return;
+  // 已切换到其他会话时直接写入原会话保存的草稿，回到该会话时恢复；不占用当前输入框的取回槽位。
+  if (current.get()?.id !== sessionId) {
+    const key = `pi-pane.draft.${sessionId}`;
+    let existing: DraftNode[] = [];
+    try { existing = JSON.parse(localStorage.getItem(key) ?? "[]"); } catch { /* 损坏的草稿按空处理。 */ }
+    localStorage.setItem(key, JSON.stringify(prependDrafts(drafts, Array.isArray(existing) ? existing : [])));
+    return;
   }
-  if (drafts.length) restoredDrafts.set({ sessionId, drafts });
+  restoredDrafts.set({ sessionId, drafts });
 }
 
 export async function restart(): Promise<void> {
