@@ -18,12 +18,13 @@ import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
+import { claim, emptyMirror, match, reconcile, type QueueMirror } from "./queue-mirror.js";
 
 interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
   state?: any; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>;
-  /** 实际队列文字 → 按入队顺序排列的原草稿。技能和提示模板在入队前展开，队列文字可能与发送文字完全不同。 */
-  queued: Map<string, DraftNode[][]>; clients: number; lastActive: number;
+  /** pi 队列的镜像，队列项关联发送时的原草稿，见 queue-mirror.ts。随写者和模型重建清空。 */
+  queued: QueueMirror; clients: number; lastActive: number;
   holds: Map<string, { source: string; reason: string }>; ui: Map<string, { request: PaneUiDialog; timer?: ReturnType<typeof setTimeout> }>; recentExternal: boolean; closed: boolean;
 }
 const mutations = new Set(["prompt", "steer", "follow_up", "stop", "close", "restart", "set_model", "set_thinking_level", "compact", "new_session", "fork", "clone", "set_session_name", "export"]);
@@ -120,7 +121,7 @@ export class Sessions {
     assert(!this.closing, "serverStopping", "服务端正在关闭", 503);
     const existing = this.files.get(fileKey(file)); if (existing) return this.view(existing);
     assert(!this.records.has(id), "sessionIdentityConflict", "另一个文件使用了相同的会话标识", 409);
-    const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), queued: new Map(), clients: 0, lastActive: Date.now(), holds: new Map(), ui: new Map(), recentExternal, closed: false };
+    const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), queued: emptyMirror(), clients: 0, lastActive: Date.now(), holds: new Map(), ui: new Map(), recentExternal, closed: false };
     this.records.set(id, session); this.files.set(fileKey(file), session);
     this.watch(file);
     return { ...this.view(session), diagnostics: parsed.diagnostics, ...(busy.held ? { heldBy: busy.record?.host.app } : {}), ...(recentExternal ? { warning: "recentModification" } : {}) };
@@ -216,22 +217,15 @@ export class Sessions {
       // 受理控制操作只递增 revision；生成阶段由真实事件驱动，handled/拒绝不推测为 streaming。
       model.control(model.status, model.inFlight.phase, undefined, true);
       const handle = session.handle;
-      // 运行中的 steer、follow-up 进入 pi 队列；pi 在响应前已发出 queue_update，响应时队尾新增的一项就是这条消息。
+      // 运行中的 steer、follow-up 进入 pi 队列；pi 在响应前已发出 queue_update，响应时本次新增的队列项已在镜像中。
       const kind = command.type === "steer" || (command.type === "prompt" && command.delivery === "steer") ? "steering" as const
         : command.type === "follow_up" || (command.type === "prompt" && command.delivery === "followUp") ? "followUp" as const : undefined;
-      const queuedBefore = kind ? model.inFlight.queue[kind].length : 0;
+      const owner = session; const mirrorBefore = kind ? [...owner.queued[kind]] : [];
       const response = await handle.send(rpc, { trackResult: true });
       assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409);
-      if (kind && request.draft) {
-        const queue = model.inFlight.queue;
-        if (queue[kind].length === queuedBefore + 1) {
-          const text = queue[kind].at(-1)!;
-          session.queued.set(text, [...(session.queued.get(text) ?? []), structuredClone(request.draft)]);
-        }
-        // 只保留仍在队列中的文字的记录，已送达的消息不再需要取回。
-        const live = new Set([...queue.steering, ...queue.followUp]);
-        for (const key of session.queued.keys()) if (!live.has(key)) session.queued.delete(key);
-      }
+      // 被扩展处理（handled）的输入不入队，不能认领扩展自己追加的队列项。
+      if (kind && request.draft && (response.data as any)?.disposition !== "handled" && owner.handle === handle)
+        claim(mirrorBefore, owner.queued[kind], request.draft, encoded?.message);
       const result = exported ? { exportId: exported.id } : toPaneOutcome(command.type, response.data);
       if (exported) this.exports.complete(exported.id);
       session = this.files.get(fileKey(handle.sessionFile)) ?? session;
@@ -329,7 +323,7 @@ export class Sessions {
           const session = attached;
           if (session.owner !== owner) return;
           if (report) this.reports.push(report);
-          session.owner = undefined; session.handle = undefined; this.closeUi(session);
+          session.owner = undefined; session.handle = undefined; this.closeUi(session); session.queued = emptyMirror();
           if (reason === "会话已关闭" && !error) {
             session.model.readonly = true; session.model.readonlyReason = "archived"; session.model.inFlight.assistant = undefined; session.model.inFlight.tools = [];
             session.model.control("idle", "idle", reason, true);
@@ -370,7 +364,7 @@ export class Sessions {
         target.owner = session.owner; target.handle = handle; session.owner = undefined; session.handle = undefined; session.dirty = false;
         session = target;
       } else {
-        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, syncing: undefined, dirty: false, drafts: new Map(), queued: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
+        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, syncing: undefined, dirty: false, drafts: new Map(), queued: emptyMirror(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
         this.records.set(session.id, previous); this.files.set(fileKey(session.file), previous);
         session.id = state.sessionId; session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
         this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
@@ -378,6 +372,7 @@ export class Sessions {
     }
     session.state = state; session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
     session.model.reset(data.entries as Entry[], data.leafId); session.model.control("idle", "idle", undefined, true); session.recentExternal = false;
+    session.queued = emptyMirror();
     return session;
   }
   private receive(session: HostedSession, event: any): void {
@@ -390,6 +385,7 @@ export class Sessions {
       } else this.emitUi(session.id, request);
       return;
     }
+    if (event.type === "queue_update") session.queued = { steering: reconcile(session.queued.steering, event.steering ?? []), followUp: reconcile(session.queued.followUp, event.followUp ?? []) };
     session.model.apply(event);
     if (["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type)) void this.refreshState(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     if (["message_end", "entry_appended", "compaction_end", "session_info_changed", "agent_settled"].includes(event.type)) void this.sync(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
@@ -439,6 +435,8 @@ export class Sessions {
     const handle = session.handle;
     session.model.control("running", "stopping", undefined, true);
     let cleared: any = { steering: [], followUp: [] };
+    // clear_queue 会先发出空的 queue_update；发送前取镜像快照，用于把清出的文字对应到原草稿。
+    const mirror = { steering: [...session.queued.steering], followUp: [...session.queued.followUp] };
     try {
       const response = await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 }); cleared = response.data;
       if (close) await handle.stop();
@@ -453,13 +451,13 @@ export class Sessions {
       }
     } catch { await handle.stop(); }
     const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
-    // 技能和提示模板在入队前已由 pi 展开，队列文字与发送时的编码文字不同；
-    // 带图片的草稿按每条消息唯一的图片标记 nonce 对应，整条草稿（含图片节点）放回输入框。
-    // 优先按入队时记录的实际队列文字取回原草稿（含图片节点），同文字的多条按先进先出对应。
-    const queuedDrafts = texts.map((text) => session.queued.get(text)?.shift());
-    if (!session.handle || session.handle === handle) session.queued.clear();
+    // 优先按队列镜像取回原草稿（含图片节点），steering 在前、followUp 在后，与 clear_queue 的顺序一致。
+    // 镜像无法确认时依次按完整编码文字、图片标记 nonce 查找，都找不到时只放回文字。
+    const items = [...match(mirror.steering, cleared?.steering ?? []), ...match(mirror.followUp, cleared?.followUp ?? [])];
+    if (!session.handle || session.handle === handle) session.queued = emptyMirror();
+    const queuedDrafts = items.map((item) => item?.draft);
     const keys = texts.map((text, i) => {
-      if (queuedDrafts[i]) return undefined;
+      if (queuedDrafts[i]) return items[i]?.key;
       if (session.drafts.has(text)) return text;
       const nonce = /⟦pane-img:([a-z0-9]{6,8}):\d+⟧/.exec(text)?.[1];
       return nonce ? [...session.drafts.keys()].find((key) => key.includes(`⟦pane-img:${nonce}:`)) : undefined;
