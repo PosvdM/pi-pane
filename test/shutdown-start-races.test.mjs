@@ -378,11 +378,12 @@ test("运行记录恢复失败由本实例保存，随后关闭不能报告成�
 test("重绑定复制出的旧记录不继承 syncing，重新托管后真正取条目", async () => {
   const sessions = Object.create(Sessions.prototype); sessions.assets = new AssetStore("unused");
   sessions.records = new Map(); sessions.files = new Map(); sessions.watch = () => {};
+  sessions.pluginHolds = new Map(); sessions.mainListeners = new Set(); sessions.knownMain = new Map();
   const gate = deferred(); const file = path.resolve("sync-source.jsonl"); const destination = path.resolve("sync-target.jsonl");
   const handle = { acceptingInput: true, send: async () => { await gate.promise; return { data: { entries: [] } }; } };
   const source = { id: "source", file, cwd: process.cwd(), model: new SessionModel({ source: "pane", id: "source" }, sessions.assets),
     handle, control: new ControlQueue(), owner: Symbol(), dirty: false, drafts: new Map(), clients: 0, lastActive: 0, holds: new Map(), ui: new Map(), recentExternal: false, closed: false };
-  sessions.records.set(source.id, source); sessions.files.set(fileKey(file), source);
+  sessions.records.set(source.id, source); sessions.files.set(fileKey(file), source); sessions.pluginHolds.set(source.id, source.holds);
   const syncing = sessions.sync(source); source.dirty = true;
   sessions.rebind(source, handle, { sessionId: "target", sessionFile: destination }, { entries: [] }, "resume");
   const previous = sessions.records.get("source");
