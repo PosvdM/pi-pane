@@ -280,7 +280,11 @@ test("只读文件读取迟到于启动、切换和停止，不把旧文件提�
     const read = fs.readFile; const entered = deferred();
     const mock = t.mock.method(fs, "readFile", async (...args) => {
       const data = await read(...args);
-      if (!injected && typeof args[0] === "string" && fileKey(args[0]) === fileKey(a.sessionFile)) { injected = true; entered.resolve(); await gate.promise; returned.resolve(); }
+      if (typeof args[0] === "string" && fileKey(args[0]) === fileKey(a.sessionFile)) {
+        // 所有同路径 watch 读取都停在窗口内，后续读取不能先 reset 模型、推进 epoch。
+        if (!injected) { injected = true; entered.resolve(); }
+        await gate.promise; returned.resolve();
+      }
       return data;
     });
     syncBuiltinESMExports();

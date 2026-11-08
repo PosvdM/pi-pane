@@ -195,7 +195,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 
 两个条件检查各管一件事：
 
-- **epoch**：隔离进程和会话的替换。浏览器的会话命令都带上它看到的 `expectedEpoch`（会话游标的 epoch）。进程重启或切换了会话后 epoch 不同，服务端拒绝命令（HTTP 409 `epochChanged`），浏览器重新取快照并提示用户，避免把消息发进另一个会话。
+- **epoch**：隔离进程和会话的替换。浏览器的会话命令都带上它看到的 `expectedEpoch`（会话游标的 epoch）。进程重启、切换会话，或只读文件变化触发模型重建后 epoch 不同，服务端拒绝命令（HTTP 409 `epochChanged`），浏览器重新取快照并提示用户，避免按过期状态发送命令。
 - **控制状态 revision**：隔离同一会话内状态的变化。服务端为每个托管会话维护控制状态（运行阶段 `idle`/`running`/`compacting`/`stopping`、模型、thinking 级别），任一项变化时 `controlRevision` 加 1；它出现在快照和每条 `pane_status` 事件里。
 
 | 命令 | 必须带 | 冲突（409 `revisionChanged`）后的处理 |
