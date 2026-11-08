@@ -1,5 +1,15 @@
 export default function(pi) {
   let cancelTransitions = false;
+  pi.on("input", (event) => {
+    if (event.source === "extension") return;
+    const transform = event.text.startsWith("pane-queue-transform ");
+    const handled = event.text.startsWith("pane-queue-handled ");
+    if (!transform && !handled) return;
+    // 扩展消息先入队；原输入保留图片，正文不保留 pane 图片标记。
+    const auxiliary = event.text.includes("同文辅助") ? "扩展固定正文" : "扩展辅助消息";
+    pi.sendUserMessage(auxiliary, { deliverAs: "followUp" });
+    return handled ? { action: "handled" } : { action: "transform", text: "扩展固定正文", images: event.images };
+  });
   pi.on("session_before_switch", () => cancelTransitions ? { cancel: true } : undefined);
   pi.on("session_before_fork", () => cancelTransitions ? { cancel: true } : undefined);
   pi.registerCommand("pane-web-ready", { handler: async () => {} });

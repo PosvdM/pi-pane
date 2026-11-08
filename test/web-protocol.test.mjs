@@ -16,6 +16,23 @@ async function ready(server, token, f) {
   const result = await control(server, token, await open(server, token, f), { type: "prompt", message: "/pane-web-ready" });
   assert.equal(result.code, 200, JSON.stringify(result)); return result.value.snapshot;
 }
+async function queueImageDrafts(server, token, prefix) {
+  const drafts = [];
+  for (const i of [0, 1]) {
+    const form = new FormData();
+    form.append("image", new Blob([png(i, 1, 1)], { type: "image/png" }), `queue-${i}.png`);
+    form.append("thumb", new Blob([Buffer.from("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA", "base64")], { type: "image/webp" }), "thumb.webp");
+    const response = await fetch(server.origin + "/api/assets", { method: "POST", headers: { Authorization: "Bearer " + token, "X-Request-Id": randomUUID() }, body: form });
+    assert.equal(response.status, 200);
+    const { assetId } = await response.json();
+    drafts.push([{ type: "text", text: `${prefix} 图片 ${i + 1} 之前 ` }, { type: "image", assetId }, { type: "text", text: ` 图片 ${i + 1} 之后` }]);
+  }
+  assert.notEqual(drafts[0][1].assetId, drafts[1][1].assetId);
+  return drafts;
+}
+async function requestRecords(f) {
+  return (await readFile(f.env.FAKE_REQUEST_LOG, "utf8")).trim().split("\n").map(JSON.parse);
+}
 async function subscribed(client, state) {
   const count = client.messages.filter(m => m.type === "pong").length;
   client.subscribe(state); client.ws.send(JSON.stringify({ type: "ping" }));
@@ -199,6 +216,112 @@ test("Q1 HTTP 固定模板的相同队列文字按先进先出恢复两张不同
     }
     const log = (await readFile(f.env.FAKE_REQUEST_LOG, "utf8")).trim().split("\n").map(JSON.parse);
     assert.equal(log.filter(row => row.kind === "request").length, commands.length, "每轮只有慢速回合调用模型，固定模板图片均未消费");
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+test("R5-1 HTTP 固定模板的图片 A 消费后，同文图片 B 停止时只恢复 B", { timeout: 60_000 }, async () => {
+  const f = await piFixture();
+  const release = path.join(f.root, "release-first-turn");
+  await f.setScript({ turns: [{ segments: [{ type: "waitForFile", file: release }, { type: "text", text: "第一回合结束" }] }], fallback: { segments: [{ type: "hang" }] } });
+  const fixed = "固定模板正文，不包含参数占位符";
+  await mkdir(path.join(f.agentDir, "prompts"));
+  await writeFile(path.join(f.agentDir, "prompts", "pane-fixed.md"), fixed);
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] }); let client;
+  try {
+    const token = await pair(server); let state = await ready(server, token, f);
+    const drafts = await queueImageDrafts(server, token, "/pane-fixed");
+    client = await connect(server, token); await subscribed(client, state);
+    const running = await control(server, token, state, { type: "prompt", message: "等待图片 A 排队" });
+    assert.equal(running.code, 200, JSON.stringify(running)); state = running.value.snapshot;
+    await until(async () => (await requestRecords(f)).some(row => row.kind === "waiting"));
+    const first = await control(server, token, await snapshot(server, token, state.ref.id), { type: "follow_up" }, { draft: drafts[0] });
+    assert.equal(first.code, 200, JSON.stringify(first));
+    assert.deepEqual(first.value.snapshot.inFlight.queue, { steering: [], followUp: [fixed] });
+    await until(() => client.messages.some(message => message.event?.type === "queue_update" && message.event.followUp?.[0] === fixed));
+    const beforeConsumption = client.messages.length;
+    await writeFile(release, "继续");
+    await until(async () => (await requestRecords(f)).some(row => row.kind === "hang" && row.request === 2));
+    await until(() => client.messages.slice(beforeConsumption).some(message => message.event?.type === "queue_update" && message.event.followUp?.length === 0));
+    const consumed = (await requestRecords(f)).find(row => row.kind === "request" && row.request === 2);
+    assert.equal(consumed.lastUser, fixed);
+    assert.deepEqual(consumed.context.messages.findLast(message => message.role === "user").content.filter(node => node.type === "image"),
+      [{ type: "image", data: png(0, 1, 1).toString("base64"), mimeType: "image/png" }], "必须确认图片 A 已送入下一回合的模型请求");
+    assert.deepEqual((await snapshot(server, token, state.ref.id)).inFlight.queue, { steering: [], followUp: [] });
+    const second = await control(server, token, await snapshot(server, token, state.ref.id), { type: "follow_up" }, { draft: drafts[1] });
+    assert.equal(second.code, 200, JSON.stringify(second));
+    assert.deepEqual(second.value.snapshot.inFlight.queue, { steering: [], followUp: [fixed] });
+    const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.equal(stopped.value.status, "done");
+    assert.deepEqual(stopped.value.clearedText, [fixed]);
+    assert.deepEqual(stopped.value.clearedDrafts, [drafts[1]], "已消费的图片 A 不得替代尚未消费的图片 B");
+    assert.equal((await requestRecords(f)).filter(row => row.kind === "request").length, 2);
+  } finally { client?.close(); await server.close(); await f.cleanup(); }
+});
+
+test("R5-3 HTTP 固定模板先 follow-up 图片 A 再 steer 图片 B，停止按 B、A 恢复", { timeout: 60_000 }, async () => {
+  const f = await piFixture({ fallback: { segments: [{ type: "hang" }] } });
+  const fixed = "固定模板正文，不包含参数占位符";
+  await mkdir(path.join(f.agentDir, "prompts"));
+  await writeFile(path.join(f.agentDir, "prompts", "pane-fixed.md"), fixed);
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  try {
+    const token = await pair(server); let state = await ready(server, token, f);
+    const drafts = await queueImageDrafts(server, token, "/pane-fixed");
+    const running = await control(server, token, state, { type: "prompt", message: "等待两种队列的图片" });
+    assert.equal(running.code, 200, JSON.stringify(running)); state = running.value.snapshot;
+    await until(async () => (await requestRecords(f)).some(row => row.kind === "hang"));
+    for (const [i, type] of ["follow_up", "steer"].entries()) {
+      const queued = await control(server, token, await snapshot(server, token, state.ref.id), { type }, { draft: drafts[i] });
+      assert.equal(queued.code, 200, JSON.stringify(queued)); assert.equal(queued.value.status, "accepted");
+    }
+    assert.deepEqual((await snapshot(server, token, state.ref.id)).inFlight.queue, { steering: [fixed], followUp: [fixed] });
+    const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.equal(stopped.value.status, "done");
+    assert.deepEqual(stopped.value.clearedText, [fixed, fixed], "两种队列的实际文字必须相同且不含图片标记");
+    assert.deepEqual(stopped.value.clearedDrafts, [drafts[1], drafts[0]], "steering 必须先于 follow-up 恢复，不能按提交时间恢复");
+    assert.equal((await requestRecords(f)).filter(row => row.kind === "request").length, 1);
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+for (const sameText of [false, true]) test(`R5-2 HTTP 输入扩展转换图片草稿并追加${sameText ? "同文" : "不同文"}辅助消息，停止时分别恢复图片与文字`, { timeout: 60_000 }, async () => {
+  const f = await piFixture({ fallback: { segments: [{ type: "hang" }] } });
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  try {
+    const token = await pair(server); let state = await ready(server, token, f);
+    const [draft] = await queueImageDrafts(server, token, "pane-queue-transform " + (sameText ? "同文辅助" : "不同辅助"));
+    const fixed = "扩展固定正文"; const auxiliary = sameText ? fixed : "扩展辅助消息";
+    const running = await control(server, token, state, { type: "prompt", message: "等待输入扩展排队" });
+    assert.equal(running.code, 200, JSON.stringify(running)); state = running.value.snapshot;
+    await until(async () => (await requestRecords(f)).some(row => row.kind === "hang"));
+    const queued = await control(server, token, await snapshot(server, token, state.ref.id), { type: "prompt", delivery: "followUp" }, { draft });
+    assert.equal(queued.code, 200, JSON.stringify(queued)); assert.equal(queued.value.status, "accepted");
+    assert.equal(queued.value.result, undefined, "transform 输入必须实际入队，不能作为 handled 跳过");
+    assert.deepEqual(queued.value.snapshot.inFlight.queue, { steering: [], followUp: [auxiliary, fixed] });
+    const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.equal(stopped.value.status, "done");
+    assert.deepEqual(stopped.value.clearedText, [auxiliary, fixed]);
+    assert.deepEqual(stopped.value.clearedDrafts, [[{ type: "text", text: auxiliary }], draft], "辅助消息只能恢复为文字，原输入必须完整恢复图片与前后文字");
+    assert.equal((await requestRecords(f)).filter(row => row.kind === "request").length, 1, "扩展产生的两条消息在停止前均未消费");
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+test("R5-2 HTTP 输入扩展 handled 并追加辅助消息，停止时不恢复已处理的原图片草稿", { timeout: 60_000 }, async () => {
+  const f = await piFixture({ fallback: { segments: [{ type: "hang" }] } });
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  try {
+    const token = await pair(server); let state = await ready(server, token, f);
+    const [draft] = await queueImageDrafts(server, token, "pane-queue-handled 不同辅助");
+    const running = await control(server, token, state, { type: "prompt", message: "等待扩展处理图片输入" });
+    assert.equal(running.code, 200, JSON.stringify(running)); state = running.value.snapshot;
+    await until(async () => (await requestRecords(f)).some(row => row.kind === "hang"));
+    const handled = await control(server, token, await snapshot(server, token, state.ref.id), { type: "follow_up" }, { draft });
+    assert.equal(handled.code, 200, JSON.stringify(handled)); assert.deepEqual(handled.value.result, { handled: true });
+    assert.deepEqual(handled.value.snapshot.inFlight.queue, { steering: [], followUp: ["扩展辅助消息"] });
+    const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.equal(stopped.value.status, "done");
+    assert.deepEqual(stopped.value.clearedText, ["扩展辅助消息"]);
+    assert.deepEqual(stopped.value.clearedDrafts, [[{ type: "text", text: "扩展辅助消息" }]], "handled 不得把原图片草稿认领给扩展辅助消息");
+    assert.equal((await requestRecords(f)).filter(row => row.kind === "request").length, 1);
   } finally { await server.close(); await f.cleanup(); }
 });
 
