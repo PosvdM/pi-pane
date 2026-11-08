@@ -437,8 +437,15 @@ export class Sessions {
       }
     } catch { await handle.stop(); }
     const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
-    const drafts = texts.map((text) => session.drafts.get(text) ?? [{ type: "text", text }]);
-    if (!session.handle || session.handle === handle) for (const text of texts) session.drafts.delete(text);
+    // 技能和提示模板在入队前已由 pi 展开，队列文字与发送时的编码文字不同；
+    // 带图片的草稿按每条消息唯一的图片标记 nonce 对应，整条草稿（含图片节点）放回输入框。
+    const keys = texts.map((text) => {
+      if (session.drafts.has(text)) return text;
+      const nonce = /⟦pane-img:([a-z0-9]{6,8}):\d+⟧/.exec(text)?.[1];
+      return nonce ? [...session.drafts.keys()].find((key) => key.includes(`⟦pane-img:${nonce}:`)) : undefined;
+    });
+    const drafts = texts.map((text, i) => (keys[i] && session.drafts.get(keys[i]!)) || [{ type: "text", text }]);
+    if (!session.handle || session.handle === handle) for (const key of keys) if (key) session.drafts.delete(key);
     return { status: "done", clearedText: texts, clearedDrafts: drafts };
   }
   private reclaim(): Promise<void> { return this.inflight.run("sessions.reclaim", () => this.performReclaim()); }

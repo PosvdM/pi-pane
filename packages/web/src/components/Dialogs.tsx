@@ -45,14 +45,14 @@ export function ExtensionDialog() {
   const all = useStore(extensionUi);
   const id = state?.id ?? "";
   const request: DialogRequest | undefined = all[id]?.dialogs[0];
-  const [value, setValue] = useState("");
+  // 输入值按对话框 id 归属：新对话框直接使用初始值，不经 effect 重置，用户立即输入的内容不会被覆盖。
+  const [edit, setEdit] = useState<{ id: string; value: string } | null>(null);
+  const value = edit && edit.id === request?.id ? edit.value : request?.kind === "editor" ? request.prefill ?? "" : "";
+  const setValue = (next: string) => { if (request) setEdit({ id: request.id, value: next }); };
   const [sending, setSending] = useState(false);
   const left = useCountdown(request?.expiresAt);
   const input = useRef<HTMLInputElement & HTMLTextAreaElement>(null);
-  useEffect(() => {
-    setValue(request?.kind === "editor" ? request.prefill ?? "" : "");
-    setTimeout(() => input.current?.focus(), 0);
-  }, [request?.id]);
+  useEffect(() => { setTimeout(() => input.current?.focus(), 0); }, [request?.id]);
   useEffect(() => { if (request && left === 0) removeDialog(id, request.id); }, [left]);
   if (!request || !state?.model) return null;
 

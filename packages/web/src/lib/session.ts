@@ -95,6 +95,8 @@ function onEvent(id: string, record: Parameters<typeof apply>[1]): void {
   }
   if (event.type === "pane_status" && event.status === "idle") { void refreshStats(); scheduleListRefresh(); }
   if (event.type === "pane_session_replaced") scheduleListRefresh();
+  // 写者退出（关闭、回收、中断）时 pane_status 变为只读；重取快照以更新托管状态和标题栏。
+  if (event.type === "pane_status" && event.readonly === true && state.model.view.hosted) { void reload(); scheduleListRefresh(); }
   if (state.model.view.hosted && (state.model.view.controlRevision !== revision || ["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type))) scheduleStateRefresh();
   current.touch();
 }
@@ -314,6 +316,7 @@ export async function closeSession(): Promise<boolean> {
   if (!outcome.ok) { toast(outcome.error.code === "revisionChanged" ? "会话状态已变化，请确认后重新关闭" : outcome.error.message, "error"); return false; }
   if (outcome.result.status === "done" && outcome.result.clearedDrafts.length) restoredDrafts.set({ sessionId: state.id, drafts: outcome.result.clearedDrafts });
   toast("会话已关闭");
+  if (current.get()?.id === state.id) void reload();
   return true;
 }
 
