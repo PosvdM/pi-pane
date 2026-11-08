@@ -18,7 +18,7 @@ import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
-import { claim, emptyMirror, match, reconcile, type QueueMirror } from "./queue-mirror.js";
+import { claim, emptyMirror, reconcile, removed, restore, type QueueMirror } from "./queue-mirror.js";
 
 interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
@@ -222,10 +222,11 @@ export class Sessions {
         : command.type === "follow_up" || (command.type === "prompt" && command.delivery === "followUp") ? "followUp" as const : undefined;
       const owner = session; const mirrorBefore = kind ? [...owner.queued[kind]] : [];
       const response = await handle.send(rpc, { trackResult: true });
+      // 只有确实入队（disposition 为 queued）的输入认领队列项；handled、started 和被拒绝的输入不再需要取回，释放草稿记录。
+      const queued = response.success && (response.data as any)?.disposition === "queued";
+      if (kind && request.draft && queued && owner.handle === handle) claim(mirrorBefore, owner.queued[kind], request.draft, encoded?.message);
+      if (encoded && !queued) owner.drafts.delete(encoded.message);
       assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409);
-      // 被扩展处理（handled）的输入不入队，不能认领扩展自己追加的队列项。
-      if (kind && request.draft && (response.data as any)?.disposition !== "handled" && owner.handle === handle)
-        claim(mirrorBefore, owner.queued[kind], request.draft, encoded?.message);
       const result = exported ? { exportId: exported.id } : toPaneOutcome(command.type, response.data);
       if (exported) this.exports.complete(exported.id);
       session = this.files.get(fileKey(handle.sessionFile)) ?? session;
@@ -323,7 +324,7 @@ export class Sessions {
           const session = attached;
           if (session.owner !== owner) return;
           if (report) this.reports.push(report);
-          session.owner = undefined; session.handle = undefined; this.closeUi(session); session.queued = emptyMirror();
+          session.owner = undefined; session.handle = undefined; this.closeUi(session); session.queued = emptyMirror(); session.drafts.clear();
           if (reason === "会话已关闭" && !error) {
             session.model.readonly = true; session.model.readonlyReason = "archived"; session.model.inFlight.assistant = undefined; session.model.inFlight.tools = [];
             session.model.control("idle", "idle", reason, true);
@@ -362,6 +363,7 @@ export class Sessions {
         // 保留目标对象及模型；控制队列随写者迁移，切换后仍挂起的 RPC 必须能被目标会话停止。
         target.control = session.control; session.control = new ControlQueue();
         target.owner = session.owner; target.handle = handle; session.owner = undefined; session.handle = undefined; session.dirty = false;
+        session.queued = emptyMirror(); session.drafts.clear();
         session = target;
       } else {
         const previous: HostedSession = { ...session, handle: undefined, owner: undefined, syncing: undefined, dirty: false, drafts: new Map(), queued: emptyMirror(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
@@ -372,7 +374,7 @@ export class Sessions {
     }
     session.state = state; session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
     session.model.reset(data.entries as Entry[], data.leafId); session.model.control("idle", "idle", undefined, true); session.recentExternal = false;
-    session.queued = emptyMirror();
+    session.queued = emptyMirror(); session.drafts.clear();
     return session;
   }
   private receive(session: HostedSession, event: any): void {
@@ -385,7 +387,14 @@ export class Sessions {
       } else this.emitUi(session.id, request);
       return;
     }
-    if (event.type === "queue_update") session.queued = { steering: reconcile(session.queued.steering, event.steering ?? []), followUp: reconcile(session.queued.followUp, event.followUp ?? []) };
+    if (event.type === "queue_update") {
+      const previous = session.queued;
+      session.queued = { steering: reconcile(previous.steering, event.steering ?? []), followUp: reconcile(previous.followUp, event.followUp ?? []) };
+      // 已消费或已清出的队列项释放编码草稿记录（停止时使用发送前的镜像快照，不依赖这份记录）。
+      const live = new Set([...session.queued.steering, ...session.queued.followUp].map((item) => item.claim));
+      for (const item of [...removed(previous.steering, session.queued.steering), ...removed(previous.followUp, session.queued.followUp)])
+        if (item.claim?.key && !live.has(item.claim)) session.drafts.delete(item.claim.key);
+    }
     session.model.apply(event);
     if (["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type)) void this.refreshState(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     if (["message_end", "entry_appended", "compaction_end", "session_info_changed", "agent_settled"].includes(event.type)) void this.sync(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
@@ -453,7 +462,7 @@ export class Sessions {
     const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
     // 优先按队列镜像取回原草稿（含图片节点），steering 在前、followUp 在后，与 clear_queue 的顺序一致。
     // 镜像无法确认时依次按完整编码文字、图片标记 nonce 查找，都找不到时只放回文字。
-    const items = [...match(mirror.steering, cleared?.steering ?? []), ...match(mirror.followUp, cleared?.followUp ?? [])];
+    const items = [...restore(mirror.steering, cleared?.steering ?? []), ...restore(mirror.followUp, cleared?.followUp ?? [])];
     if (!session.handle || session.handle === handle) session.queued = emptyMirror();
     const queuedDrafts = items.map((item) => item?.draft);
     const keys = texts.map((text, i) => {
