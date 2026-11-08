@@ -40,7 +40,7 @@ async function create(s, text) {
   await dispatch(s.page, text);
   try {
     await until(async () => {
-      if (await byId(s.page, "trust-yes").isVisible()) await byId(s.page, "trust-yes").click();
+      if (await byId(s.page, "trust-yes").isVisible()) await byId(s.page, "trust-yes").click({ timeout: 3000 }).catch(() => {}); // 询问框重渲染时由外层循环重试
       return hasUser(await sessionView(s), text);
     }, 30_000);
   } catch (error) {
@@ -316,7 +316,7 @@ test("草稿初始化 Chrome 连续五次新建会话后立即 fill 和 Enter �
     await byId(page, "composer").press("Enter");
     const opened = await (await opening).json();
     await until(async () => {
-      if (await byId(page, "trust-yes").isVisible()) await byId(page, "trust-yes").click();
+      if (await byId(page, "trust-yes").isVisible()) await byId(page, "trust-yes").click({ timeout: 3000 }).catch(() => {}); // 询问框重渲染时由外层循环重试
       return hasUser(await sessionView(s), text);
     }, 30_000);
     const view = await idle(s);

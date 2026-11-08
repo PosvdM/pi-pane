@@ -93,7 +93,7 @@ test("Chrome 两张图片占位符的上传、复制、发送和退格重新编�
   await screenshot(page, "e2e-images-composer");
   await editor.press("Enter");
   await until(async () => {
-    if (await byId(page, "trust-yes").isVisible()) await byId(page, "trust-yes").click();
+    if (await byId(page, "trust-yes").isVisible()) await byId(page, "trust-yes").click({ timeout: 3000 }).catch(() => {}); // 询问框重渲染时由外层循环重试
     return byId(page, "model-button").isVisible();
   }, 30_000);
   await byId(page, "assistant-message").waitFor();

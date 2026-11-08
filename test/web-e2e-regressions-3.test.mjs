@@ -36,7 +36,7 @@ async function create(s, text) {
   await newSession(s.page, s.fixture);
   await dispatch(s.page, text);
   await until(async () => {
-    if (await byId(s.page, "trust-yes").isVisible()) await byId(s.page, "trust-yes").click();
+    if (await byId(s.page, "trust-yes").isVisible()) await byId(s.page, "trust-yes").click({ timeout: 3000 }).catch(() => {}); // 询问框重渲染时由外层循环重试
     return hasUser(await sessionView(s), text);
   }, 30_000);
   const view = await idle(s);

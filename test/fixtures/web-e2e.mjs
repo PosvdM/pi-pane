@@ -63,7 +63,7 @@ export async function send(page, text, button) {
   await page.waitForFunction(() => { const b = document.querySelector('[data-testid="send"],[data-testid="steer"]'); return b && !b.disabled; });
   if (button) await byId(page, button).click(); else await byId(page, "composer").press("Enter");
   await until(async () => {
-    if (await byId(page, "trust-yes").isVisible()) await byId(page, "trust-yes").click();
+    if (await byId(page, "trust-yes").isVisible()) await byId(page, "trust-yes").click({ timeout: 3000 }).catch(() => {}); // 询问框重渲染时由外层循环重试
     return await byId(page, "model-button").isVisible() || await byId(page, "ui-dialog").isVisible();
   }, 30_000);
 }
