@@ -1,6 +1,6 @@
 # 总体架构
 
-> 状态：M1 服务端核心已实现。Web 界面与设备签名在 M2、插件宿主在 M3 实现。本文描述完整架构；M1 的可用接口与验收映射见 [development.md](development.md)。
+> 状态：M1 服务端核心与 M2 前端核心已实现，插件宿主、持久表单和 `userPresence` 确认流程属于 M3，尚未实现。本文描述完整架构；当前可用接口、前端结构与验收映射见 [development.md](development.md)。
 
 pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起一个 `pi --mode rpc` 子进程，把聊天流转发给浏览器；子代理、会议等功能由插件通过通用接口显示，pi-pane 本身不实现这些业务。
 
@@ -35,18 +35,18 @@ pi-pane 服务端（server）
  ├─ 只读会话读取：不拉起进程，直接解析会话文件
  ├─ 扩展 UI 适配：pi 原生 select/confirm/input/editor 等 → 浏览器
  ├─ 附件与图片缓存
- └─ 插件宿主：加载可信的服务端插件（如 pi-agora 的 pane 插件）
+ └─ 插件宿主（M3，尚未实现）：加载可信的服务端插件（如 pi-agora 的 pane 插件）
 ```
 
-| 包（草案） | 职责 |
+| 包 | 职责 |
 | --- | --- |
-| `packages/server` | 服务端：会话托管、RPC 驱动、只读解析、鉴权、WebSocket、附件、插件宿主 |
-| `packages/web` | 前端：会话列表与树、聊天视图、输入框、对话框、面板、设备密钥 |
+| `packages/server` | 服务端：会话托管、RPC 驱动、只读解析、鉴权、WebSocket、附件；插件宿主属于 M3 |
+| `packages/web` | Vite + Preact 前端：会话列表、聊天视图、输入框与图片占位符、斜杠命令、扩展对话框、模型与思考级别、设备密钥；会话树中的插件节点、面板与待处理区属于 M3 |
 | `packages/bridge-extension` | 加载进每个主会话的 pi 扩展（pane-bridge），见“pane-bridge” |
 | `packages/plugin-api` | `@pi-pane/plugin-api`：插件接口和 pane 协议 v1 的 TypeScript 类型，按 [plugin-api.md](plugin-api.md) 导出；插件把它作为 peer 依赖 |
 | `pi-hostkit`（外部依赖） | 平台相关的共享实现，见“平台支持” |
 
-前端技术栈（草案）：Vite + Preact。选择理由是打包体积小；P0 期间可以换，但不改变接口。
+前端使用 Vite + Preact，以控制打包体积；模块职责与运行时约束见 [development.md 的“前端结构”](development.md#前端结构)。
 
 ## 平台支持
 
@@ -86,7 +86,7 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 ### 会话列表
 
-会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。
+会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。HTTP 返回 `PaneSessionList`：`path` 映射为 `sessionFile`，`firstMessage` 的前 200 个字符作为 `title`，空会话的 pi 占位标题转换为空字符串；`created`/`modified` 转为 ISO 时间，`parentSessionPath` 映射为 `parentSessionFile`。列表不下发 `allMessagesText` 等消息全文；`hosted` 按匹配 `fileKey` 的写者是否接受输入填写，已登记记录附带 `status`。
 
 - 存储位置按 pi 的规则确定（依据：pi `docs/sessions.md`、`docs/settings.md`）：环境变量 `PI_CODING_AGENT_SESSION_DIR` 优先，其次是 agent 目录（默认 `~/.pi/agent`，可由 `PI_CODING_AGENT_DIR` 覆盖）下 `settings.json` 的 `sessionDir`，都没有时用 `<agent 目录>/sessions/`。
 - 项目的 `.pi/settings.json` 也可以设置 `sessionDir`（pi 在信任判断之前就读取它，依据：pi `docs/configuration.md`）。pi-pane 对已知的项目目录（打开过或新建过会话的 `cwd`）另外读取这个设置，把那里的会话一并列出。
@@ -172,7 +172,7 @@ pi 决定信任的顺序（依据：`dist/core/project-trust.js` 的 `resolvePro
 
 - 拉起一个会话之前，服务端用 pi 导出的 `hasTrustRequiringProjectResources(cwd)` 和 `ProjectTrustStore`（依据：`dist/index.d.ts` 第 28 行）判断该目录是否有需要信任的资源、是否已有保存的决定。注意：没有资源的目录，如果 `trust.json` 里记的是 false，同样当作不信任。有资源且没有保存的决定时，浏览器显示“是否信任项目 <cwd>？”，选项为“信任”“不信任”和“记住此选择”。这一步发生在用户打开或新建会话的那个标签页里，用户一定在场。
 - 决定不用 `--approve`/`--no-approve` 传给 pi：命令行覆盖对该进程内所有目录生效，进程内切换到别的项目时也会沿用。服务端把“目录 → `{ trusted, remember }`”放进 pane-bridge 的启动配置（随回连通道的兑换响应下发），比较路径前先做 `realpath`（例如 macOS 上系统临时目录 `event.cwd` 在 `/private/var` 与 `/var` 的符号链接差异）；pane-bridge 的 `project_trust` 处理器只对匹配的目录返回这个决定，返回值按 pi 的类型 `{ trusted: "yes" | "no" | "undecided", remember?: boolean }`（依据：`dist/core/extensions/types.d.ts` 第 558–562 行）；`remember: true` 时由 pi 写入 `trust.json`。
-- 用户关闭询问框或没有作答时，处理器返回 `"undecided"`。
+- 用户关闭询问框或没有作答时，处理器返回 `"undecided"`。回答或超时后向全部已鉴权浏览器广播 `{type:"project_trust_resolved",id}`，关闭其他标签页的同一询问框。
 - 同一 pi-pane 运行期间对同一目录的回答缓存在服务端内存里（未勾选“记住”时只对本次运行有效），重新拉起时不再询问。
 
 **补充：进程内切换到新目录**
@@ -210,7 +210,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 普通操作在控制队列中执行前比较条件。停止类操作也先检查 epoch、revision 和关闭确认，再取消尚未执行的排队操作（`controlPreempted`）；启动中的操作收到取消信号，迟到的进程在发送输入前被停止。已发送的 RPC 不伪造取消结果，仍记录真实响应；进程停止而未收到响应，或停止失败后主动终结本地等待时，记为 `rpcResultUnknown`。
 - **准入上限**：每会话最多排队 64 项，超过时返回 HTTP 429 `controlQueueLimit`；停止优先通道不占普通队列。全服务最多保留 256 项未完成的普通请求，停止类请求另保留 16 项额度，超过时返回 HTTP 429 `pendingLimit`。达到上限不删除已有 pending 幂等记录，同 requestId 的查询和结果重放仍可使用。停止期间的新操作返回 `controlStopping`。
 - **停止（取消）**：会话视图的“停止”按钮。服务端进入 `stopping` 状态，先发 `clear_queue`，把返回的 steering 和 follow-up 文本按原顺序放回输入框（放在现有草稿之前，用空行分隔），再发 `abort`。P0 实测证明：只发 `abort` 时排队消息留在队列里、不会自动执行，而且排队的 agora 通知之后会重复落盘，所以 pane 不提供只发 abort 的操作（不提供“只停止当前回复”菜单项）。
-- **队列里的图片**：`clear_queue` 只返回文字。服务端记录每条排队消息的草稿（含图片节点），按文字找回对应草稿后整条放回输入框；带图片的消息文字里有随机标记（见 [image-placeholders.md](image-placeholders.md#做法发送时编码message_end-时还原)），可以唯一对应。
+- **队列里的图片**：`clear_queue` 只返回文字。服务端记录每条排队消息的草稿（含图片节点），停止时找回对应草稿后整条放回输入框。技能和提示模板在入队前由 pi 展开，队列文字可能与发送文字完全不同，因此服务端维护 pi 队列的镜像（`packages/server/src/queue-mirror.ts`），按队列项身份关联草稿：`queue_update` 时按“新增在队尾、开始处理的用户消息删除同文字最早项”对齐；steer、follow-up（含带 `delivery` 的 prompt）的响应 `disposition` 为 `queued` 时，本次请求期间新增的队列项中文字或图片标记与发送文字相符的唯一项、或唯一的新增项认领草稿，扩展同时入队导致归属不明时，全部新增项成为同一分组的候选。停止前对镜像取快照（`clear_queue` 会先发出空的 `queue_update`），清出的文字按快照后缀对应，steering 在前、followUp 在后；分组草稿只在全部候选都被清出时在最后一个候选的位置取回一次，避免把可能已发送的草稿放回。镜像无法确认时依次按完整编码文字、图片随机标记（见 [image-placeholders.md](image-placeholders.md#做法发送时编码message_end-时还原)）查找，都找不到时只放回文字。队列项被消费或清出、写者退出或重绑定时释放对应草稿记录。
 - **超时与抢占**：`abort` 会等会话空闲后才响应。服务端默认等待 10 秒，超时后自动按 hostkit 流程终止进程树。抢占活动控制操作时，即使 `abort` 返回，也停止进程，以结束可能仍挂起的扩展命令及全部 RPC 等待项；停止报告与进程身份复查完成后才释放写锁。已进入桥接事件的目标取锁若在停止后才返回，不登记新的 running writer，等待该停止确认后释放迟到锁；清理无法确认时保留锁并记录诊断。
 - **运行记录清理**：每个 handle 的运行记录写入串行执行。停止后才进入持久化队列的写入直接跳过；已进入的写入（包括临时文件 rename）结束后，停止才删除临时文件和运行记录。不等待尚未进入持久化的初始化收尾，迟到初始化也不能重新创建运行记录。
 - **stopping 期间**：拒绝新的发送（提示“正在停止”），直到收到 `agent_settled` 或进程退出。进入和离开 `stopping` 都会使 `controlRevision` 加 1。
@@ -240,6 +240,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 | `GET /api/trust`、`POST /api/trust/:id` | 返回 503 `serverStopping`，不读取或提交信任决定。 |
 | `GET /api/sessions/:id/snapshot`、`GET /api/sessions/:id/history` | 返回 503 `serverStopping`。 |
 | `POST /api/sessions/:id/control`、`POST /api/sessions/:id/query`、`POST /api/sessions/:id/ui` | 返回 503 `serverStopping`，不提交控制、RPC 查询或 UI 回应。 |
+| `GET /api/exports/:id` | 返回 503 `serverStopping`，不读取导出文件。 |
 | `POST /api/assets`、`POST /api/assets/touch` | 返回 503 `serverStopping`，不上传或刷新附件。 |
 | `GET /api/assets/:hash`、`GET /api/assets/:hash/thumb`、`GET /api/blobs/:hash`、`GET /api/blobs/:hash/thumb` | 返回 503 `serverStopping`，不读取附件或重建缓存。 |
 | `POST /bridge/launch`、`POST /bridge/event` | 返回 503 `serverStopping`，不兑换 bridge ticket 或受理新桥接事件；已登记事件按关闭屏障收尾。 |
@@ -321,6 +322,12 @@ interface DriverHandle {
 
 ### 通道
 
+浏览器接口由 `packages/server/src/web-api.ts` 定义，`web-adapter.ts` 在服务端转换 pi 原始数据。`/query`、`/ui`、控制结果和会话列表使用 web-api.ts 的 pane 类型。会话流与 entries 遵循 plugin-api.md 的 pane 协议。
+
+`POST /api/sessions/:id/query` 接受 `{type}`，`type` 仅为 `state`、`models`、`commands`、`stats`、`forkPoints`，服务端分别调用 `get_state`、`get_available_models`、`get_commands`、`get_session_stats`、`get_fork_messages`，返回对应的 `PaneQueryResults[type]`，pi 拒绝时返回 409 `rpcRejected`。快照和打开响应包含 `hosted`，并在存在最近状态时附带 `PaneSessionState`。缓存状态在托管初始化、状态查询、`set_model`、`set_thinking_level`、`set_session_name`、`compact` 成功后，以及 `session_info_changed`、`model_select`、`thinking_level_select`、`model_changed`、`thinking_level_changed` 事件后通过 `get_state` 刷新；事件刷新合并执行，仅在写者、模型和 epoch 未变且写者仍接受输入时提交，名称、模型或思考级别变化后递增 `controlRevision` 并发送 `pane_status`，事件或控制操作后的刷新失败仅发送 `pane_diagnostic`，不覆盖已确认的控制结果。
+
+控制受理结果为 `{status:"accepted",snapshot,result?}`，不含 pi `response`；`result` 按命令提供 `handled`、`cancelled` 或 `exportId`。`stop`/`close` 返回 `{status:"done",clearedText,clearedDrafts}`，停止报告仅用于服务端诊断。
+
 - **命令**：HTTP `POST /api/...`，带 `Authorization` 头（见“鉴权”）。每个命令带 `requestId`（同时作为幂等键），会话命令还按“停止与控制队列”的表带 `expectedEpoch` 和 `expectedRevision`。如发送消息、steer、停止、切换模型、回应对话框、调用插件动作、提交表单、上传图片。
 - **幂等**：同一 `requestId` 的命令只执行一次。HTTP 等待默认 30 秒（`rpcTimeoutMs`），等待到期返回 `{ status: "pending" }`，不取消底层控制操作、不完成幂等记录。控制 RPC 保留本地响应等待项，直到实际响应、传输关闭或停止失败后的本地等待终结；服务正常运行时，信任询问、长时间压缩等操作的迟到结果仍写回同一记录。重复提交时服务端返回这次操作的**当前**状态：仍在执行就返回“处理中”，已结束就返回最终结果；最终结果至少保留 24 小时。传输中断且没有确认响应时返回 `rpcResultUnknown`，要求读取会话状态核对；只有 pi 明确拒绝的响应属于 `rpcRejected`。同一 `requestId` 配不同的命令内容时拒绝（HTTP 409 `idempotencyConflict`）。服务端重启后幂等记录丢失，此时 epoch 已经改变，旧命令会被 epoch 检查拒绝。
 - **事件**：一条 WebSocket `/ws`。浏览器订阅关心的会话和插件来源，服务端推送事件。
@@ -331,7 +338,10 @@ type ServerMessage =
   | { type: "session"; ref: SessionRef; cursor: StreamCursor; event: object } // pi 会话事件、pane_* 事件或 resync
   | { type: "tree"; source: string; change: TreeChange }
   | { type: "panel"; update: PanelUpdate }
-  | { type: "ui_request"; ref: SessionRef; request: ExtensionUiRequest }       // pi 原生扩展 UI
+  | { type: "ui_request"; ref: SessionRef; request: PaneUiRequest }
+  | { type: "ui_resolved"; ref: SessionRef; id: string; reason: "answered" | "cancelled" | "expired" | "closed" }
+  | { type: "project_trust"; request: { id: string; cwd: string; expiresAt: string } }
+  | { type: "project_trust_resolved"; id: string }
   | { type: "form"; form: FormSpec }
   | { type: "formRemoved"; formId: string; reason: FormRemovedReason }
   | { type: "presence"; request: { id: string; title: string; summary: string; payload: unknown; source: string } }
@@ -342,6 +352,10 @@ type ServerMessage =
 ```
 
 `BannerState` 是 `PaneBanner` 加上 `source` 和 `sourceUnavailable: boolean`（见 [plugin-api.md](plugin-api.md#横幅)）。`SessionRef`、`StreamCursor`、`TreeChange`、`FormSpec`、`PaneNotification` 等类型由 pane 协议 v1 定义（[plugin-api.md](plugin-api.md)）。主会话的 `SessionRef` 是 `{ source: "pane", id: <piSessionId> }`。
+
+扩展 UI 使用 `PaneUiRequest` 的 `kind`，不向浏览器下发 pi `method`。`notify` 的 `level` 默认 `info`，`widget` 的 `placement` 默认 `aboveEditor`。对话框的 `timeout` 在收到时换算为 `expiresAt`；重新订阅时补推原始期限。`POST /api/sessions/:id/ui` 接受 `{requestId,expectedEpoch,id,answer?}`，`answer` 为 `{value}` 或 `{confirmed}`，省略表示取消；回答类型必须匹配 `kind`，`select` 的 `value` 必须属于 `options`，否则返回 400 `invalidUiAnswer`。回答或取消后向全部会话订阅者推送 `ui_resolved`；到期推 `expired` 并删除待答记录，pi 自行处理默认值，服务端不再回复 pi。写者退出、切换会话或 `reload` 清除对话框时推 `closed`。
+
+导出下载只接受规范的 22 字符 base64url 标识，且必须由本实例生成，只读取数据目录 `tmp/exports/`。响应使用 `Content-Type: text/html; charset=utf-8` 和 `Content-Disposition: attachment; filename="pi-session.html"`。`sweep` 删除超过 24 小时的导出文件。CLI 的 `webRoot` 默认是相对 server dist 的 `../../web/dist`，配置文件可以覆盖；目录不存在时非 API 路径返回 404“Web 界面未构建，请运行 npm run build”，不影响服务启动。
 
 ### 会话模型
 
@@ -393,14 +407,16 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 | `/thinking [level]` | RPC `set_thinking_level`；无参数时打开选择 |
 | `/new` | RPC `new_session`，按“会话切换”处理 |
 | `/name [名称]` | RPC `set_session_name`；无参数时显示当前名称 |
-| `/export` | RPC `export_html`，输出路径在 pi-pane 的临时目录里，完成后提供下载 |
+| `/export` | pane `export` 控制命令进入普通队列，校验 `expectedEpoch`/`expectedRevision`；RPC `export_html` 的 `outputPath` 固定在数据目录 `tmp/exports/<128 位随机 base64url id>.html`，`result.exportId` 用于已鉴权的 `GET /api/exports/:id` 下载 |
 | `/fork` | 用 `get_fork_messages` 列出可选的用户消息，选中后 RPC `fork` |
 | `/clone` | RPC `clone` |
 | `/resume` | 打开 pi-pane 的会话列表 |
 | `/session` | 显示 `get_state` 和 `get_session_stats` 的信息 |
 | `/quit` | 关闭会话 |
-| `get_commands` 返回的扩展命令、技能、提示模板 | 原样通过 `prompt` 发送 |
-| 其他（如 `/settings`、`/tree`、`/reload`、`/login`） | 不发送，提示“pi-pane 不支持 /xxx，请在终端中使用 pi” |
+| `get_commands` 返回的扩展命令、技能、提示模板 | 原样通过 pane `prompt` 发送；运行中可携带 `delivery: "steer"` 或 `"followUp"`。技能和模板展开后按该方式排队，扩展命令立即执行并忽略送达字段 |
+| 终端专用内置命令（如 `/settings`、`/tree`、`/reload`、`/login`、`/import`、`/trust`、`/bug`） | 服务端在启动 pi 之前检查；未托管时直接返回 400 `unsupportedCommand`，提示“pi-pane 不支持 /xxx，请在终端中使用 pi”。已托管时先查询 `get_commands`，存在同名资源命令则允许发送，否则拒绝且不发给模型 |
+
+服务端在 `packages/server/src/pi-commands.ts` 维护终端专用命令名单，依据 pi 1.5.0 的内置命令列表和交互命令分发，排除上表中由 pi-pane 实现的命令。检查覆盖 `prompt`、`steer`、`follow_up` 的实际文本，包括草稿编码结果；同名资源命令的存在性每次查询，不缓存到下一次会话绑定。pane `prompt.delivery` 在服务端映射为 pi RPC 的 `streamingBehavior`，只接受 `"steer"` 和 `"followUp"`；其他控制命令携带此字段时返回 400 `invalidCommand`。字段属于幂等命令内容，不能用同一 `requestId` 改变送达方式。
 
 输入 `/` 时，补全列表包含上表的内置命令和 `get_commands` 返回的命令（显示 `description` 和来源）。会话的扩展重新加载或切换后重新获取。
 
@@ -410,7 +426,7 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 
 ### 规范源与监听
 
-- 只监听 `127.0.0.1`（端口默认 4319，配置项 `port`）。
+- 只监听 `127.0.0.1`（端口默认 4319，配置项 `port`）。端口必须是 1–65535 的整数且不在 [Fetch 规范的禁止端口列表](https://fetch.spec.whatwg.org/#port-blocking)中；`0` 表示自动分配，取得实例锁后最多尝试监听 20 次，遇到禁止端口时先关闭监听再重新分配，失败时沿用启动清理流程。
 - 只服务规范源 `http://127.0.0.1:<port>`：每个 HTTP 请求和 WebSocket 握手的 `Host` 头必须正好是 `127.0.0.1:<port>`，否则拒绝（防 DNS 重绑定）。`localhost` 也拒绝，终端里打印的地址始终用 `127.0.0.1`。
 - 带 `Origin` 头的请求，`Origin` 必须是规范源；不开放 CORS。
 - 浏览器的设备密钥存在 IndexedDB，按源隔离：端口或源改变后浏览器看到的是一台新设备（见 [plugin-api.md](plugin-api.md#设备密钥)）。改端口前应知道插件后台服务会要求重新批准设备。
@@ -450,7 +466,7 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 
 ## 用户在场确认与设备密钥
 
-浏览器第一次登录时用 WebCrypto 生成不可导出的 ECDSA P-256 设备密钥，存在 IndexedDB。插件调用 `ctx.userPresence.confirm()` 时，浏览器弹出确认框，用户点击确认后签名，插件的后台服务验签。pi-pane 只负责生成、保存密钥和签名，不判断设备是否可信；设备的首次信任（TOFU）和批准由插件后台服务负责。接口、签名格式和流程见 [plugin-api.md](plugin-api.md#用户在场确认)。
+浏览器第一次登录时用 WebCrypto 生成不可导出的 ECDSA P-256 设备密钥，存在 IndexedDB；密钥管理和签名能力由 M2 提供。M3 的 `userPresence` 确认流程尚未接入，其协议规定：插件调用 `ctx.userPresence.confirm()` 时，浏览器弹出确认框，用户点击确认后签名，插件的后台服务验签。pi-pane 只负责生成、保存密钥和签名，不判断设备是否可信；设备的首次信任（TOFU）和批准由插件后台服务负责。接口、签名格式和流程见 [plugin-api.md](plugin-api.md#用户在场确认)。
 
 ## 渲染与资源安全
 

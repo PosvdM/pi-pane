@@ -17,9 +17,9 @@ test("空闲会话的无模型扩展命令及 handled 输入只受理 revision�
     for (const message of ["/pane-test-wait 1", "pane-test-handled-input"]) {
       const revision = state.controlRevision;
       const result = await control(server, token, state, { type: "prompt", message }); assert.equal(result.code, 200, JSON.stringify(result));
-      assert.equal(result.value.response.data.disposition, "handled");
+      assert.equal(result.value.result.handled, true);
       state = await snapshot(server, token, state.ref.id); assert.equal(state.status, "idle"); assert.equal(state.inFlight.phase, "idle"); assert.equal(state.controlRevision, revision + 1);
-      const real = await server.sessions.query(state.ref.id, "get_state"); assert.equal(real.data.isStreaming, false);
+      const real = await server.sessions.query(state.ref.id, "state"); assert.equal(real.running, false);
     }
     assert.equal(events.some(e => e.event.type === "agent_start" || e.event.type === "pane_status" && e.event.status === "running"), false);
     assert.equal((await readFile(f.env.FAKE_REQUEST_LOG, "utf8")).split("\n").filter(line => line && JSON.parse(line).kind === "request").length, 1);
@@ -38,7 +38,7 @@ test("空闲会话 prompt 预检被拒绝不改变运行阶段", { timeout: 3000
     const events = []; const off = server.sessions.subscribe(state.ref.id, state.cursor, e => events.push(e));
     const denied = await control(server, token, state, { type: "prompt", message: "无可用模型的预检" }); assert.equal(denied.code, 409); assert.equal(denied.value.error, "rpcRejected");
     const after = await snapshot(server, token, state.ref.id); assert.equal(after.status, "idle"); assert.equal(after.inFlight.phase, "idle"); assert.equal(after.controlRevision, state.controlRevision + 1);
-    assert.equal((await server.sessions.query(state.ref.id, "get_state")).data.isStreaming, false);
+    assert.equal((await server.sessions.query(state.ref.id, "state")).running, false);
     assert.equal(events.some(e => e.event.type === "pane_status" && e.event.status === "running"), false); off();
   } finally { await server.close(); await f.cleanup(); }
 });

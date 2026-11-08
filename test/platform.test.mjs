@@ -18,7 +18,7 @@ test("忽略 abort 的工具启动真实 shell 与脱离进程组后代，StopRe
   await delay(200); const stopped = await control(server, token, await snapshot(server, token, id), { type: "stop" });
   if (stopped.code !== 200) t.diagnostic(JSON.stringify({ response: stopped, stopReports: server.sessions.reports, identities }));
   assert.equal(stopped.code, 200, JSON.stringify(stopped));
-  const report = stopped.value.stopReport; assert.equal(report.leftovers.length, 0); assert.ok(report.steps.some(s => s.step === "abort" && !s.ok));
+  const report = server.sessions.reports.at(-1); assert.equal("stopReport" in stopped.value, false); assert.equal(report.leftovers.length, 0); assert.ok(report.steps.some(s => s.step === "abort" && !s.ok));
   const began = performance.now(); const observations = [];
   async function gone() { const states = await Promise.all(identities.map(identity => isSameProcess(identity))); observations.push({ elapsedMs: Math.round(performance.now() - began), states }); return states.every(state => state === "gone"); }
   assert.ok(await gone(), "StopReport 返回后必须立即确认已知后代退出");

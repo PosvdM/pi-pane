@@ -40,7 +40,7 @@ for (const fault of ["query", "release", "cleanup-release"]) test(`取消切换�
     };
     const result = await control(server, token, state, { type: "prompt", message: "/pane-test-resume " + target }, { requestId: "confirmed-cancel" });
     assert.equal(injected, true); assert.equal(result.code, 200, JSON.stringify(result)); assert.equal(result.value.status, "accepted");
-    assert.equal(received.success, true); assert.equal(received.data.disposition, "handled"); assert.deepEqual(result.value.response, received);
+    assert.equal(received.success, true); assert.equal(received.data.disposition, "handled"); assert.deepEqual(result.value.result, { handled: true }); assert.equal("response" in result.value, false);
     assert.equal(result.value.snapshot.sessionFile, state.sessionFile);
     assert.ok(events.some(e => e.type === "pane_diagnostic" && /切换后写锁清理未确认.*injected cleanup/.test(e.message)));
     await handle.exited; assert.equal(await isSameProcess(handle.identity), "gone");

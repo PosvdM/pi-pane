@@ -4,7 +4,11 @@ import { readFile, readdir, rm, mkdir, stat, writeFile, rename } from "node:fs/p
 import path from "node:path";
 import { stopByIdentity, probeSessionWriterLock, type ProcessIdentity, type StopReport } from "pi-hostkit";
 import type { DraftNode, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
-import type { ControlRequest, ExtensionUiRequest } from "./pi-rpc.js";
+import type { ControlRequest } from "./pi-rpc.js";
+import type { PaneSessionList, PaneSessionView, PaneQueryResults, PaneQueryType, PaneUiAnswerRequest, PaneUiAnswerResult, PaneUiRequest, PaneServerMessage } from "./web-api.js";
+import { isPaneQueryType, isUiDialog, queryCommands, toPaneOutcome, toPaneQuery, toPaneSessionListItem, toPaneState, toPaneUiRequest, toPiControlCommand, toPiUiAnswer, type PaneUiDialog } from "./web-adapter.js";
+import { ExportStore } from "./exports.js";
+import { terminalOnlyCommand } from "./pi-commands.js";
 import { AssetStore } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { ControlQueue, RequestLedger } from "./control.js";
@@ -14,29 +18,35 @@ import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
+import { claim, emptyMirror, reconcile, removed, restore, type QueueMirror } from "./queue-mirror.js";
 
 interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
-  state?: any; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>; clients: number; lastActive: number;
-  holds: Map<string, { source: string; reason: string }>; ui: Map<string, ExtensionUiRequest>; recentExternal: boolean; closed: boolean;
+  state?: any; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>;
+  /** pi 队列的镜像，队列项关联发送时的原草稿，见 queue-mirror.ts。随写者和模型重建清空。 */
+  queued: QueueMirror; clients: number; lastActive: number;
+  holds: Map<string, { source: string; reason: string }>; ui: Map<string, { request: PaneUiDialog; timer?: ReturnType<typeof setTimeout> }>; recentExternal: boolean; closed: boolean;
 }
-const mutations = new Set(["prompt", "steer", "follow_up", "stop", "close", "restart", "set_model", "set_thinking_level", "compact", "new_session", "fork", "clone", "set_session_name"]);
-const queries = new Set(["get_state", "get_available_models", "get_commands", "get_session_stats", "get_fork_messages", "get_last_assistant_text"]);
+const mutations = new Set(["prompt", "steer", "follow_up", "stop", "close", "restart", "set_model", "set_thinking_level", "compact", "new_session", "fork", "clone", "set_session_name", "export"]);
 export interface SessionManagerOptions extends DriverOptions { idleReclaimMs?: number }
 export class Sessions {
   readonly ledger: RequestLedger;
+  readonly exports: ExportStore;
   private records = new Map<string, HostedSession>(); private files = new Map<string, HostedSession>();
   private driver: RpcSubprocessDriver; private timer: ReturnType<typeof setInterval>; private projects = new Set<string>();
   private state: Record<string, unknown> = {};
   private stateQueue = new ControlQueue();
   private recoveredFiles = new Set<string>();
+  private stateRefreshes = new WeakMap<HostedSession, { handle: DriverHandle; model: SessionModel; epoch: string; dirty: boolean; promise: Promise<void> }>();
   private recovering = true; private closing = false; readonly reports: StopReport[] = [];
   private starts = new Map<AbortController, Promise<void>>(); private closePromise?: Promise<void>;
   private handles = new Map<DriverHandle, Promise<void>>(); private cleanupErrors: unknown[] = [];
   private readonly closeTimeoutMs: number;
   readonly recoveryDiagnostics: string[] = [];
   constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
-    private readonly emitUi: (sessionId: string, request: any) => void) {
+    private readonly emitUi: (sessionId: string, request: PaneUiRequest) => void,
+    private readonly emitUiResolved: (sessionId: string, id: string, reason: Extract<PaneServerMessage, { type: "ui_resolved" }>["reason"]) => void = () => {}) {
+    this.exports = new ExportStore(options.home);
     const waits = [options.stopOptions?.abortTimeoutMs ?? 10000, options.stopOptions?.graceMs ?? 5000, options.stopOptions?.termGraceMs ?? 3000];
     assert(waits.every(ms => Number.isFinite(ms) && ms >= 0), "invalidConfig", "停止宽限必须为非负有限毫秒");
     // 与固定 hostkit 的 StopOptions 默认值一致；clear_queue 2 秒，身份核查及清理另留 5 秒。
@@ -111,7 +121,7 @@ export class Sessions {
     assert(!this.closing, "serverStopping", "服务端正在关闭", 503);
     const existing = this.files.get(fileKey(file)); if (existing) return this.view(existing);
     assert(!this.records.has(id), "sessionIdentityConflict", "另一个文件使用了相同的会话标识", 409);
-    const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), clients: 0, lastActive: Date.now(), holds: new Map(), ui: new Map(), recentExternal, closed: false };
+    const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), queued: emptyMirror(), clients: 0, lastActive: Date.now(), holds: new Map(), ui: new Map(), recentExternal, closed: false };
     this.records.set(id, session); this.files.set(fileKey(file), session);
     this.watch(file);
     return { ...this.view(session), diagnostics: parsed.diagnostics, ...(busy.held ? { heldBy: busy.record?.host.app } : {}), ...(recentExternal ? { warning: "recentModification" } : {}) };
@@ -126,14 +136,26 @@ export class Sessions {
       }).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     });
   }
-  private view(session: HostedSession): any { return { ...session.model.snapshot(), cwd: session.cwd, sessionFile: session.file, projectTrusted: session.state?.projectTrusted, holds: [...session.holds.values()] }; }
-  snapshot(id: string): any { return this.view(this.record(id)); }
+  private view(session: HostedSession): PaneSessionView {
+    return { ...session.model.snapshot(), cwd: session.cwd, sessionFile: session.file, hosted: session.handle?.acceptingInput === true,
+      ...(session.state ? { state: toPaneState(session.state) } : {}), projectTrusted: session.state?.projectTrusted, holds: [...session.holds.values()] };
+  }
+  snapshot(id: string): PaneSessionView { return this.view(this.record(id)); }
   history(id: string, before: string, limit?: number): any { return this.record(id).model.history(before, limit); }
-  async list(): Promise<any[]> { return this.store.list([...this.projects]); }
-  subscribe(id: string, cursor: StreamCursor, listener: (event: SessionStreamEvent) => void): () => void {
+  async list(): Promise<PaneSessionList> {
+    const rows = await this.store.list([...this.projects]);
+    return { sessions: rows.map(row => {
+      const session = this.files.get(fileKey(row.path));
+      return toPaneSessionListItem(row, session?.handle?.acceptingInput === true, session?.model.status);
+    }) };
+  }
+  subscribe(id: string, cursor: StreamCursor, listener: (event: SessionStreamEvent) => void, onUi = (request: PaneUiRequest) => this.emitUi(id, request)): () => void {
     const session = this.record(id); session.clients++; session.lastActive = Date.now();
     const off = session.model.subscribe(cursor, listener);
-    for (const request of session.ui.values()) this.emitUi(id, request);
+    for (const [uiId, pending] of session.ui) {
+      if (this.uiExpired(pending.request)) this.resolveUi(session, uiId, "expired");
+      else onUi(pending.request);
+    }
     return () => { off(); session.clients--; session.lastActive = Date.now(); };
   }
   hold(id: string, source: string, reason: string): () => void {
@@ -146,6 +168,7 @@ export class Sessions {
     return this.ledger.execute(request.requestId, { sessionId: id, ...request }, () => this.inflight.run("sessions.command", () => this.record(id).control.run(async (signal) => {
       let session = this.record(id); const model = session.model; const command = request.command;
       assert(command && mutations.has(command.type), "unsupportedCommand", "不支持此会话控制命令");
+      let rpc = toPiControlCommand(command);
       assert(request.expectedEpoch === model.epoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
       assert(request.expectedRevision === model.controlRevision, "revisionChanged", "会话状态已变化，请重新确认", 409);
       session.lastActive = Date.now(); const requestedFile = fileKey(session.file);
@@ -158,50 +181,112 @@ export class Sessions {
       if (command.type === "stop") return this.stop(session, false, session.control.preempt());
       assert(model.inFlight.phase !== "stopping", "stopping", "正在停止，请稍后重试", 409);
       signal.throwIfAborted();
+      let encoded: ReturnType<AssetStore["encode"]> | undefined;
+      if (["prompt", "steer", "follow_up"].includes(command.type)) {
+        assert(!("images" in command), "invalidImages", "图片必须使用上传后的草稿节点");
+        // 编码后检查实际发送的文本；模型图片能力在启动并读取状态后校验。
+        if (request.draft) { encoded = this.assets.encode(request.draft, true); rpc = { ...rpc, ...encoded }; }
+        assert(typeof rpc.message === "string" && Buffer.byteLength(rpc.message) <= 1024 * 1024, "invalidMessage", "消息文本无效或超过 1 MiB");
+        const name = terminalOnlyCommand(rpc.message);
+        if (name) {
+          const handle = session.handle;
+          let available = false;
+          if (handle?.acceptingInput) {
+            const response = await handle.send({ type: "get_commands" });
+            signal.throwIfAborted();
+            assert(session.handle === handle && handle.acceptingInput && session.model === model && model.epoch === request.expectedEpoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
+            assert(response.success, "rpcRejected", response.error ?? "pi 拒绝查询", 409);
+            available = toPaneQuery("commands", response.data).commands.some(candidate => candidate.name === name);
+          }
+          assert(available, "unsupportedCommand", `pi-pane 不支持 /${name}，请在终端中使用 pi`);
+        }
+      }
       if (!session.handle) await this.start(session, false, signal);
       signal.throwIfAborted();
       assert(fileKey(session.file) === requestedFile, "epochChanged", "会话启动期间已切换，请重新确认目标会话", 409);
       assert(session.handle?.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪，不能发送输入", 409);
-      let rpc = { ...command };
-      if (["prompt", "steer", "follow_up"].includes(command.type)) {
-        assert(!("images" in command), "invalidImages", "图片必须使用上传后的草稿节点");
-        if (request.draft) {
-          const encoded = this.assets.encode(request.draft, session.state?.model?.input?.includes("image") === true);
-          rpc = { ...rpc, ...encoded }; session.drafts.set(encoded.message, structuredClone(request.draft));
-        }
-        assert(typeof rpc.message === "string" && Buffer.byteLength(rpc.message) <= 1024 * 1024, "invalidMessage", "消息文本无效或超过 1 MiB");
+      if (encoded) {
+        assert(!encoded.images.length || session.state?.model?.input?.includes("image") === true, "imageUnsupported", "当前模型不支持图片，请切换模型");
+        session.drafts.set(encoded.message, structuredClone(request.draft!));
+      }
+      let exported: Awaited<ReturnType<ExportStore["allocate"]>> | undefined;
+      if (command.type === "export") {
+        exported = await this.exports.allocate(); signal.throwIfAborted();
+        rpc = { type: "export_html", outputPath: exported.outputPath };
       }
       // 受理控制操作只递增 revision；生成阶段由真实事件驱动，handled/拒绝不推测为 streaming。
       model.control(model.status, model.inFlight.phase, undefined, true);
       const handle = session.handle;
-      const response = await handle.send(rpc, { trackResult: true });
+      // 运行中的 steer、follow-up 进入 pi 队列；pi 在响应前已发出 queue_update，响应时本次新增的队列项已在镜像中。
+      const kind = command.type === "steer" || (command.type === "prompt" && command.delivery === "steer") ? "steering" as const
+        : command.type === "follow_up" || (command.type === "prompt" && command.delivery === "followUp") ? "followUp" as const : undefined;
+      const owner = session; const mirrorBefore = kind ? [...owner.queued[kind]] : [];
+      let response: Awaited<ReturnType<typeof handle.send>>;
+      try { response = await handle.send(rpc, { trackResult: true }); }
+      catch (error) {
+        // pi 明确拒绝时输入未入队，释放本次编码记录；结果未知时保留，以便停止时仍能取回。
+        if (encoded && error instanceof PaneError && error.code === "rpcRejected") owner.drafts.delete(encoded.message);
+        throw error;
+      }
+      // 只有确实入队（disposition 为 queued）的输入认领队列项；handled、started 和被拒绝的输入不再需要取回，释放草稿记录。
+      const queued = response.success && (response.data as any)?.disposition === "queued";
+      if (kind && request.draft && queued && owner.handle === handle) claim(mirrorBefore, owner.queued[kind], request.draft, encoded?.message);
+      if (encoded && !queued) owner.drafts.delete(encoded.message);
+      assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409);
+      const result = exported ? { exportId: exported.id } : toPaneOutcome(command.type, response.data);
+      if (exported) this.exports.complete(exported.id);
       session = this.files.get(fileKey(handle.sessionFile)) ?? session;
-      if (session.handle !== handle) return { status: "accepted", response, snapshot: this.view(session) };
+      if (session.handle !== handle) return { status: "accepted", ...(result ? { result } : {}), snapshot: this.view(session) };
       try {
         await this.sync(session);
-        if (["set_model", "set_thinking_level", "compact"].includes(command.type) && session.handle?.acceptingInput) {
+        if (["set_model", "set_thinking_level", "set_session_name", "compact"].includes(command.type) && session.handle?.acceptingInput) {
           const currentModel = session.model; const epoch = currentModel.epoch; const currentHandle = session.handle;
-          const state = (await currentHandle.send({ type: "get_state" })).data as any;
+          await this.refreshState(session);
           if (session.handle === currentHandle && currentHandle.acceptingInput && session.model === currentModel && currentModel.epoch === epoch) {
-            session.state = state;
-            if (command.type === "compact" && !state.isCompacting && !state.isStreaming) currentModel.control("idle", "idle");
+            if (command.type === "compact" && !session.state.isCompacting && !session.state.isStreaming) currentModel.control("idle", "idle");
           }
         }
       } catch (error) {
         // 控制响应已经确认；后续快照查询失败不能把已执行操作缓存为失败。
         session.model.emit({ type: "pane_diagnostic", message: String(error) });
       }
-      return { status: "accepted", response, snapshot: this.view(session) };
+      return { status: "accepted", ...(result ? { result } : {}), snapshot: this.view(session) };
     }, priority)), priority);
   }
-  async query(id: string, type: string): Promise<any> {
-    assert(queries.has(type), "unsupportedQuery", "不支持此会话查询"); const session = this.record(id);
-    assert(session.handle?.acceptingInput, "notHosted", "会话尚未托管", 409); return session.handle.send({ type });
+  async query(id: string, type: string): Promise<PaneQueryResults[PaneQueryType]> {
+    assert(isPaneQueryType(type), "unsupportedQuery", "不支持此会话查询"); const session = this.record(id);
+    assert(session.handle?.acceptingInput, "notHosted", "会话尚未托管", 409);
+    const handle = session.handle; const model = session.model; const epoch = model.epoch;
+    const response = await handle.send({ type: queryCommands[type] });
+    assert(response.success, "rpcRejected", response.error ?? "pi 拒绝查询", 409);
+    if (type === "state" && session.handle === handle && handle.acceptingInput && session.model === model && model.epoch === epoch) this.commitState(session, response.data);
+    return toPaneQuery(type, response.data);
   }
-  respondUi(id: string, body: any): any {
+  respondUi(id: string, body: PaneUiAnswerRequest): PaneUiAnswerResult {
     const session = this.record(id); assert(body.expectedEpoch === session.model.epoch, "epochChanged", "会话进程已更换", 409);
-    if (!session.ui.has(body.id)) return { status: "alreadyHandled" };
-    session.handle!.respondUi(body.response ? { ...body.response, id: body.id } : { id: body.id, cancelled: true }); session.ui.delete(body.id); return { status: "done" };
+    const pending = session.ui.get(body.id);
+    if (!pending) return { status: "alreadyHandled" };
+    if (this.uiExpired(pending.request)) { this.resolveUi(session, body.id, "expired"); return { status: "alreadyHandled" }; }
+    assert(!("response" in body), "invalidUiAnswer", "对话框回答需要使用 answer 字段");
+    const response = toPiUiAnswer(pending.request, body.answer);
+    session.handle!.respondUi(response);
+    this.resolveUi(session, body.id, body.answer === undefined ? "cancelled" : "answered"); return { status: "done" };
+  }
+  private uiExpired(request: PaneUiDialog): boolean { return request.expiresAt !== undefined && Date.parse(request.expiresAt) <= Date.now(); }
+  private resolveUi(session: HostedSession, id: string, reason: Extract<PaneServerMessage, { type: "ui_resolved" }>["reason"]): void {
+    const pending = session.ui.get(id); if (!pending) return;
+    clearTimeout(pending.timer); session.ui.delete(id); this.emitUiResolved(session.id, id, reason);
+  }
+  private closeUi(session: HostedSession): void { for (const id of session.ui.keys()) this.resolveUi(session, id, "closed"); }
+  private scheduleUi(session: HostedSession, request: PaneUiDialog): void {
+    if (!request.expiresAt) return;
+    const pending = session.ui.get(request.id)!;
+    const check = () => {
+      if (session.ui.get(request.id) !== pending) return;
+      if (this.uiExpired(request)) this.resolveUi(session, request.id, "expired");
+      else { pending.timer = setTimeout(check, Math.min(2 ** 31 - 1, Date.parse(request.expiresAt!) - Date.now())); pending.timer.unref(); }
+    };
+    check();
   }
   private start(session: HostedSession, assumeNoWriter = false, signal?: AbortSignal): Promise<void> {
     if (this.closing) return Promise.reject(new PaneError("interrupted", "会话已关闭", 409));
@@ -245,7 +330,7 @@ export class Sessions {
           const session = attached;
           if (session.owner !== owner) return;
           if (report) this.reports.push(report);
-          session.owner = undefined; session.handle = undefined; session.ui.clear();
+          session.owner = undefined; session.handle = undefined; this.closeUi(session); session.queued = emptyMirror(); session.drafts.clear();
           if (reason === "会话已关闭" && !error) {
             session.model.readonly = true; session.model.readonlyReason = "archived"; session.model.inFlight.assistant = undefined; session.model.inFlight.tools = [];
             session.model.control("idle", "idle", reason, true);
@@ -274,6 +359,7 @@ export class Sessions {
   private rebind(session: HostedSession, handle: DriverHandle, state: any, data: any, reason: string): HostedSession {
     assert(session.handle === handle, "staleDriver", "会话写者已更换，忽略旧写者的重绑定", 409);
     const old = session.model; const changed = state.sessionId !== session.id || fileKey(state.sessionFile) !== fileKey(session.file);
+    if (changed || reason === "reload") this.closeUi(session);
     if (changed) {
       old.emit({ type: "pane_session_replaced", newRef: { source: "pane", id: state.sessionId }, reason: reason === "startup" ? "new" : reason });
       old.readonly = true; old.readonlyReason = "archived"; old.control("idle", "idle", undefined, true);
@@ -282,10 +368,11 @@ export class Sessions {
         assert(target.id === state.sessionId && !target.handle && !target.control.busy, "sessionIdentityConflict", "目标会话身份冲突、已被托管或正在处理控制操作", 409);
         // 保留目标对象及模型；控制队列随写者迁移，切换后仍挂起的 RPC 必须能被目标会话停止。
         target.control = session.control; session.control = new ControlQueue();
-        target.owner = session.owner; target.handle = handle; session.owner = undefined; session.handle = undefined; session.ui.clear(); session.dirty = false;
+        target.owner = session.owner; target.handle = handle; session.owner = undefined; session.handle = undefined; session.dirty = false;
+        session.queued = emptyMirror(); session.drafts.clear();
         session = target;
       } else {
-        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, syncing: undefined, dirty: false, drafts: new Map(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
+        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, syncing: undefined, dirty: false, drafts: new Map(), queued: emptyMirror(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
         this.records.set(session.id, previous); this.files.set(fileKey(session.file), previous);
         session.id = state.sessionId; session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
         this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
@@ -293,16 +380,57 @@ export class Sessions {
     }
     session.state = state; session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
     session.model.reset(data.entries as Entry[], data.leafId); session.model.control("idle", "idle", undefined, true); session.recentExternal = false;
+    session.queued = emptyMirror(); session.drafts.clear();
     return session;
   }
   private receive(session: HostedSession, event: any): void {
     session.lastActive = Date.now();
     if (event.type === "extension_ui_request") {
-      if (["select", "confirm", "input", "editor"].includes(event.method)) session.ui.set(event.id, event);
-      this.emitUi(session.id, event); return;
+      const request = toPaneUiRequest(event, Date.now()); if (!request) return;
+      if (isUiDialog(request)) {
+        this.resolveUi(session, request.id, "closed"); session.ui.set(request.id, { request });
+        this.emitUi(session.id, request); this.scheduleUi(session, request);
+      } else this.emitUi(session.id, request);
+      return;
+    }
+    if (event.type === "queue_update") {
+      const previous = session.queued;
+      session.queued = { steering: reconcile(previous.steering, event.steering ?? []), followUp: reconcile(previous.followUp, event.followUp ?? []) };
+      // 已消费或已清出的队列项释放编码草稿记录（停止时使用发送前的镜像快照，不依赖这份记录）。
+      const live = new Set([...session.queued.steering, ...session.queued.followUp].map((item) => item.claim));
+      for (const item of [...removed(previous.steering, session.queued.steering), ...removed(previous.followUp, session.queued.followUp)])
+        if (item.claim?.key && !live.has(item.claim)) session.drafts.delete(item.claim.key);
     }
     session.model.apply(event);
+    if (["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type)) void this.refreshState(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     if (["message_end", "entry_appended", "compaction_end", "session_info_changed", "agent_settled"].includes(event.type)) void this.sync(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
+  }
+  private commitState(session: HostedSession, state: any): void {
+    const previous = session.state;
+    const changed = previous?.sessionName !== state.sessionName || previous?.thinkingLevel !== state.thinkingLevel || JSON.stringify(previous?.model) !== JSON.stringify(state.model);
+    session.state = state;
+    if (changed) session.model.control(session.model.status, session.model.inFlight.phase, undefined, true);
+  }
+  private refreshState(session: HostedSession): Promise<void> {
+    const handle = session.handle; const model = session.model; const epoch = model.epoch;
+    if (!handle?.acceptingInput || session.closed) return Promise.resolve();
+    const pending = this.stateRefreshes.get(session);
+    if (pending?.handle === handle && pending.model === model && pending.epoch === epoch) {
+      pending.dirty = true; return pending.promise;
+    }
+    const current = () => session.handle === handle && handle.acceptingInput && session.model === model && model.epoch === epoch && !session.closed;
+    const job = { handle, model, epoch, dirty: true, promise: Promise.resolve() };
+    // 同一轮事件合并查询；查询期间的变化只追加一次刷新，不阻塞事件接收。
+    job.promise = Promise.resolve().then(async () => {
+      while (job.dirty && current()) {
+        job.dirty = false;
+        const response = await handle.send({ type: "get_state" });
+        assert(response.success, "rpcRejected", response.error ?? "pi 拒绝查询", 409);
+        if (current()) this.commitState(session, response.data);
+      }
+    }).finally(() => { if (this.stateRefreshes.get(session) === job) this.stateRefreshes.delete(session); });
+    this.stateRefreshes.set(session, job);
+    return job.promise;
   }
   private sync(session: HostedSession): Promise<void> {
     session.dirty = true;
@@ -321,24 +449,43 @@ export class Sessions {
     if (!session.handle) return { status: "nothingToStop" };
     const handle = session.handle;
     session.model.control("running", "stopping", undefined, true);
-    let cleared: any = { steering: [], followUp: [] }; let report: StopReport | undefined;
+    let cleared: any = { steering: [], followUp: [] };
+    // clear_queue 会先发出空的 queue_update；发送前取镜像快照，用于把清出的文字对应到原草稿。
+    const mirror = { steering: [...session.queued.steering], followUp: [...session.queued.followUp] };
+    // 编码草稿记录会在队列项清出时释放，回退查找使用停止开始时的副本。
+    const encodedDrafts = new Map(session.drafts);
     try {
       const response = await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 }); cleared = response.data;
-      if (close) report = await handle.stop();
+      if (close) await handle.stop();
       else {
         try {
           await handle.send({ type: "abort" }, { timeoutMs: this.options.stopOptions?.abortTimeoutMs ?? 10000 });
           // abort 的响应不能证明挂起的扩展命令已结束；抢占时关闭进程才能结束全部底层等待项。
-          if (preempted) report = await handle.stop();
+          if (preempted) await handle.stop();
           else if (session.handle === handle && handle.acceptingInput) { session.model.control("idle", "idle"); await this.sync(session); }
         }
-        catch { report = await handle.stop(); }
+        catch { await handle.stop(); }
       }
-    } catch { report = await handle.stop(); }
+    } catch { await handle.stop(); }
     const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
-    const drafts = texts.map((text) => session.drafts.get(text) ?? [{ type: "text", text }]);
-    if (!session.handle || session.handle === handle) for (const text of texts) session.drafts.delete(text);
-    return { status: "done", clearedText: texts, clearedDrafts: drafts, ...(report ? { stopReport: report } : {}) };
+    // 优先按队列镜像取回原草稿（含图片节点），steering 在前、followUp 在后，与 clear_queue 的顺序一致。
+    // 镜像无法确认时依次按完整编码文字、图片标记 nonce 查找，都找不到时只放回文字。
+    const steering = restore(mirror.steering, cleared?.steering ?? []); const followUp = restore(mirror.followUp, cleared?.followUp ?? []);
+    const items = [...steering.certain, ...followUp.certain];
+    const uncertain = [...new Set([...steering.uncertain, ...followUp.uncertain])];
+    if (!session.handle || session.handle === handle) session.queued = emptyMirror();
+    const queuedDrafts = items.map((item) => item?.draft);
+    // 归属不明的草稿只交给用户确认，其候选位置不再按文字回退查找。
+    const grouped = new Set(uncertain.flatMap((claim) => claim.key ? [claim.key] : []));
+    const keys = texts.map((text, i) => {
+      if (queuedDrafts[i]) return items[i]?.key;
+      if (encodedDrafts.has(text) && !grouped.has(text)) return text;
+      const nonce = /⟦pane-img:([a-z0-9]{6,8}):\d+⟧/.exec(text)?.[1];
+      return nonce ? [...encodedDrafts.keys()].find((key) => !grouped.has(key) && key.includes(`⟦pane-img:${nonce}:`)) : undefined;
+    });
+    const drafts = texts.map((text, i) => queuedDrafts[i] ?? ((keys[i] && encodedDrafts.get(keys[i]!)) || [{ type: "text", text }]));
+    if (!session.handle || session.handle === handle) for (const key of [...keys, ...grouped]) if (key) session.drafts.delete(key);
+    return { status: "done", clearedText: texts, clearedDrafts: drafts, ...(uncertain.length ? { uncertainDrafts: uncertain.map((claim) => claim.draft) } : {}) };
   }
   private reclaim(): Promise<void> { return this.inflight.run("sessions.reclaim", () => this.performReclaim()); }
   private async performReclaim(): Promise<void> {
@@ -355,7 +502,7 @@ export class Sessions {
     for (const [controller] of starts) controller.abort(new PaneError("interrupted", "会话已关闭", 409));
     const handles = new Set(this.handles.keys());
     for (const session of this.records.values()) {
-      session.closed = true; unwatchFile(session.file);
+      session.closed = true; this.closeUi(session); unwatchFile(session.file);
       if (session.handle) handles.add(session.handle);
     }
     // 停止本身也可能挂起；并行发出停止，任何 await 都必须落在限时屏障内。
