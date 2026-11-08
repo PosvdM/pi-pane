@@ -220,12 +220,38 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 ### 关闭与回收
 
 - 用户在界面上关闭会话：按“停止”的顺序先 `clear_queue` 再 `abort`（清出的文本存入该会话的浏览器草稿），等运行结束后关闭 stdin，宽限 5 秒后按 hostkit 的流程终止进程树，释放写锁。会话文件不受影响。
-- 空闲回收：会话已 settled、没有待回应的扩展 UI 对话框、没有浏览器连接、没有插件 hold，持续 30 分钟后按上一条停止子进程（`mainIdleReclaimMs`，默认 1800000）。再次打开时只读显示，发送时重新拉起。
+- 空闲回收：会话已 settled、没有待回应的扩展 UI 对话框、没有浏览器连接、没有插件 hold，持续 30 分钟后按上一条停止子进程（`idleReclaimMs`，默认 1800000）。再次打开时只读显示，发送时重新拉起。
 - 插件 hold：被 hold 的会话不做空闲回收，树节点和会话视图底部显示原因（如“等待子代理”）；用户主动关闭时先列出原因请用户确认。接口见 [plugin-api.md](plugin-api.md#保活)。
 - pi-pane 退出时先设置关闭门禁，再按同样顺序关闭所有托管会话。关闭期间拒绝打开会话，未完成的打开请求也在登记前复查；就绪回调不能把写者迁入关闭遍历已经经过的记录。首次发送和 restart 在信任询问及目录读取之前登记在途启动，关闭取消并等待其清理。driver 在取锁及恢复结束后检查取消，取消时释放锁且不 spawn；spawn 已开始时，创建 handle 后立即交给会话管理器，停止无需等待首次持久化或就绪。
-- 服务关闭在进程停止后另外排空在途目标取锁及初始化，包括退出回调已经摘下 handle 的写者；目标锁在停止确认后释放。`exited` 只表示退出回调已执行，独立 handle 登记须等缓存的停止结果和排空均成功后才能删除；停止失败即使先于关闭、重绑定或成功重启，也保留到关闭汇总。单个 handle 的 stop 不等待整个初始化，避免与目标锁清理形成循环等待。全部启动和写者排空后才关闭 HTTP、释放实例锁；清理未确认时关闭返回失败并保留实例锁。并发关闭调用等待同一结果。pi-pane 被强杀时子进程的清理由 hostkit 负责。
+- 服务关闭在进程停止后另外排空在途目标取锁及初始化，包括退出回调已经摘下 handle 的写者；目标锁在停止确认后释放。实例共用的关闭屏障还覆盖 open/probe、在途 RPC 和 bridge 身份核查，所有清理事实的生产者结束后才汇总错误。`exited` 只表示退出回调已执行，独立 handle 登记须等缓存的停止结果和排空均成功后才能删除；停止失败即使先于关闭、重绑定或成功重启，也保留到关闭汇总。单个 handle 的 stop 不等待整个初始化，避免与目标锁清理形成循环等待。全部启动和写者排空后才关闭 HTTP、释放实例锁；清理未确认时关闭返回失败并保留实例锁。并发关闭调用等待同一结果。pi-pane 被强杀时子进程的清理由 hostkit 负责。
 
 - 本实例取得写锁后的恢复失败、启动清理释放失败及启动时运行记录恢复失败，由实例级清理错误集合保存，关闭时汇总并保留实例锁；记录隔离诊断失败也不能覆盖该错误。启动前已有的 `recovery/` 隔离标记仅列入 `Sessions.recoveryDiagnostics`，CLI 输出其文件名，正常关闭不因此失败；标记仍阻止对应会话自动托管，须按会话写锁节的维护流程处理。
+
+### 统一关闭屏障
+
+同一实例的 Sessions、driver、BridgeBroker 和 PaneServer 共用 `BridgeBroker.inflight`。`Inflight.run(kind, operation)` 在执行 operation 前同步检查关闭门禁并登记，无论成功、同步抛错或异步拒绝都移除登记。控制操作登记的是底层控制队列的完整 Promise；HTTP 等待返回 pending 不结束登记。
+
+写者在取锁前取得资源 owner，其登记延续至停止和排空完成。owner 的内部操作仍通过同一登记器执行，允许关闭后完成已经受理的启动、迟到取锁、持久化和终止清理；对外的 send、bridge 事件及 UI 回应仍检查全局门禁。owner 在失败时也结束登记，同时把排空失败保存到实例清理错误集合，避免把仍持有的隔离锁当成永不结束的异步工作。目标和初始化有独立登记；初始化在调度 setImmediate 时即登记，不能把尚未进入回调误判为没有工作。
+
+关闭先封闭门禁、取消启动并停止写者，再调用统一 drain。drain 反复等待登记集合，直到 owner 和所有子操作结束，不能仅依赖 starts、handles、targets 的一次快照。全部生产者结束后才汇总本实例清理错误。实例锁释放属于最后的终止阶段，finalize 要求门禁已封闭且登记集合为空；释放自身的拒绝由 PaneServer 缓存为同一关闭失败，不重试成成功。
+
+| 异步入口或资源边界 | 进入关闭屏障的方式 |
+| --- | --- |
+| `Sessions.recover`：运行记录读取、stopByIdentity、verifyStopped、记录删除 | `sessions.recover` 从入口覆盖完整恢复，清理错误在其结束前登记。 |
+| `Sessions.open`：目录和文件读取、fork、probeSessionWriterLock、登记前 stat | `sessions.open` 在首个异步步骤前登记，覆盖 probe 的真实原生取锁及 finally 释放；关闭后的新请求不进入 operation。 |
+| `Sessions.command`、首次发送与 restart 的 `start`、空闲 `reclaim` | 分别登记 `sessions.command`、`sessions.start`、`sessions.reclaim`；启动登记含信任与目录准备，控制登记包含排队和真实 RPC 完成。starts 仅另管取消和启动拒绝。 |
+| `Sessions.query`、事件触发的 sync、会话 stop；UI 回应 | 通过 driver 的 send、stop 及同步 runSync 门禁；这些上层入口不另外取得锁或执行独立清理。 |
+| `RpcSubprocessDriver.start`：身份读取、写锁取得及恢复、spawn、创建 handle 前 release | 先取得 `driver.writer` owner，再登记 start；未创建 handle 的拒绝在清理结束后结束 owner，创建后的 owner 交给 handle 的停止及排空。 |
+| `RpcHandle.target`：目标写锁取得、恢复、running update、迟到 release | owner 的 target 子操作登记覆盖完整调用链，迟到释放也在其内部；保留 targets 以供 handle 自身 drain。 |
+| `RpcHandle.persist`、bridgeReady 初始化及重绑定的旧锁 release | owner 的 persist、initialize 子操作分别覆盖持久化与完整初始化，initialize 在 setImmediate 执行前登记。 |
+| `RpcHandle.send`：RPC、已确认响应后的状态读取及 switched-away release | 对外入口 `driver.send` 与内部 hostkit 子操作同时登记；停止和 exited 不能结束尚未完成的 send。 |
+| `RpcHandle.stop`：stopping update、clear_queue、proc.stop、身份核查、release、运行记录清理 | owner 的 stop 子操作覆盖完整停止；内部 hostkit 调用仍单独登记，关闭门禁不妨碍终止清理。 |
+| `RpcHandle.drain`、exited、RPC onError、进程退出及超时回调 | drain 只等待已登记的 stop、target 和 initialize，并保留失败；owner 在 exited 后继续等待 drain。错误、退出和超时回调同步保存清理事实或进入已登记的 stop，停止结束时取消订阅及计时器。 |
+| `BridgeBroker.event`、`RpcHandle.bridgeEvent` | 分别登记 `bridge.event`、`driver.bridgeEvent`，前者从进程身份核查之前覆盖到 handler 返回；外层核查迟于 handle 退出也必须排空。 |
+| `PaneServer.start` 的 acquireInstanceLock | `server.acquireInstanceLock` 登记并观察清理事实；ensurePrivateDir、locatePi 发生在实例资源取得之前，失败直接拒绝启动。 |
+| `PaneServer.close` 的实例锁 release | 所有生产者排空且清理汇总通过后，进入受检查的 `server.releaseInstanceLock` 终止阶段；结果由 closePromise 缓存。 |
+
+`respondUi` 是同步调用，使用 runSync 同步检查门禁并登记到返回或抛错。路径查询、被动订阅、stderr 读取和只读文件监视不启动进程或执行锁清理；它们没有独立的异步清理生产者。清理事实的判定规则及回归映射见 [development.md](development.md)。
 
 ### 会话驱动接口
 
