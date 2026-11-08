@@ -17,6 +17,7 @@ import { PiStore } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
 import { CLOSE_IO_TIMEOUT_MS } from "./inflight.js";
+import { isForbiddenPort, listenAvoidingForbidden } from "./ports.js";
 
 export interface PaneServerOptions extends Partial<Omit<SessionManagerOptions, "pi" | "bridgeUrl" | "instanceId" | "extensionPath">> {
   home: string; piPath?: string; port?: number; agentDir?: string; extensionPath?: string; webRoot?: string;
@@ -88,6 +89,9 @@ export class PaneServer {
     this.auth.onRevoke((credential) => { for (const client of this.clients) if (client.credential === credential) this.closeClient(client, 4403, "凭证已失效"); });
   }
   static async start(options: PaneServerOptions): Promise<PaneServer> {
+    const port = options.port === undefined ? 4319 : options.port;
+    assert(Number.isInteger(port) && port >= 0 && port <= 65535, "invalidPort", "端口必须为 1–65535 的整数，或使用 0 自动分配");
+    assert(port === 0 || !isForbiddenPort(port), "forbiddenPort", `浏览器会拒绝访问端口 ${port}，请更换端口`);
     await ensurePrivateDir(options.home);
     const pi = await locatePi(options.piPath ? { piPath: options.piPath } : {}); assert(pi.supported, "piVersion", `不支持的 pi 版本：${pi.version}`);
     const home = options.env?.HOME ?? process.env.HOME ?? process.env.USERPROFILE ?? "";
@@ -96,8 +100,7 @@ export class PaneServer {
     try {
       const lock = await server.sessions.inflight.run("server.acquireInstanceLock", () => observeHostkit(() => acquireInstanceLock("pi-pane", options.home), (error) => server.sessions.recordCleanupFailure(error))); assert(lock, "instanceBusy", "同一数据目录已有 pi-pane 服务端", 409); server.lock = lock;
       await server.sessions.recover();
-      await new Promise<void>((resolve, reject) => { server.http.once("error", reject); server.http.listen(options.port ?? 4319, "127.0.0.1", () => { server.http.off("error", reject); resolve(); }); });
-      server.port = (server.http.address() as { port: number }).port;
+      server.port = await listenAvoidingForbidden(server.http, "127.0.0.1", port);
       // 驱动延迟到第一次发送才启动，监听端口确定后设置回连地址。
       server.sessions.setBridgeUrl(server.origin);
       server.sweep = setInterval(() => { server.auth.sweep(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
