@@ -244,11 +244,15 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
 | `GET /api/assets/:hash`、`GET /api/assets/:hash/thumb`、`GET /api/blobs/:hash`、`GET /api/blobs/:hash/thumb` | 返回 503 `serverStopping`，不读取附件或重建缓存。 |
 | `POST /bridge/launch`、`POST /bridge/event` | 返回 503 `serverStopping`，不兑换 bridge ticket 或受理新桥接事件；已登记事件按关闭屏障收尾。 |
 | 静态文件、未知路径及其他方法 | 返回 503 `serverStopping`。 |
-| WebSocket upgrade（包括 `/ws`） | 返回 HTTP 503 并关闭 socket，不建立新连接。 |
-| 已进入 upgrade 的 socket、握手完成后迟到的 connection 回调 | 关闭入口销毁在途 socket，并终结 `wss.clients` 中的连接；迟到回调直接终结连接，不登记客户端。 |
+| 关闭期间的新 WebSocket upgrade（包括错误来源或路径） | 返回 HTTP 503；发送完成后销毁 socket，发送错误或超过 1000 毫秒仍未完成时也销毁，不建立新连接。 |
+| 关闭前因非法 Host/Origin 或非 `/ws` 路径被拒绝的 upgrade | 返回 HTTP 403，使用同一发送后销毁及 1000 毫秒兜底；原始 socket 在任何拒绝前登记，未完成收尾的连接受关闭入口和网络收尾的两次终结覆盖。 |
+| `/ws` 握手参数无效等由 `ws` 拒绝的 upgrade | 交给 `ws` 发送相应拒绝响应并销毁；在原始 socket 关闭前仍受登记和两次终结覆盖。 |
+| 已进入 upgrade 的 socket、握手完成后迟到的 connection 回调 | 关闭入口销毁全部登记的原始 socket，并终结 `wss.clients` 中的连接；迟到回调直接终结连接，不登记客户端。 |
 | WebSocket 首帧 ticket 鉴权、subscribe、unsubscribe、ping 及其他消息 | 关闭入口终结全部现存连接；迟到消息直接终结连接，不兑换 ticket 或修改订阅。 |
 
-关闭前开始读取 JSON 或 multipart 请求体的请求，在读取完成后、执行副作用之前复查门禁；上传还在异步模块加载后复查。已进入会话/driver/bridge 屏障的工作遵循其既定取消与排空规则。网络收尾开始前再次销毁在途 upgrade 并终结全部现存 WebSocket，覆盖停止等待期间的迟到交付；不能仅依赖关闭入口时的客户端快照。成功关闭要求 HTTP/WebSocket 收尾完成且实例锁释放得到确认，客户端无须主动回应 WebSocket 关闭握手。
+upgrade 入口在检查关闭状态、来源或路径之前，先补挂会销毁 socket 的 `error` 监听并登记原始 socket。登记在 socket 关闭或成功交给 WebSocket 连接处理器时移除；成功交接时由 WebSocket 接管错误处理。拒绝响应的销毁兜底定时器不保持进程存活，并在 socket 关闭时清除。半开客户端收到 FIN 后即使继续保持写侧打开，也不能阻止服务端的网络收尾。
+
+关闭前开始读取 JSON 或 multipart 请求体的请求，在读取完成后、执行副作用之前复查门禁；上传还在异步模块加载后复查。已进入会话/driver/bridge 屏障的工作遵循其既定取消与排空规则。网络收尾开始前再次销毁全部登记的 upgrade socket（包括已拒绝而尚未关闭的连接）并终结全部现存 WebSocket，覆盖停止等待期间的迟到交付；不能仅依赖关闭入口时的客户端快照。成功关闭要求 HTTP/WebSocket 收尾完成且实例锁释放得到确认，客户端无须主动回应 WebSocket 关闭握手。
 
 ### 统一关闭屏障
 
