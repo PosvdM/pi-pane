@@ -1,4 +1,4 @@
-# 开发与 M1 验收
+# 开发与验收
 
 ## 环境与构建
 
@@ -8,10 +8,14 @@
 
 | 命令 | 用途 |
 | --- | --- |
-| `npm run build` | 按 TypeScript project references 构建三个包 |
+| `npm run build` | 按 TypeScript project references 构建服务端相关包，再构建 Web 界面并检查 gzip 体积 |
+| `npm run build --workspace @pi-pane/web` | 检查前端 TypeScript，使用 Vite 构建 `packages/web/dist`，并检查 gzip 体积 |
+| `node packages/web/scripts/check-bundle.mjs` | 对已有前端产物执行 gzip 体积检查；需先构建 |
 | `npm test` | 先构建，再用 node --test 顺序运行测试文件 |
 | `node --test test/<文件>.test.mjs` | 运行单个测试文件；修改源码后先构建 |
-| `npm start` | 启动只有 API 的 M1 服务端 |
+| `npm start` | 启动 API 服务端 |
+
+前端使用 Vite 和 Preact。体积检查累计 `packages/web/dist` 中全部 HTML、JavaScript 和 CSS 文件以 gzip level 9 压缩后的字节数，总和不得超过 300 KiB。`npm test` 的 `pretest` 包含完整构建及体积检查；直接运行 `node --test` 不执行构建。
 
 `PI_PACKAGE` 可在测试时指定 pi 包目录。未设置时用 hostkit 的定位规则，先查官方安装目录，再查全局 npm。测试使用真实 pi 1.5.0 和本地假 provider，不访问模型服务。测试的 HOME、USERPROFILE、agent 目录、锁目录和会话文件位于临时现场；Chrome 使用独立的临时配置目录。设置 `KEEP_FIXTURES=1` 可保留现场。
 
@@ -35,8 +39,31 @@
 | `packages/server/src/bridge.ts` | 独立的 Agent 级回连凭证和实例 fencing |
 | `packages/server/src/trust.ts` | 启动前及进程内切换时的信任预判与询问 |
 | `packages/bridge-extension/src/` | 会话替换和写锁回报、信任决定、就绪握手、图片顺序还原 |
+| `packages/web/` | Vite 与 Preact 浏览器界面、会话事件投影、草稿和 IndexedDB 设备密钥管理 |
 
-不建立 `packages/web`。多题表单通道保留事件名称和 BridgeFormOutcome 类型，未启用时返回协议已有的 aborted；完整适配在 M2 联调。设备签名和插件运行时不在 M1。
+设备密钥由浏览器生成，私钥不可导出。签名格式见 [plugin-api.md 的“签名格式”](plugin-api.md#签名格式)。`userPresence` 确认流程和插件运行时未接入。
+
+## 浏览器测试
+
+`test/fixtures/browser.mjs` 提供以下共用入口：
+
+- `requireChrome(t)` 使用 `CHROME_PATH`、`CHROME_BIN` 和三平台常见安装路径定位 Chrome。本机未安装时跳过测试；设置 `PANE_TEST_REQUIRE_CHROME=1` 时缺少 Chrome 会导致失败。
+- `startWebServer(fixture, extra)` 使用 `packages/web/dist` 作为静态资源根目录。缺少产物时提示先运行 `npm run build`。
+- `launch()` 使用 playwright-core 启动 headless Chrome；`openPaired()` 建立独立 context，通过配对码登录，并等待侧栏出现。默认视口为 1280×800。
+- `assertNoPageErrors(page, whitelist)` 检查控制台 error、未处理页面异常和 CSP 违规；白名单接受正则或正则数组。
+- `screenshot(page, name)` 仅在 `PANE_SCREENSHOTS` 设置为目录时保存整页截图，文件名为 `<name>.png`。目录不存在时自动创建。
+
+`test/web-logic.test.mjs` 在 Node.js 24 中直接导入前端 `.ts` 模块，验证会话投影、草稿和 RFC 8785 向量。`test/web-device-key.test.mjs` 在真实 Chrome 中验证不可导出私钥的 IndexedDB 往返、JCS 规范数据的签名与 Node.js 验签，以及 CSP 下设置页的设备 ID。
+
+`test/fixtures/ui-extension.ts` 提供 `/pane-dialogs`、`/pane-dialog-timeout` 和 `/pane-widgets`，分别触发顺序对话框、1500 毫秒超时选择框和扩展组件请求。调用方从 `helpers.mjs` 导入 `providerPath` 与 `uiExtensionPath`，以 `startServer(fixture, { extraExtensions: [providerPath, uiExtensionPath] })` 加载；`piFixture()` 不默认加载此扩展。对话框测试须在启动服务前将 `fixture.env.PANE_UI_LOG` 设置为临时现场中的日志路径。扩展将每个结果以 `{method,result}` JSONL 追加到该文件，取消或超时的 `undefined` 结果记录为 `null`。
+
+构建后可执行：
+
+```sh
+node --test --test-concurrency=1 test/web-logic.test.mjs test/ui-extension.test.mjs test/web-device-key.test.mjs test/reconnect.test.mjs
+```
+
+设置 `PANE_SCREENSHOTS` 可保留浏览器测试截图；`PANE_UI_LOG` 用于核对真实 pi 扩展收到的对话框响应，两者均不改变生产配置。
 
 ## M1 HTTP 接口
 
@@ -124,7 +151,7 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 
 测试的 RPC 输入审计通过观察已有 data 事件记录命令，不添加 stdin 的 data listener，也不调用 resume/read，避免在 pi RPC reader 注册前开启 flowing 并吞掉初始化输入。fixture-audit 验证 reader 注册前缓冲保留、JSONL/UTF-8 分块及字节原样转交；bridge-broker 验证最新实例 fencing 和就绪幂等；hostkit-cleanup 验证嵌套报告、无报告清理错误、多错误聚合、循环上下文、普通拒绝及观察器的原样传播。stop-switch-races 的只读读取 gate 阻塞同源文件的全部 watch 读取，避免后续读取先完成并推进 epoch；只读文件变化导致模型重建时，旧 epoch 的控制请求返回 409 epochChanged 属于正常隔离行为。其初始化拒绝会关闭已经启动的真实写者、HTTP 和实例锁；迟到启动 gate 同时交付就绪成功与失败，避免初始化异常遗留监听服务或让测试永远等待 entered。
 
-测试文件路径均为 `test/<名称>.test.mjs`。三平台都运行服务端测试，不用模拟进程替代真实 pi。Chrome 路径由本机安装或 CHROME_PATH/CHROME_BIN 定位；本机不存在时明确跳过。CI 的 Linux auto 任务设置 PANE_TEST_REQUIRE_CHROME=1，找不到 Chrome 必须失败。
+测试文件路径均为 `test/<名称>.test.mjs`。三平台都运行服务端测试，不用模拟进程替代真实 pi。Chrome 路径由本机安装或 CHROME_PATH/CHROME_BIN 定位；本机不存在时明确跳过。CI 的全部矩阵项设置 `PANE_TEST_REQUIRE_CHROME=1`，三平台均须实际运行 Chrome，找不到 Chrome 必须失败。
 
 ## 图片上限观测
 
@@ -153,4 +180,4 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 hostkit #5 尚未关闭：Windows Job 已清空后，独立进程表可能短暂仍见到已退出的后代。测试最多等待两秒确认可见性，不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
 
-M1 没有前端，未验证真实输入框、BroadcastChannel、浏览器设备密钥和持久表单；这些属于 M2/M3。HTML 导出的图片排列仍由 pi 决定。插件接口类型完整导出不表示插件宿主已实现。
+浏览器设备密钥的实测范围包括 WebCrypto、IndexedDB、Node.js 验签和设置页设备 ID；该测试不验证真实输入框、BroadcastChannel 或持久表单。HTML 导出的图片排列由 pi 决定。插件接口类型完整导出不表示插件宿主已实现。
