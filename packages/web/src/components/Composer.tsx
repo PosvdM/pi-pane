@@ -29,6 +29,8 @@ export const BUILTIN: { name: string; description: string }[] = [
   { name: "session", description: "会话信息与用量" },
   { name: "quit", description: "关闭会话" },
 ];
+/** architecture.md“斜杠命令”表中只能在终端使用的 pi 内置命令。 */
+const TERMINAL_ONLY = new Set(["settings", "tree", "reload", "login", "logout", "hotkeys", "changelog", "share", "copy", "scoped-models", "debug", "exit"]);
 const THINKING: PaneThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 function escapeHtml(text: string): string {
@@ -81,48 +83,55 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   const running = phase !== "idle" || view.status === "running";
   const blocked = view.readonlyReason === "externalWriter" ? "该会话正由其他程序托管，只能查看" : model.replaced ? "此会话的进程已切换到其他会话" : current.get()?.warning === "recentModification" ? "该会话可能正在别处运行，只能查看" : null;
 
-  const save = () => {
+  // 待写入 localStorage 的草稿：编辑时立即捕获内容，延迟写入；切换会话或卸载时同步写入。
+  const pendingSave = useRef<{ sessionId: string; nodes: DraftNode[] } | null>(null);
+  const flush = () => {
     clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      const nodes = editor.current ? readNodes(editor.current) : [];
-      if (isEmpty(nodes)) localStorage.removeItem(draftKey(sessionId)); else localStorage.setItem(draftKey(sessionId), JSON.stringify(nodes));
-    }, 300);
+    const pending = pendingSave.current; pendingSave.current = null;
+    if (!pending) return;
+    if (isEmpty(pending.nodes)) localStorage.removeItem(draftKey(pending.sessionId)); else localStorage.setItem(draftKey(pending.sessionId), JSON.stringify(pending.nodes));
   };
   const refresh = () => {
-    const nodes = editor.current ? readNodes(editor.current) : [];
+    if (!editor.current) return;
+    const nodes = readNodes(editor.current);
     setEmpty(isEmpty(nodes));
     const slash = !nodes.some((n) => n.type === "image") ? /^\/(\S*)$/.exec(plainText(nodes)) : null;
     setCompletion(slash ? { query: slash[1], index: 0 } : null);
-    save();
+    pendingSave.current = { sessionId, nodes };
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(flush, 300);
   };
-  const setNodes = async (nodes: DraftNode[]) => {
-    if (!editor.current) return;
-    const ids = imageIds(nodes); let missing = new Set<string>();
-    if (ids.length) {
-      try { missing = new Set((await api<{ missing: string[] }>("/api/assets/touch", { requestId: newId(), assetIds: ids })).missing); }
-      catch { /* 无法核对时按存在处理，发送时由服务端校验。 */ }
-    }
-    editor.current.innerHTML = nodesHtml(nodes, missing);
+  /** 同步替换输入框内容；之后异步核对图片是否仍在服务端，只给已过期的图片节点加标记，不覆盖期间的编辑。 */
+  const setNodes = (nodes: DraftNode[]) => {
+    const el = editor.current; if (!el) return;
+    el.innerHTML = nodesHtml(nodes);
     refresh();
+    const ids = imageIds(nodes);
+    if (!ids.length) return;
+    void api<{ missing: string[] }>("/api/assets/touch", { requestId: newId(), assetIds: ids }).then(({ missing }) => {
+      if (!el.isConnected) return;
+      for (const chip of el.querySelectorAll<HTMLElement>(".chip")) if (missing.includes(chip.dataset.assetId ?? "")) chip.classList.add("expired");
+    }, () => { /* 无法核对时按存在处理，发送时由服务端校验。 */ });
   };
 
-  // 切换会话时恢复该会话保存在 localStorage 的草稿。
+  // 切换会话时恢复该会话保存在 localStorage 的草稿；离开时先写入尚未保存的编辑。
   useEffect(() => {
     let nodes: DraftNode[] = [];
     try { nodes = JSON.parse(localStorage.getItem(draftKey(sessionId)) ?? "[]"); } catch { /* 草稿损坏时丢弃。 */ }
-    void setNodes(Array.isArray(nodes) ? nodes : []);
+    setNodes(Array.isArray(nodes) ? nodes : []);
+    return flush;
   }, [sessionId]);
   // 停止或关闭时清出的排队消息放回输入框，放在现有草稿之前。
   useEffect(() => {
     if (!restored || restored.sessionId !== sessionId || !editor.current) return;
     restoredDrafts.set(null);
-    void setNodes(prependDrafts(restored.drafts, readNodes(editor.current)));
+    setNodes(prependDrafts(restored.drafts, readNodes(editor.current)));
     toast("排队中的消息已放回输入框");
   }, [restored, sessionId]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;
     editorText.set(null);
-    void setNodes([{ type: "text", text: external.text }]);
+    setNodes([{ type: "text", text: external.text }]);
   }, [external, sessionId]);
 
   const items = useMemo(() => {
@@ -227,7 +236,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     el.focus();
     const r = document.createRange(); r.selectNodeContents(el); const sel = getSelection()!; sel.removeAllRanges(); sel.addRange(r);
     document.execCommand("insertText", false, `/${name} `);
-    setCompletion(null); save();
+    refresh(); setCompletion(null);
   }
 
   async function runCommand(command: PaneControlCommand, okText?: string): Promise<ControlOutcome> {
@@ -238,38 +247,44 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     return outcome;
   }
 
-  /** 处理斜杠命令；返回 true 表示已处理，不再作为消息发送。 */
-  async function slash(name: string, args: string): Promise<boolean> {
+  /**
+   * 处理斜杠命令。返回 ok：已执行，清空输入；failed：执行失败，保留输入；
+   * prompt：扩展命令、技能或提示模板，原样用 prompt 发送（运行中也用 prompt，扩展命令立即执行）。
+   */
+  async function slash(name: string, args: string): Promise<"ok" | "failed" | "prompt"> {
+    const ran = async (command: PaneControlCommand, okText?: string) => (await runCommand(command, okText)).ok ? "ok" as const : "failed" as const;
     switch (name) {
-      case "compact": await runCommand({ type: "compact", ...(args ? { customInstructions: args } : {}) }, "已压缩"); return true;
+      case "compact": return ran({ type: "compact", ...(args ? { customInstructions: args } : {}) }, "已压缩");
       case "model": {
-        if (!args) { overlay.set("models"); return true; }
+        if (!args) { overlay.set("models"); return "ok"; }
         const at = args.indexOf("/");
-        if (at <= 0) { toast("格式：/model provider/model", "warning"); return true; }
-        await runCommand({ type: "set_model", provider: args.slice(0, at), modelId: args.slice(at + 1) }, "已切换模型"); return true;
+        if (at <= 0) { toast("格式：/model provider/model", "warning"); return "failed"; }
+        return ran({ type: "set_model", provider: args.slice(0, at), modelId: args.slice(at + 1) }, "已切换模型");
       }
       case "thinking":
-        if (!args) { overlay.set("thinking"); return true; }
-        if (!THINKING.includes(args as PaneThinkingLevel)) { toast(`思考级别只能是 ${THINKING.join("、")}`, "warning"); return true; }
-        await runCommand({ type: "set_thinking_level", level: args as PaneThinkingLevel }, "已设置思考级别"); return true;
-      case "new": await runCommand({ type: "new_session" }); return true;
+        if (!args) { overlay.set("thinking"); return "ok"; }
+        if (!THINKING.includes(args as PaneThinkingLevel)) { toast(`思考级别只能是 ${THINKING.join("、")}`, "warning"); return "failed"; }
+        return ran({ type: "set_thinking_level", level: args as PaneThinkingLevel }, "已设置思考级别");
+      case "new": return ran({ type: "new_session" });
       case "name":
-        if (!args) { toast(`当前名称：${view.state?.sessionName ?? "（未设置）"}`); return true; }
-        await runCommand({ type: "set_session_name", name: args }, "已设置会话名称"); return true;
+        if (!args) { toast(`当前名称：${view.state?.sessionName ?? "（未设置）"}`); return "ok"; }
+        return ran({ type: "set_session_name", name: args }, "已设置会话名称");
       case "export": {
         const outcome = await runCommand({ type: "export" });
-        if (outcome.ok && outcome.result.status === "accepted" && outcome.result.result?.exportId) await downloadExport(outcome.result.result.exportId);
-        return true;
+        if (!outcome.ok) return "failed";
+        if (outcome.result.status === "accepted" && outcome.result.result?.exportId) await downloadExport(outcome.result.result.exportId);
+        return "ok";
       }
-      case "fork": overlay.set("fork"); return true;
-      case "clone": await runCommand({ type: "clone" }); return true;
-      case "resume": sidebarOpen.set(true); return true;
-      case "session": overlay.set("session-info"); return true;
-      case "quit": await closeSession(); return true;
+      case "fork": overlay.set("fork"); return "ok";
+      case "clone": return ran({ type: "clone" });
+      case "resume": sidebarOpen.set(true); return "ok";
+      case "session": overlay.set("session-info"); return "ok";
+      case "quit": await closeSession(); return "ok";
     }
-    if (!view.hosted || commands?.some((c) => c.name === name)) return false;
+    // 会话启动前拿不到命令列表：已知只在终端可用的命令直接拒绝，其余交给 pi 判断。
+    if (!TERMINAL_ONLY.has(name) && (!view.hosted || commands?.some((c) => c.name === name))) return "prompt";
     toast(`pi-pane 不支持 /${name}，请在终端中使用 pi`, "warning");
-    return true;
+    return "failed";
   }
 
   async function send(delivery?: "steer" | "follow_up") {
@@ -278,17 +293,22 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     if (isEmpty(nodes)) return;
     setCompletion(null);
     const command = parseSlash(nodes);
+    let viaPrompt = false;
     if (command) {
       setBusy(true);
-      try { if (await slash(command.name, command.args)) { el.innerHTML = ""; refresh(); return; } }
+      let outcome: "ok" | "failed" | "prompt";
+      try { outcome = await slash(command.name, command.args); }
       finally { setBusy(false); }
+      if (outcome === "failed") return;
+      if (outcome === "ok") { if (el.isConnected && JSON.stringify(readNodes(el)) === JSON.stringify(nodes)) { el.innerHTML = ""; refresh(); } return; }
+      viaPrompt = true;
     }
     if (el.querySelector(".chip.expired")) { toast("图片已过期，请重新添加", "warning"); return; }
     if (uploads) { toast("图片仍在上传", "warning"); return; }
     const ids = imageIds(nodes);
     const problem = checkImages(ids); if (problem) { toast(problem, "warning"); return; }
     if (ids.length && view.state?.model && !view.state.model.images) { toast("当前模型不支持图片，请切换模型", "warning"); return; }
-    let type: "prompt" | "steer" | "follow_up" = running ? delivery ?? "steer" : "prompt";
+    let type: "prompt" | "steer" | "follow_up" = running && !viaPrompt ? delivery ?? "steer" : "prompt";
     setBusy(true);
     try {
       for (;;) {
@@ -299,6 +319,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
           return;
         }
         if (outcome.error.code !== "revisionChanged") { toast(outcome.error.message, "error"); return; }
+        if (viaPrompt) { toast("会话状态已变化，请确认后重新执行命令", "warning"); return; }
         // 用户看到的状态已过期：按最新状态请用户重新确认，草稿保留，不自动重发。
         const latest = current.get()?.model?.view;
         const nowRunning = (latest?.inFlight?.phase ?? "idle") !== "idle";

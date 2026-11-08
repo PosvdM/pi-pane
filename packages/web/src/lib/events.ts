@@ -16,6 +16,8 @@ function update(id: string, change: (ui: ReturnType<typeof emptyUi>) => void): v
 }
 
 export function installEventHandlers(): void {
+  // 待答对话框以服务端为准：离线或退订期间可能已在别处处理，重新订阅时清空后由服务端重发。
+  ws.onSubscribing((id) => update(id, (ui) => { ui.dialogs = []; }));
   ws.onMessage((message) => {
     if (message.type === "ui_request") {
       const id = message.ref.id; const request = message.request;

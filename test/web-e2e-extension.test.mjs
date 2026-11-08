@@ -113,7 +113,8 @@ test("Chrome 斜杠命令补全支持方向键、Tab 并拒绝终端专用命令
   await byId(page, "completion").waitFor({ state: "detached" });
   await send(page, "/settings");
   await byId(page, "toast").filter({ hasText: "pi-pane 不支持 /settings" }).waitFor();
-  await page.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "");
+  // 未执行的命令保留在输入框中，便于修改。
+  assert.equal(await byId(page, "composer").textContent(), "/settings");
   assert.equal((await records(s.fixture.env.FAKE_REQUEST_LOG)).filter(record => record.kind === "request").length, 1, "不支持的斜杠命令不得进入模型");
   await screenshot(page, "e2e-command-unsupported");
 });

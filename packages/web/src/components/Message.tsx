@@ -230,7 +230,17 @@ function CompactionMarker({ entry }: { entry: Entry }) {
 /** 条目的工具状态签名：只有其中工具调用的结果或运行状态变化时才重新渲染该条目。 */
 export function toolKey(entry: Entry, ctx: ToolContext): string {
   const content = entry.type === "message" && entry.message?.role === "assistant" && Array.isArray(entry.message.content) ? entry.message.content : [];
-  return content.filter((b: any) => b.type === "toolCall").map((b: any) => `${ctx.results.has(b.id) ? "r" : ""}${ctx.running.has(b.id) ? "x" + JSON.stringify(ctx.running.get(b.id)?.partialResult ?? "").length : ""}`).join(",") + (ctx.showHidden ? "h" : "");
+  return content.filter((b: any) => b.type === "toolCall").map((b: any) => `${ctx.results.has(b.id) ? "r" : ""}${ctx.running.has(b.id) ? "x" + identity(ctx.running.get(b.id)?.partialResult) : ""}`).join(",") + (ctx.showHidden ? "h" : "");
+}
+
+/** 每次 tool_execution_update 都带来新的 partialResult 对象；按对象身份编号，内容等长时也能识别变化。 */
+const identities = new WeakMap<object, number>();
+let nextIdentity = 0;
+function identity(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value ?? "");
+  let id = identities.get(value);
+  if (id === undefined) { id = ++nextIdentity; identities.set(value, id); }
+  return "#" + id;
 }
 
 export const EntryView = memo(function EntryView({ entry, ctx }: { entry: Entry; ctx: ToolContext; toolKey: string }) {

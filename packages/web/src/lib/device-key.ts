@@ -57,7 +57,15 @@ function unsupported(stage: string, error: unknown): PresenceError {
 }
 
 /** 读取设备密钥，没有时生成并存入 IndexedDB。 */
-export async function getOrCreateDevice(): Promise<DeviceInfo> {
+export function getOrCreateDevice(): Promise<DeviceInfo> { return exclusive(loadOrCreate); }
+
+/** 同一浏览器的多个标签页用 Web Locks 串行化密钥的生成和重置，避免两个标签页各自写入不同的密钥。 */
+function exclusive<T>(fn: () => Promise<T>): Promise<T> {
+  if (!navigator.locks) return fn();
+  return navigator.locks.request("pi-pane-device-key", fn);
+}
+
+async function loadOrCreate(): Promise<DeviceInfo> {
   const support = detectSupport();
   if (!support.ok) throw new PresenceError("unsupported", support.reason);
   let record: KeyRecord | undefined;
@@ -73,9 +81,11 @@ export async function getOrCreateDevice(): Promise<DeviceInfo> {
 }
 
 /** “重置设备密钥”：删除旧密钥并生成新的，插件后台服务会把它当作新设备。 */
-export async function resetDevice(): Promise<DeviceInfo> {
-  await transaction("readwrite", (s) => idb(s.delete(KEY)));
-  return getOrCreateDevice();
+export function resetDevice(): Promise<DeviceInfo> {
+  return exclusive(async () => {
+    await transaction("readwrite", (s) => idb(s.delete(KEY)));
+    return loadOrCreate();
+  });
 }
 
 export function setDeviceLabel(label: string): void { localStorage.setItem(LABEL_KEY, label.trim() || "本机 Chrome"); }

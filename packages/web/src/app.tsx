@@ -2,6 +2,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { auth, boot, pair } from "./lib/auth.ts";
 import { installEventHandlers } from "./lib/events.ts";
+import { getOrCreateDevice } from "./lib/device-key.ts";
 import { current, detach, lastSessionId, open } from "./lib/session.ts";
 import { useStore } from "./lib/store.ts";
 import { link, start, stop } from "./lib/ws.ts";
@@ -37,6 +38,8 @@ function Main() {
   const sidebar = useStore(sidebarOpen);
   useEffect(() => {
     start();
+    // 登录后即建立设备密钥（plugin-api.md“设备密钥”）；不支持时在设置页显示原因。
+    getOrCreateDevice().catch(() => {});
     const last = lastSessionId();
     if (last && !current.get()) void open(last);
     return () => { detach(); stop(); };

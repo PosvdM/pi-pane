@@ -33,6 +33,8 @@ function useCountdown(expiresAt?: string): number | null {
   return expiresAt ? Math.max(0, Math.ceil((Date.parse(expiresAt) - now) / 1000)) : null;
 }
 
+const attempts = new Map<string, string>();
+
 function removeDialog(sessionId: string, id: string): void {
   extensionUi.set((all) => all[sessionId] ? { ...all, [sessionId]: { ...all[sessionId], dialogs: all[sessionId].dialogs.filter((d) => d.id !== id) } } : all);
 }
@@ -57,12 +59,22 @@ export function ExtensionDialog() {
   async function answer(body?: { value: string } | { confirmed: boolean }) {
     if (!request || sending) return;
     setSending(true);
+    // 同一个答案的重试沿用同一 requestId，由服务端去重。
+    const key = request.id + JSON.stringify(body ?? null);
+    const requestId = attempts.get(key) ?? newId(); attempts.set(key, requestId);
+    let done = false;
     try {
-      const result = await api<PaneUiAnswerResult>(`/api/sessions/${encodeURIComponent(id)}/ui`, { requestId: newId(), expectedEpoch: current.get()?.model?.view.cursor.epoch, id: request.id, ...(body ? { answer: body } : {}) });
+      const result = await api<PaneUiAnswerResult>(`/api/sessions/${encodeURIComponent(id)}/ui`, { requestId, expectedEpoch: current.get()?.model?.view.cursor.epoch, id: request.id, ...(body ? { answer: body } : {}) });
       if (result.status === "alreadyHandled") toast("该对话框已在别处处理或已超时");
+      done = true;
     } catch (error) {
-      toast(error instanceof ApiError && error.code === "epochChanged" ? "会话进程已更换，对话框已失效" : (error as Error).message, "warning");
-    } finally { setSending(false); removeDialog(id, request.id); }
+      const epoch = error instanceof ApiError && error.code === "epochChanged";
+      done = epoch;
+      toast(epoch ? "会话进程已更换，对话框已失效" : `回应未送达：${(error as Error).message}，可以重试`, "warning");
+    } finally {
+      setSending(false);
+      if (done) { attempts.delete(key); removeDialog(id, request.id); }
+    }
   }
   const cancel = () => void answer();
   return (
@@ -106,9 +118,17 @@ export function TrustDialog() {
   useEffect(() => { if (request && left === 0) trustRequests.set((list) => list.filter((r) => r.id !== request.id)); }, [left]);
   if (!request) return null;
   async function decide(trusted?: boolean) {
-    trustRequests.set((list) => list.filter((r) => r.id !== request.id));
-    try { await api(`/api/trust/${encodeURIComponent(request.id)}`, { requestId: newId(), ...(trusted === undefined ? {} : { decision: { trusted, remember } }) }); }
-    catch (error) { toast((error as Error).message, "warning"); }
+    const body = trusted === undefined ? {} : { decision: { trusted, remember } };
+    const key = request.id + JSON.stringify(body);
+    const requestId = attempts.get(key) ?? newId(); attempts.set(key, requestId);
+    try {
+      await api(`/api/trust/${encodeURIComponent(request.id)}`, { requestId, ...body });
+      attempts.delete(key); trustRequests.set((list) => list.filter((r) => r.id !== request.id));
+    } catch (error) {
+      // 询问已处理或过期时关闭；其他失败保留询问以便重试。
+      if (error instanceof ApiError && error.code === "trustExpired") { attempts.delete(key); trustRequests.set((list) => list.filter((r) => r.id !== request.id)); }
+      else toast(`回答未送达：${(error as Error).message}，可以重试`, "warning");
+    }
   }
   return (
     <Modal title="项目信任" onClose={() => void decide()} testid="trust-dialog">

@@ -23,13 +23,25 @@ export function onMessage(listener: (message: PaneServerMessage) => void): () =>
   return () => { listeners.delete(listener); };
 }
 
+const subscribing = new Set<(id: string) => void>();
+/** 每次向服务端发送订阅前通知：服务端会在订阅后重发全部待答对话框，收到通知的一方先清空本地副本。 */
+export function onSubscribing(listener: (id: string) => void): () => void {
+  subscribing.add(listener);
+  return () => { subscribing.delete(listener); };
+}
+function sendSubscribe(id: string, cursor: () => StreamCursor): void {
+  if (socket?.readyState !== WebSocket.OPEN || link.get().state !== "open") return;
+  for (const listener of subscribing) listener(id);
+  socket.send(JSON.stringify({ type: "subscribe", ref: { source: "pane", id }, after: cursor() }));
+}
+
 function send(value: unknown): void { if (socket?.readyState === WebSocket.OPEN && link.get().state === "open") socket.send(JSON.stringify(value)); }
 
 /** 订阅会话事件；连接恢复后按 cursor() 返回的游标重新订阅。 */
 export function subscribe(id: string, cursor: () => StreamCursor, onEvent: (event: SessionStreamEvent) => void): () => void {
   const subscription = { cursor, onEvent };
   subscriptions.set(id, subscription);
-  send({ type: "subscribe", ref: { source: "pane", id }, after: cursor() });
+  sendSubscribe(id, cursor);
   return () => {
     if (subscriptions.get(id) !== subscription) return;
     subscriptions.delete(id);
@@ -40,7 +52,7 @@ export function subscribe(id: string, cursor: () => StreamCursor, onEvent: (even
 /** 以新游标重新订阅（resync 之后）。 */
 export function resubscribe(id: string): void {
   const subscription = subscriptions.get(id);
-  if (subscription) send({ type: "subscribe", ref: { source: "pane", id }, after: subscription.cursor() });
+  if (subscription) sendSubscribe(id, subscription.cursor);
 }
 
 function schedule(): void {
@@ -79,7 +91,7 @@ async function connect(): Promise<void> {
     if (message.type === "banners") {
       retry = 0; lastPong = Date.now();
       link.set({ state: "open", connectionId: message.connectionId });
-      for (const [id, subscription] of subscriptions) ws.send(JSON.stringify({ type: "subscribe", ref: { source: "pane", id }, after: subscription.cursor() }));
+      for (const [id, subscription] of subscriptions) sendSubscribe(id, subscription.cursor);
       clearInterval(heartbeat);
       heartbeat = setInterval(() => {
         // 网络中断时浏览器可能长时间不触发 close；超过两个心跳周期没有回应就主动重连。

@@ -28,11 +28,16 @@ export const restoredDrafts = new Store<{ sessionId: string; drafts: DraftNode[]
 export const editorText = new Store<{ sessionId: string; text: string; seq: number } | null>(null);
 
 let unsubscribe: (() => void) | null = null;
-let reloading: Promise<void> | null = null;
+/** 正在重取快照的会话与导航代次；只屏蔽同一会话、同一次导航的事件。 */
+let reloading: { id: string; nav: number; promise: Promise<void> } | null = null;
+/** 导航代次：每次打开会话加 1，只有最后一次导航的响应能写入当前会话。 */
+let nav = 0;
 const retiredEpochs = new Set<string>();
 /** 本标签页发起了会切换会话的操作（首次发送、/new、/fork、/clone）：截止时间前收到替换事件时自动跟随。 */
 let followUntil = 0;
 const FOLLOW_WINDOW_MS = 15000;
+/** 控制请求遇到网络错误时，用同一 requestId 重试的最长时间。 */
+const NETWORK_RETRY_MS = 120000;
 
 const LAST_SESSION_KEY = "pi-pane.lastSession";
 
@@ -67,9 +72,17 @@ function attach(id: string): void {
   sessionStorage.setItem(LAST_SESSION_KEY, id);
 }
 
+let stateTimer: ReturnType<typeof setTimeout> | undefined;
+/** 名称、模型、思考级别可能由其他标签页或扩展改变：控制 revision 变化或会话信息变化后重新读取状态。 */
+function scheduleStateRefresh(): void {
+  clearTimeout(stateTimer);
+  stateTimer = setTimeout(() => { void refreshState(); }, 200);
+}
+
 function onEvent(id: string, record: Parameters<typeof apply>[1]): void {
   const state = current.get();
-  if (!state || state.id !== id || !state.model || reloading) return;
+  if (!state || state.id !== id || !state.model || reloading?.id === id) return;
+  const revision = state.model.view.controlRevision;
   if (retiredEpochs.has(record.cursor.epoch)) return;
   const result = apply(state.model, record);
   if (result === "resync") { void reload(); return; }
@@ -80,42 +93,47 @@ function onEvent(id: string, record: Parameters<typeof apply>[1]): void {
   }
   if (event.type === "pane_status" && event.status === "idle") { void refreshStats(); scheduleListRefresh(); }
   if (event.type === "pane_session_replaced") scheduleListRefresh();
+  if (state.model.view.hosted && (state.model.view.controlRevision !== revision || ["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type))) scheduleStateRefresh();
   current.touch();
 }
 
 /** 重新取快照并以新游标续订。 */
 export function reload(): Promise<void> {
-  if (reloading) return reloading;
   const state = current.get(); if (!state) return Promise.resolve();
-  const id = state.id; const epoch = state.model?.view.cursor.epoch;
-  reloading = (async () => {
+  if (reloading && reloading.id === state.id && reloading.nav === nav) return reloading.promise;
+  const id = state.id; const epoch = state.model?.view.cursor.epoch; const mine = nav;
+  const promise = (async () => {
     try {
       const view = await api<PaneSessionView>(`/api/sessions/${encodeURIComponent(id)}/snapshot`);
-      if (current.get()?.id !== id) return;
+      if (current.get()?.id !== id || nav !== mine) return;
       if (epoch && epoch !== view.cursor.epoch) retiredEpochs.add(epoch);
       const replaced = current.get()?.model?.replaced;
       setModel(id, view);
       if (replaced && current.get()?.model) current.get()!.model!.replaced = replaced;
     } catch (error) {
-      if (current.get()?.id === id) current.set((s) => s && { ...s, error: (error as Error).message });
-    } finally { reloading = null; }
+      if (current.get()?.id === id && nav === mine) current.set((s) => s && { ...s, error: (error as Error).message });
+    } finally { if (reloading?.id === id && reloading.nav === mine) reloading = null; }
+    // 导航已经换了会话时，新会话的订阅不受这次重取影响。
+    if (current.get()?.id !== id || nav !== mine) return;
     ws.resubscribe(id);
     current.touch();
   })();
-  return reloading;
+  reloading = { id, nav: mine, promise };
+  return promise;
 }
 
 /** 打开已登记的会话（按会话 id）。 */
 export async function open(id: string): Promise<void> {
+  const mine = ++nav;
   current.set({ id, model: null, loading: true });
   try {
     const view = await api<PaneSessionView>(`/api/sessions/${encodeURIComponent(id)}/snapshot`);
-    if (current.get()?.id !== id) return;
+    if (nav !== mine) return;
     setModel(id, view);
     attach(id);
     void refreshAuxiliary();
   } catch (error) {
-    if (current.get()?.id !== id) return;
+    if (nav !== mine) return;
     if (error instanceof ApiError && error.status === 404) {
       // 服务端重启后会话登记丢失，需要从会话列表重新打开。
       sessionStorage.removeItem(LAST_SESSION_KEY);
@@ -128,22 +146,25 @@ export async function open(id: string): Promise<void> {
 
 /** 退出主界面（重新配对等）时取消订阅并清空当前会话。 */
 export function detach(): void {
+  nav++;
   unsubscribe?.(); unsubscribe = null;
   current.set(null);
 }
 
 /** 从会话列表打开，或在项目目录下新建（sessionFile 省略）。 */
 export async function openFile(cwd: string, sessionFile?: string, fork = false): Promise<void> {
+  const mine = ++nav;
   current.set({ id: "", model: null, loading: true });
   try {
     const result = await api<PaneOpenResult>("/api/sessions/open", { requestId: newId(), cwd, ...(sessionFile ? { sessionFile } : {}), ...(fork ? { fork: true } : {}) });
+    if (nav !== mine) return;
     const id = result.ref.id;
     setModel(id, result, { warning: result.warning, heldBy: result.heldBy });
     attach(id);
     void refreshAuxiliary();
     void refreshList();
   } catch (error) {
-    current.set({ id: "", model: null, loading: false, error: (error as Error).message });
+    if (nav === mine) current.set({ id: "", model: null, loading: false, error: (error as Error).message });
   }
 }
 
@@ -180,10 +201,13 @@ async function refreshAuxiliary(): Promise<void> {
     const result = await query("commands");
     if (result && current.get()?.id === id) current.set((s) => s && { ...s, commands: result.commands });
   } catch { /* 补全列表取不到时只提供内置命令。 */ }
+  await refreshState();
+}
+async function refreshState(): Promise<void> {
+  const id = current.get()?.id; const model = current.get()?.model; const epoch = model?.view.cursor.epoch;
   try {
     const state = await query("state");
-    const model = current.get()?.model;
-    if (state && model && current.get()?.id === id) { model.view.state = state; current.touch(); }
+    if (state && model && current.get()?.id === id && current.get()?.model === model && model.view.cursor.epoch === epoch) { model.view.state = state; current.touch(); }
   } catch { /* 状态在下一次快照时更新。 */ }
 }
 
@@ -197,9 +221,18 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[]):
   const body = { requestId: newId(), expectedEpoch: model.view.cursor.epoch, expectedRevision: model.view.controlRevision ?? 0, command, ...(draft ? { draft } : {}) };
   const switching = ["new_session", "fork", "clone"].includes(command.type) || (!model.view.hosted && ["prompt", "steer", "follow_up"].includes(command.type));
   if (switching) followUntil = Number.MAX_SAFE_INTEGER;
+  const giveUp = Date.now() + NETWORK_RETRY_MS; let warned = false; let delay = 500;
   try {
     for (;;) {
-      const result = await api<PaneControlResult>(`/api/sessions/${encodeURIComponent(id)}/control`, body);
+      let result: PaneControlResult;
+      try { result = await api<PaneControlResult>(`/api/sessions/${encodeURIComponent(id)}/control`, body); }
+      catch (error) {
+        // 响应丢失时服务端可能已经执行：用同一 requestId 和同一内容重试，由服务端去重并返回原结果。
+        if (!(error instanceof ApiError && error.code === "network") || Date.now() > giveUp) throw error;
+        if (!warned) { warned = true; toast("网络中断，恢复后自动核对这次操作的结果", "warning"); }
+        await new Promise((r) => setTimeout(r, delay)); delay = Math.min(5000, delay * 2);
+        continue;
+      }
       if (result.status === "pending") { await new Promise((r) => setTimeout(r, 1000)); continue; }
       if (result.status === "accepted") {
         const next = result.snapshot.ref.id;
@@ -216,7 +249,8 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[]):
       return { ok: true, result };
     }
   } catch (error) {
-    const failure = error instanceof ApiError ? error : new ApiError(0, "unknown", String(error));
+    let failure = error instanceof ApiError ? error : new ApiError(0, "unknown", String(error));
+    if (failure.code === "network") failure = new ApiError(0, "network", "网络中断，这次操作可能已经执行。请在连接恢复后查看会话，再决定是否重发");
     if (failure.code === "epochChanged") { await reload(); }
     else if (failure.code === "revisionChanged") { await reload(); }
     else if (failure.code === "rpcResultUnknown") { await reload(); }
