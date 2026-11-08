@@ -2,7 +2,7 @@
 
 pi-pane 是 [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) 编码智能体的轻量 Web 界面。它在浏览器里显示和操作 pi 会话；子代理、会议等功能由插件提供，pi-pane 只提供通用的显示接口。
 
-> **当前状态：M1 服务端核心。** 三个 workspace 包提供会话托管、pane 协议类型和 pane-bridge。Web 界面在 M2 实现，插件宿主在 M3 实现；当前通过 HTTP 和 WebSocket 接口使用。开发与验收说明见 [docs/development.md](docs/development.md)。
+> **当前状态：M2 前端核心。** 可以在 Chrome 里配对后查看、新建、切换会话，发送消息、看流式回复、停止，使用斜杠命令、图片占位符和 pi 扩展对话框。插件宿主、子会话树和待处理区在 M3 实现。开发与验收说明见 [docs/development.md](docs/development.md)。
 
 ## 为什么要做
 
@@ -17,7 +17,7 @@ pi-pane 不替代终端：会话仍然是 pi 自己的会话文件，在终端�
 
 ## 功能范围
 
-以下为完整 MVP 的目标范围。M1 只实现服务端核心，前端与插件能力尚不可用。
+以下为完整 MVP 的目标范围。插件接口（会话树中的插件节点、面板、动作、持久表单、横幅、用户在场确认）在 M3 实现，其余功能已可用。
 
 - **托管主会话**：每个打开的会话对应一个 `pi --mode rpc` 子进程，加载你自己的 pi 扩展、技能和配置，和在终端里运行 pi 一样。没在运行的会话可以只读查看，第一次发送时再启动。
 - **聊天**：Markdown、思考内容折叠、工具调用卡片、`edit` 差异显示、压缩分隔标记；发送、运行中追加（steer）、排队（follow-up）、停止（排队中的消息退回输入框）；切换模型和 thinking；查看上下文用量和费用。
@@ -73,7 +73,12 @@ npm test
 npm start
 ```
 
-`npm start` 只提供 M1 服务端接口，默认监听 `127.0.0.1:4319`，终端显示一次性配对地址。当前没有可操作的首页。配置文件为 `~/.pi/pane/config.json`，可设置 `piPath`、`port` 和 `idleReclaimMs`；`PI_PANE_HOME` 可覆盖数据目录。接口与测试入口见 [开发文档](docs/development.md)。
+`npm test` 之前会运行 `npm run build`，它同时构建服务端和 `packages/web` 的前端。`npm start` 默认监听 `127.0.0.1:4319`，终端显示一次性配对地址，在 Chrome 中打开即可登录；在终端按 Enter 生成新的配对码。配置文件为 `~/.pi/pane/config.json`，可设置 `piPath`、`port`、`idleReclaimMs` 和 `webRoot`；`PI_PANE_HOME` 可覆盖数据目录。接口与测试入口见 [开发文档](docs/development.md)。
+
+界面操作：
+
+- 输入框中 Enter 发送，Shift+Enter 换行；会话运行中 Enter 为追加（steer），Alt+Enter 为排队（follow-up）。“停止”会清空排队并中止当前回复，排队中的消息退回输入框。
+- 输入 `/` 显示命令补全。粘贴、拖入或点“添加图片”在光标处插入图片，图片编号随位置自动更新。
 
 ## 文档
 
