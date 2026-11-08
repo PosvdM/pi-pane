@@ -28,7 +28,9 @@ async function setup(afterListen = async () => {}) {
     server = await startServer(f, { extraExtensions: [providerPath, commands] });
     await afterListen({ server, f, target });
     const token = await pair(server); const b = await open(server, token, f, { sessionFile: target });
-    const first = await control(server, token, await open(server, token, f), { type: "prompt", message: "源会话" }); assert.equal(first.code, 200);
+    const first = await control(server, token, await open(server, token, f), { type: "prompt", message: "源会话" });
+    assert.equal(first.code, 200, JSON.stringify({ response: first, serverStopping: server.stopping, serverCloseStarted: !!server.closePromise,
+      inflightClosing: server.sessions.inflight.closing, sessionsCloseStarted: !!server.sessions.closePromise }));
     const a = await until(async () => { const s = await snapshot(server, token, first.value.snapshot.ref.id); return s.status === "idle" && s; });
     server.sessions.ledger = new RequestLedger(Date.now, 50);
     return { f, target, server, token, a, b };
