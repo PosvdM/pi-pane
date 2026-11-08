@@ -40,8 +40,10 @@ export class Sessions {
     this.driver = new RpcSubprocessDriver(broker, { ...options, onTrust: (cwd) => trust.request(cwd) });
     this.timer = setInterval(() => { void this.reclaim().catch(() => {}); }, 10000); this.timer.unref();
   }
+  get inflight() { return this.broker.inflight; }
   recordCleanupFailure(error: unknown): void { this.cleanupErrors.push(error); }
-  async recover(): Promise<void> {
+  recover(): Promise<void> { return this.inflight.run("sessions.recover", () => this.performRecover()); }
+  private async performRecover(): Promise<void> {
     try {
       this.state = JSON.parse(await readFile(path.join(this.options.home, "state.json"), "utf8"));
       assert(this.state && typeof this.state === "object" && !Array.isArray(this.state), "invalidState", "服务端状态文件无效", 503);
@@ -72,7 +74,10 @@ export class Sessions {
     for (const session of this.records.values()) this.assets.detach((await readSession(session.file)).entries);
   }
   private record(id: string): HostedSession { const session = this.records.get(id); assert(session, "sessionMissing", "会话不存在", 404); return session; }
-  async open(input: { cwd: string; sessionFile?: string; fork?: boolean }): Promise<any> {
+  open(input: { cwd: string; sessionFile?: string; fork?: boolean }): Promise<any> {
+    return this.inflight.run("sessions.open", () => this.performOpen(input));
+  }
+  private async performOpen(input: { cwd: string; sessionFile?: string; fork?: boolean }): Promise<any> {
     assert(!this.recovering, "recovering", "旧进程尚未完成恢复", 503);
     assert(!this.closing, "serverStopping", "服务端正在关闭", 503);
     assert(typeof input.cwd === "string" && path.isAbsolute(input.cwd), "invalidCwd", "项目目录必须为绝对路径");
@@ -132,7 +137,7 @@ export class Sessions {
   }
   command(id: string, request: ControlRequest): Promise<any> {
     const priority = ["stop", "close", "restart"].includes(request.command?.type);
-    return this.ledger.execute(request.requestId, { sessionId: id, ...request }, () => this.record(id).control.run(async (signal) => {
+    return this.ledger.execute(request.requestId, { sessionId: id, ...request }, () => this.inflight.run("sessions.command", () => this.record(id).control.run(async (signal) => {
       let session = this.record(id); const model = session.model; const command = request.command;
       assert(command && mutations.has(command.type), "unsupportedCommand", "不支持此会话控制命令");
       assert(request.expectedEpoch === model.epoch, "epochChanged", "会话进程已更换，请重新读取快照", 409);
@@ -181,7 +186,7 @@ export class Sessions {
         session.model.emit({ type: "pane_diagnostic", message: String(error) });
       }
       return { status: "accepted", response, snapshot: this.view(session) };
-    }, priority), priority);
+    }, priority)), priority);
   }
   async query(id: string, type: string): Promise<any> {
     assert(queries.has(type), "unsupportedQuery", "不支持此会话查询"); const session = this.record(id);
@@ -196,7 +201,7 @@ export class Sessions {
     if (this.closing) return Promise.reject(new PaneError("interrupted", "会话已关闭", 409));
     const controller = new AbortController(); const cancellation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     // 信任询问及目录读取也属于启动；登记后才进入第一个异步步骤。
-    const operation = Promise.resolve().then(() => this.performStart(session, assumeNoWriter, cancellation));
+    const operation = this.inflight.run("sessions.start", () => Promise.resolve().then(() => this.performStart(session, assumeNoWriter, cancellation)));
     const settled = operation.catch((error) => { if (controller.signal.aborted && error !== cancellation.reason) throw error; });
     this.starts.set(controller, settled);
     void settled.then(() => this.starts.delete(controller), () => this.starts.delete(controller));
@@ -329,7 +334,8 @@ export class Sessions {
     if (!session.handle || session.handle === handle) for (const text of texts) session.drafts.delete(text);
     return { status: "done", clearedText: texts, clearedDrafts: drafts, ...(report ? { stopReport: report } : {}) };
   }
-  private async reclaim(): Promise<void> {
+  private reclaim(): Promise<void> { return this.inflight.run("sessions.reclaim", () => this.performReclaim()); }
+  private async performReclaim(): Promise<void> {
     for (const session of this.records.values()) if (session.handle && session.model.status === "idle" && !session.clients && !session.holds.size && !session.ui.size && Date.now() - session.lastActive >= (this.options.idleReclaimMs ?? 1800000)) await this.stop(session, true);
   }
   close(): Promise<void> {
@@ -337,7 +343,7 @@ export class Sessions {
     return this.closePromise;
   }
   private async performClose(): Promise<void> {
-    this.closing = true; clearInterval(this.timer); this.trust.close(); const errors: unknown[] = [];
+    this.inflight.seal(); this.closing = true; clearInterval(this.timer); this.trust.close(); const errors: unknown[] = [];
     const starts = [...this.starts];
     for (const [controller] of starts) controller.abort(new PaneError("interrupted", "会话已关闭", 409));
     for (const session of this.records.values()) {
@@ -347,7 +353,8 @@ export class Sessions {
     }
     for (const result of await Promise.allSettled(starts.map(([, settled]) => settled))) if (result.status === "rejected") errors.push(result.reason);
     for (const [handle, finished] of this.handles) try { await handle.stop(); await finished; } catch (error) { errors.push(error); }
-    // 仅汇总本实例产生的恢复失败；既有隔离记录留作诊断，不阻止正常关闭。
+    // 所有清理事实的生产者结束后才汇总；旧隔离记录仅保留诊断。
+    await this.inflight.drain();
     errors.push(...this.cleanupErrors);
     if (errors.length) throw new AggregateError(errors, "部分会话未确认停止");
   }

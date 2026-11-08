@@ -311,8 +311,9 @@ for (const close of [false, true]) test(`只读打开的 stat 迟到于${close ?
     });
     syncBuiltinESMExports(); opening = server.sessions.open({ cwd: f.cwd, sessionFile: file }); await entered.promise;
     if (close) {
-      await server.sessions.close(); gate.resolve();
-      await assert.rejects(opening, { code: "serverStopping" });
+      let finished = false; const closing = server.sessions.close().then(() => { finished = true; });
+      await new Promise(setImmediate); assert.equal(finished, false, "关闭屏障包含在途 open 的后续读取"); gate.resolve();
+      await assert.rejects(opening, { code: "serverStopping" }); await closing;
       assert.equal(server.sessions.records.has("late-open"), false);
     } else {
       const other = await open(server, token, f, { sessionFile: file });
@@ -341,8 +342,9 @@ test("服务关闭正在等待较早记录时，后续写者不能重绑定到�
     const source = server.sessions.records.get(a.ref.id); handle = source.handle;
     closing = server.sessions.close(); await entered.promise;
     assert.equal(destination.closed, true); assert.equal(destination.handle, undefined); assert.equal(source.closed, false);
-    const response = await handle.send({ type: "prompt", message: "/pane-test-resume " + target }); assert.equal(response.success, true);
-    await until(() => fileKey(handle.sessionFile) === fileKey(target) && handle.acceptingInput);
+    await assert.rejects(handle.send({ type: "prompt", message: "/pane-test-resume " + target }), { code: "serverStopping" });
+    // 已受理操作的迟到回调仍不能绕过会话关闭检查，直接覆盖回调归属边界。
+    handle.callbacks.onReady({ sessionFile: target, sessionId: b.ref.id, cwd: f.cwd }, { entries: [] }, "resume", handle);
     assert.ok(destination.handle === undefined, "关闭遍历已经经过的目标不能接收迟到写者");
     assert.equal(source.handle, handle);
     gate.resolve(); await closing; await handle.exited;

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { isSameProcess, type ProcessIdentity } from "pi-hostkit";
 import { assert } from "./errors.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
+import { Inflight } from "./inflight.js";
 export type TrustChoice = { trusted: boolean; remember: boolean };
 interface BridgeRun {
   ticket: string; token?: string; expires: number; instance: number; identity?: ProcessIdentity;
@@ -10,7 +11,7 @@ interface BridgeRun {
 }
 export class BridgeBroker {
   private tickets = new Map<string, BridgeRun>(); private tokens = new Map<string, BridgeRun>();
-  constructor(private readonly now = Date.now) {}
+  constructor(private readonly now = Date.now, readonly inflight = new Inflight()) {}
   issue(decisions: Record<string, TrustChoice>, handler: (event: any) => Promise<any>, onCleanupFailure?: (error: unknown) => void): { ticket: string; attach(identity: ProcessIdentity): void; close(): void } {
     const run: BridgeRun = { ticket: randomBytes(24).toString("base64url"), expires: this.now() + 30000, instance: 0, decisions, handler, onCleanupFailure, closed: false };
     this.tickets.set(run.ticket, run);
@@ -24,7 +25,10 @@ export class BridgeBroker {
     const token = randomBytes(32).toString("base64url"); run.token = token; this.tokens.set(token, run);
     return { token, decisions: run.decisions };
   }
-  async event(token: string, event: any): Promise<any> {
+  event(token: string, event: any): Promise<any> {
+    return this.inflight.run("bridge.event", () => this.performEvent(token, event));
+  }
+  private async performEvent(token: string, event: any): Promise<any> {
     const run = this.tokens.get(token);
     assert(run && !run.closed, "invalidBridgeCredential", "pane-bridge 凭证已失效", 403);
     assert(Number.isSafeInteger(event.instance) && event.instance > 0, "invalidBridgeInstance", "pane-bridge 实例号无效");

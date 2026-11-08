@@ -156,16 +156,17 @@ test("关闭等待 reload 的在途初始化排空，不允许迟到 ready 恢�
 });
 
 test("停止未确认时关闭返回失败并保留实例锁，并发调用不报告成功", { timeout: 30000 }, async () => {
-  const f = await piFixture(); const server = await startServer(f); let stop; let handle;
+  const f = await piFixture(); const server = await startServer(f); let stop; let handle; let locks;
   try {
     const view = await server.sessions.open({ cwd: f.cwd }); const source = server.sessions.records.get(view.ref.id);
-    await server.sessions.start(source); handle = source.handle; stop = handle.stop.bind(handle);
-    handle.stop = async () => { throw new Error("注入停止未确认"); };
+    await server.sessions.start(source); handle = source.handle; stop = handle.proc.stop.bind(handle.proc); locks = [...handle.locks.values()];
+    // 保留真实 performStop 的退出和排空生命周期，hostkit 停止本身拒绝且写者仍存活。
+    handle.proc.stop = async () => { throw new Error("注入停止未确认"); };
     let released = false; const release = server.lock.release.bind(server.lock);
     server.lock.release = async () => { released = true; await release(); };
     await assert.rejects(server.close(), AggregateError); await assert.rejects(server.close(), AggregateError);
     assert.equal(released, false); assert.equal((await probeSessionWriterLock(source.file)).held, true);
-  } finally { if (stop) { handle.stop = stop; await stop(); } await server.lock.release(); await f.cleanup(); }
+  } finally { if (stop) { handle.proc.stop = stop; await stop(); for (const lock of locks) await lock.release(); } await server.lock.release(); await f.cleanup(); }
 });
 
 for (const phase of ["process", "verify", "update", "release", "record"]) test(`关闭前真实停止的 ${phase} 失败在退出及登记收尾后仍保留实例锁`, { timeout: 30000 }, async (t) => {

@@ -10,6 +10,7 @@ import { fileKey } from "./store.js";
 import { carriesUnconfirmedCleanup, observeHostkit, observeHostkitSync } from "./hostkit-cleanup.js";
 import { acquireRecoveredWriter } from "./writer-recovery.js";
 import { verifyStopped } from "./stop-report.js";
+import type { Inflight, InflightOwner } from "./inflight.js";
 export { checkStopReport, verifyStopped } from "./stop-report.js";
 
 export interface DriverSpec { cwd: string; sessionFile: string; sessionDir: string; decisions: Record<string, TrustChoice>; assumeNoWriter?: boolean }
@@ -39,6 +40,11 @@ export class RpcSubprocessDriver implements SessionDriver {
   constructor(private readonly broker: BridgeBroker, private readonly options: DriverOptions,
     private readonly acquireWriter = acquireSessionWriterLock) { duration(options.readyTimeoutMs, 10000); }
   async start(spec: DriverSpec, callbacks: DriverCallbacks, signal?: AbortSignal): Promise<DriverHandle> {
+    const owner = this.broker.inflight.owner("driver.writer");
+    try { return await owner.run("start", () => this.performStart(spec, callbacks, owner, signal)); }
+    catch (error) { owner.close(); throw error; }
+  }
+  private async performStart(spec: DriverSpec, callbacks: DriverCallbacks, owner: InflightOwner, signal?: AbortSignal): Promise<DriverHandle> {
     signal?.throwIfAborted();
     const lock = await acquireRecoveredWriter(spec.sessionFile, this.options.home, this.options.instanceId,
       { ...this.options.stopOptions, assumeNoWriter: spec.assumeNoWriter }, this.acquireWriter, callbacks.onCleanupFailure);
@@ -59,14 +65,14 @@ export class RpcSubprocessDriver implements SessionDriver {
     } catch (error) {
       launch.close(); await release(); throw error;
     }
-    handle = new RpcHandle(proc, lock, launch.close, spec, callbacks, this.options, this.acquireWriter); attachHandle();
+    handle = new RpcHandle(proc, lock, launch.close, spec, callbacks, this.options, this.acquireWriter, this.broker.inflight, owner); attachHandle();
     try {
       // spawn 可能晚于取消返回；先交付 handle，再检查取消，停止无需等待首次持久化或 ready。
       callbacks.onHandle?.(handle);
       if (signal?.aborted) { await handle.stop(); signal.throwIfAborted(); }
       await handle.persist(); return handle;
     }
-    catch (error) { await handle.stop(); throw error; }
+    catch (error) { try { await handle.stop(); } finally { await handle.drain(); } throw error; }
   }
 }
 class RpcHandle implements DriverHandle {
@@ -80,11 +86,13 @@ class RpcHandle implements DriverHandle {
   private targets = new Set<Promise<boolean>>(); private cleanupErrors: unknown[] = [];
   constructor(private readonly proc: ManagedProcess, lock: SessionWriterLock, private readonly revoke: () => void,
     private readonly spec: DriverSpec, private readonly callbacks: DriverCallbacks, private readonly options: DriverOptions,
-    private readonly acquireWriter: typeof acquireSessionWriterLock) {
+    private readonly acquireWriter: typeof acquireSessionWriterLock, private readonly inflight: Inflight, private readonly owner: InflightOwner) {
     this.identity = proc.identity; this.current = lock; this.locks.set(fileKey(lock.sessionFile), lock);
     this.recordFile = path.join(options.home, "run", `${proc.identity.runId}.json`);
     this.ready = new Promise((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; }); this.ready.catch(() => {});
     this.exited = new Promise((resolve) => { this.resolveExit = resolve; });
+    // 资源 owner 覆盖空闲持锁、停止及迟到清理；失败另外交给实例保存，不能阻塞排空本身。
+    void this.exited.then(() => this.drain()).then(() => owner.close(), error => { callbacks.onCleanupFailure?.(error); owner.close(); });
     this.listeners.push(proc.rpc.onEvent((event) => callbacks.onRecord(event)), proc.rpc.onUiRequest((event) => callbacks.onRecord(event)), proc.rpc.onError((error) => {
       if (carriesUnconfirmedCleanup(error)) callbacks.onCleanupFailure?.(error);
       this.fail("RPC 传输故障", error);
@@ -94,11 +102,15 @@ class RpcHandle implements DriverHandle {
     void proc.exited.then((info) => { if (!this.stopping) this.fail(this.started ? "pi 进程意外退出" : `pane-bridge 就绪前退出（${info.code}）：${proc.stderrTail()}`); });
   }
   private hostkit<T>(operation: () => Promise<T>, cleanup = false): Promise<T> {
-    return observeHostkit(operation, this.callbacks.onCleanupFailure, cleanup);
+    return this.owner.run("hostkit", () => observeHostkit(operation, this.callbacks.onCleanupFailure, cleanup));
   }
   get sessionFile(): string { return this.current.sessionFile; }
   get acceptingInput(): boolean { return this.enabled && !this.stopping; }
   persist(): Promise<void> {
+    if (this.stopping) return this.persistence;
+    return this.owner.run("persist", () => this.performPersist());
+  }
+  private performPersist(): Promise<void> {
     const write = this.persistence.then(async () => {
       if (this.stopping) return;
       await this.writeRecord();
@@ -116,7 +128,7 @@ class RpcHandle implements DriverHandle {
     this.timer = setTimeout(() => this.fail("pane-bridge 就绪超时，请重启会话"), duration(this.options.readyTimeoutMs, 10000)); this.timer.unref();
   }
   private target(file: string): Promise<boolean> {
-    const operation = this.acquireTarget(file); this.targets.add(operation);
+    const operation = this.owner.run("target", () => this.acquireTarget(file)); this.targets.add(operation);
     void operation.then(() => this.targets.delete(operation), (error) => {
       this.targets.delete(operation);
       // 关闭期间恢复失败可能留下隔离锁；不能把失败当作已排空并释放实例锁。
@@ -138,7 +150,8 @@ class RpcHandle implements DriverHandle {
     await this.hostkit(() => lock.update({ writer: this.identity, state: "running" }));
     assert(!this.stopping, "bridgeStopping", "会话正在停止", 409); return true;
   }
-  async bridgeEvent(event: any): Promise<any> {
+  bridgeEvent(event: any): Promise<any> { return this.inflight.run("driver.bridgeEvent", () => this.performBridgeEvent(event)); }
+  private async performBridgeEvent(event: any): Promise<any> {
     assert(!this.stopping, "bridgeStopping", "会话正在停止", 409);
     switch (event.type) {
       case "trust": {
@@ -168,8 +181,10 @@ class RpcHandle implements DriverHandle {
         assert(typeof event.sessionFile === "string" && typeof event.sessionId === "string", "invalidReady", "pane-bridge 缺少会话身份");
         const generation = this.generation;
         // session_start 处理器等待此 HTTP 回应；RPC 在回应之后才会处理初始化命令。
-        setImmediate(() => {
-          this.initialization = this.initialization.then(async () => {
+        // 调度时即登记；关闭不能越过尚未进入 setImmediate 的初始化。
+        const scheduled = new Promise<void>(resolve => setImmediate(resolve));
+        this.initialization = this.owner.run("initialize", () => this.initialization.then(async () => {
+            await scheduled;
             if (this.stopping || generation !== this.generation) return;
             if (this.switchFailure) throw this.switchFailure;
             const destination = this.locks.get(fileKey(event.sessionFile));
@@ -189,8 +204,7 @@ class RpcHandle implements DriverHandle {
             this.callbacks.onReady({ ...state.data, projectTrusted: event.trusted, cwd: event.cwd }, entries.data, event.reason, this);
             if (this.stopping || generation !== this.generation) return;
             this.enabled = true; this.started = true; clearTimeout(this.timer); this.resolveReady();
-          }).catch((error) => this.fail("pane-bridge 重绑定失败", error));
-        });
+          })).catch((error) => this.fail("pane-bridge 重绑定失败", error));
         return { accepted: true };
       }
       default: throw new PaneError("unknownBridgeEvent", "不支持此 pane-bridge 请求");
@@ -199,7 +213,10 @@ class RpcHandle implements DriverHandle {
   private raw(command: RpcCommand, timeoutMs = this.options.rpcTimeoutMs ?? 30000, trackResult = false): Promise<any> {
     return this.hostkit(() => this.proc.rpc.send(command, trackResult ? {} : { timeoutMs })).then((response) => { assert(response.success, "rpcRejected", response.error ?? "pi 拒绝命令", 409); return response; });
   }
-  async send(command: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse> {
+  send(command: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse> {
+    return this.inflight.run("driver.send", () => this.performSend(command, opts));
+  }
+  private async performSend(command: RpcCommand, opts?: { timeoutMs?: number; trackResult?: boolean }): Promise<RpcResponse> {
     assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪或会话正在停止", 409);
     let response: RpcResponse;
     try { response = await this.raw(command, opts?.timeoutMs, opts?.trackResult); }
@@ -226,7 +243,12 @@ class RpcHandle implements DriverHandle {
     }
     return response;
   }
-  respondUi(response: ExtensionUiResponse): void { assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪", 409); observeHostkitSync(() => this.proc.rpc.respondUi(response), this.callbacks.onCleanupFailure); }
+  respondUi(response: ExtensionUiResponse): void {
+    this.inflight.runSync("driver.respondUi", () => {
+      assert(this.acceptingInput, "bridgeNotReady", "pane-bridge 尚未就绪", 409);
+      observeHostkitSync(() => this.proc.rpc.respondUi(response), this.callbacks.onCleanupFailure);
+    });
+  }
   private fail(reason: string, error?: unknown): void {
     if (this.stopping) return;
     this.fatalReason = `${reason}${error ? `：${String(error)}` : ""}`;
@@ -236,7 +258,7 @@ class RpcHandle implements DriverHandle {
   stop(): Promise<StopReport> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true; this.enabled = false; clearTimeout(this.timer); this.revoke();
-    this.stopPromise = this.performStop(); return this.stopPromise;
+    this.stopPromise = this.owner.run("stop", () => this.performStop()); return this.stopPromise;
   }
   async drain(): Promise<void> {
     // exited 只表示退出回调已执行；排空必须同时保留缓存的停止结果及迟到清理错误。
