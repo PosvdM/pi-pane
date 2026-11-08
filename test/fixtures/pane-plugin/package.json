@@ -1,0 +1,9 @@
+{
+  "name": "pane-plugin-test-fixture",
+  "private": true,
+  "type": "module",
+  "piPane": {
+    "entry": "./plugin.mjs",
+    "paneProtocol": [1, 1]
+  }
+}
