@@ -256,7 +256,9 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[]):
           const live = current.get()!.model!;
           // 响应中的快照可能落后于已收到的事件；只取更新的 revision 和托管状态。
           if ((result.snapshot.controlRevision ?? 0) > (live.view.controlRevision ?? 0) && result.snapshot.cursor.epoch === live.view.cursor.epoch) live.view.controlRevision = result.snapshot.controlRevision;
-          if (result.snapshot.hosted && !live.view.hosted) { live.view.hosted = true; live.view.readonly = result.snapshot.readonly; live.view.readonlyReason = result.snapshot.readonlyReason; void refreshAuxiliary(); }
+          // 托管状态同样只接受不旧于当前视图的快照：迟到的响应不能把已关闭的会话改回托管。
+          const fresh = result.snapshot.cursor.epoch === live.view.cursor.epoch && (result.snapshot.controlRevision ?? 0) >= (live.view.controlRevision ?? 0);
+          if (result.snapshot.hosted && !live.view.hosted && fresh) { live.view.hosted = true; live.view.readonly = result.snapshot.readonly; live.view.readonlyReason = result.snapshot.readonlyReason; void refreshAuxiliary(); }
           // 只有不旧于当前视图的快照才更新状态；迟到的响应不能覆盖其他标签页之后的修改。
           if (result.snapshot.state && result.snapshot.cursor.epoch === live.view.cursor.epoch && (result.snapshot.controlRevision ?? 0) >= (live.view.controlRevision ?? 0)) { live.view.state = result.snapshot.state; stateQuery++; }
           current.touch();
