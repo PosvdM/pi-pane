@@ -30,7 +30,7 @@ function Project({ cwd, items, activeFile }: { cwd: string; items: PaneSessionLi
         <button class="icon-btn" title="在此项目新建会话" data-testid="new-in-project" onClick={() => void openFile(cwd)}>＋</button>
       </div>
       {[...recent, ...history.slice(0, shown)].map((item) => (
-        <button key={item.sessionFile} class={"session-item" + (item.sessionFile === activeFile ? " active" : "")} data-testid="session-item" title={item.sessionFile}
+        <button key={item.sessionFile} class={"session-item" + (item.sessionFile === activeFile ? " active" : "")} data-testid="session-item" title={`${label(item)}\n${item.sessionFile}`}
           onClick={() => void openFile(item.cwd, item.sessionFile)}>
           <span class={"status-dot s-" + (item.hosted ? item.status ?? "idle" : "none")} />
           <span class="session-label">{label(item)}</span>

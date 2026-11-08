@@ -50,7 +50,7 @@ a { color: var(--accent); }
 .pair-card h1 { margin: 0; font-size: 22px; }
 
 /* 布局 */
-.layout { display: grid; grid-template-columns: 280px 1fr; height: 100%; }
+.layout { display: grid; grid-template-columns: 280px 1fr; grid-template-rows: minmax(0, 1fr); height: 100vh; overflow: hidden; }
 .layout.no-sidebar { grid-template-columns: 0 1fr; }
 .sidebar { background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 .sidebar.closed { visibility: hidden; }
@@ -74,7 +74,7 @@ a { color: var(--accent); }
 .status-dot.s-waiting, .status-dot.s-paused { background: var(--warn); border-color: var(--warn); }
 @keyframes pulse { from { opacity: 1; } to { opacity: .3; } }
 
-.main { position: relative; display: flex; flex-direction: column; min-width: 0; height: 100%; }
+.main { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; }
 .sidebar-toggle { position: absolute; left: 6px; top: 10px; z-index: 2; }
 .placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--muted); text-align: center; }
 .net-banner { background: var(--warn-soft); color: var(--warn); text-align: center; padding: 3px; font-size: 12px; }
@@ -182,7 +182,7 @@ a { color: var(--accent); }
 .option.active { background: var(--accent-soft); border-color: var(--accent); }
 .kv { border-collapse: collapse; width: 100%; font-size: 13px; }
 .kv th { text-align: left; color: var(--muted); font-weight: normal; padding: 3px 12px 3px 0; white-space: nowrap; vertical-align: top; }
-.kv td { word-break: break-all; }
+.kv td { overflow-wrap: anywhere; }
 .select { user-select: all; word-break: break-all; }
 .toasts { position: fixed; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 8px; z-index: 40; max-width: 380px; }
 .toast { display: flex; gap: 8px; align-items: flex-start; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 6px; padding: 8px 10px; box-shadow: 0 4px 14px rgba(0,0,0,.12); font-size: 13px; }
