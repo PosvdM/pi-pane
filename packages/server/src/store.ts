@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
 import { readFile, copyFile, mkdtemp, rm, writeFile, mkdir, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -49,16 +48,7 @@ export function branch(entries: readonly Entry[], leafId: string | null): Entry[
   return result.reverse();
 }
 export function fileKey(file: string): string {
-  let canonical: string;
-  try { canonical = realPathOrPending(file); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOTDIR") throw error;
-    // hostkit#6：https://github.com/PosvdM/pi-hostkit/issues/6。
-    // 文件可能在 realpath 的 ENOENT 与 lstat 之间首次落盘；只复核一次，仍失败则拒绝。
-    // 固定依赖升级至该竞态修复版本后移除这层复核。
-    canonical = realpathSync.native(file);
-  }
-  return comparisonKey(canonical);
+  return comparisonKey(realPathOrPending(file));
 }
 export class PiStore {
   private modules?: Promise<any>;
