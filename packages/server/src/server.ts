@@ -1,5 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import type { Duplex } from "node:stream";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +59,7 @@ export class PaneServer {
   readonly auth = new AuthStore(); readonly broker = new BridgeBroker(); readonly assets: AssetStore;
   readonly sessions: Sessions; readonly trust: TrustDecisions; readonly http: http.Server;
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024, perMessageDeflate: false });
+  private readonly upgrades = new Set<Duplex>(); private stopping = false;
   private readonly clients = new Set<Client>(); private port = 0; private lock?: HeldLock; private sweep?: ReturnType<typeof setInterval>; private closePromise?: Promise<void>;
   private constructor(private readonly options: PaneServerOptions, private readonly store: PiStore) {
     this.assets = new AssetStore(options.home);
@@ -68,8 +70,10 @@ export class PaneServer {
     this.http = http.createServer((req, res) => { void this.request(req, res).catch((error) => this.error(res, error)); });
     this.http.requestTimeout = 65000; this.http.headersTimeout = 10000; this.http.keepAliveTimeout = 5000;
     this.http.on("upgrade", (req, socket, head) => {
+      if (this.stopping) { socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", () => socket.destroy()); return; }
       if (!checkOrigin(req.headers, this.port) || req.url !== "/ws") { socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return; }
-      this.wss.handleUpgrade(req, socket, head, (ws) => this.connection(ws));
+      this.upgrades.add(socket); socket.once("close", () => this.upgrades.delete(socket));
+      this.wss.handleUpgrade(req, socket, head, (ws) => { this.upgrades.delete(socket); this.connection(ws); });
     });
     this.auth.onRevoke((credential) => { for (const client of this.clients) if (client.credential === credential) this.closeClient(client, 4403, "凭证已失效"); });
   }
@@ -100,13 +104,15 @@ export class PaneServer {
     if (res.headersSent) { res.destroy(); return; }
     sendJson(res, Number.isInteger(error.status) ? error.status : 500, { error: error.code ?? "internalError", message: error.status ? error.message : "服务端处理失败", instanceId: this.auth.instanceId });
   }
+  private assertAccepting(): void { assert(!this.stopping, "serverStopping", "服务端正在关闭", 503); }
   private async request(req: IncomingMessage, res: ServerResponse): Promise<void> {
     this.headers(res); assert(checkOrigin(req.headers, this.port), "badOrigin", "只允许规范的本机来源", 403);
     const url = new URL(req.url ?? "/", this.origin); const pathname = url.pathname;
     if (req.method === "GET" && pathname === "/api/instance") { sendJson(res, 200, { instanceId: this.auth.instanceId, paneProtocol: 1 }); return; }
-    if (req.method === "POST" && pathname === "/api/auth/pair") { sendJson(res, 200, this.auth.pair((await jsonBody(req, 4096)).code)); return; }
+    this.assertAccepting();
+    if (req.method === "POST" && pathname === "/api/auth/pair") { const body = await jsonBody(req, 4096); this.assertAccepting(); sendJson(res, 200, this.auth.pair(body.code)); return; }
     if (req.method === "POST" && pathname.startsWith("/bridge/")) {
-      const body = await jsonBody(req, 65536);
+      const body = await jsonBody(req, 65536); this.assertAccepting();
       if (pathname === "/bridge/launch") sendJson(res, 200, this.broker.launch(body.ticket));
       else if (pathname === "/bridge/event") sendJson(res, 200, await this.broker.event(bearer(req), body));
       else throw new PaneError("notFound", "接口不存在", 404);
@@ -121,29 +127,29 @@ export class PaneServer {
       if (req.method === "GET" && pathname === "/api/trust") { sendJson(res, 200, { requests: this.trust.list() }); return; }
       const trust = pathname.match(/^\/api\/trust\/([^/]+)$/);
       if (req.method === "POST" && trust) {
-        const body = await jsonBody(req); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.trust.answer(trust[1], body.decision); return { status: "done" }; })); return;
+        const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); this.trust.answer(trust[1], body.decision); return { status: "done" }; })); return;
       }
       if (req.method === "POST" && pathname === "/api/sessions/open") {
-        const body = await jsonBody(req); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, () => this.sessions.open(body))); return;
+        const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, () => { this.assertAccepting(); return this.sessions.open(body); })); return;
       }
       const route = pathname.match(/^\/api\/sessions\/([^/]+)\/(snapshot|history|control|query|ui)$/);
       if (route) {
         const id = decodeURIComponent(route[1]); const operation = route[2];
         if (req.method === "GET" && operation === "snapshot") { sendJson(res, 200, this.sessions.snapshot(id)); return; }
         if (req.method === "GET" && operation === "history") { sendJson(res, 200, this.sessions.history(id, url.searchParams.get("before") ?? "", Number(url.searchParams.get("limit") ?? 50))); return; }
-        if (req.method === "POST" && operation === "control") { sendJson(res, 200, await this.sessions.command(id, await jsonBody(req))); return; }
-        if (req.method === "POST" && operation === "query") { sendJson(res, 200, await this.sessions.query(id, (await jsonBody(req)).type)); return; }
-        if (req.method === "POST" && operation === "ui") { const body = await jsonBody(req); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => this.sessions.respondUi(id, body))); return; }
+        if (req.method === "POST" && operation === "control") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.command(id, body)); return; }
+        if (req.method === "POST" && operation === "query") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.query(id, body.type)); return; }
+        if (req.method === "POST" && operation === "ui") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); return this.sessions.respondUi(id, body); })); return; }
       }
       if (req.method === "POST" && pathname === "/api/assets") {
-        const parts = await upload(req); const id = req.headers["x-request-id"];
+        const parts = await upload(req); this.assertAccepting(); const id = req.headers["x-request-id"];
         assert(typeof id === "string", "invalidRequestId", "上传必须提供 X-Request-Id");
-        const { hashId } = await import("./assets.js");
-        sendJson(res, 200, await this.sessions.ledger.execute(id, { path: pathname, image: hashId(parts.image), thumb: hashId(parts.thumb), mimeType: parts.mimeType }, async () => this.assets.upload(parts.image, parts.mimeType, parts.thumb))); return;
+        const { hashId } = await import("./assets.js"); this.assertAccepting();
+        sendJson(res, 200, await this.sessions.ledger.execute(id, { path: pathname, image: hashId(parts.image), thumb: hashId(parts.thumb), mimeType: parts.mimeType }, async () => { this.assertAccepting(); return this.assets.upload(parts.image, parts.mimeType, parts.thumb); })); return;
       }
       if (req.method === "POST" && pathname === "/api/assets/touch") {
-        const body = await jsonBody(req); assert(Array.isArray(body.assetIds) && body.assetIds.length <= 10000, "invalidAssetIds", "图片标识列表无效");
-        sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => this.assets.touch(body.assetIds))); return;
+        const body = await jsonBody(req); this.assertAccepting(); assert(Array.isArray(body.assetIds) && body.assetIds.length <= 10000, "invalidAssetIds", "图片标识列表无效");
+        sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); return this.assets.touch(body.assetIds); })); return;
       }
       const asset = pathname.match(/^\/api\/(assets|blobs)\/(sha256-[a-f0-9]{64})(\/thumb)?$/);
       if (req.method === "GET" && asset) {
@@ -170,12 +176,14 @@ export class PaneServer {
     throw new PaneError("notFound", "M1 只提供服务端接口，Web 界面在 M2 实现", 404);
   }
   private connection(ws: WebSocket): void {
+    if (this.stopping) { ws.on("error", () => {}); ws.terminate(); return; }
     const client: Client = { ws, id: randomUUID(), state: "pending", subscriptions: new Map(), pending: [], pendingBytes: 0, needsResync: new Map() }; this.clients.add(client);
     const timeout = setTimeout(() => this.closeClient(client, 4401, "首帧鉴权超时"), 5000); timeout.unref();
     const flush = setInterval(() => this.flush(client), 25); flush.unref();
     ws.on("error", () => this.closeClient(client, 1011, "连接故障"));
     ws.on("close", () => { clearTimeout(timeout); clearInterval(flush); client.state = "closed"; for (const off of client.subscriptions.values()) off(); client.subscriptions.clear(); this.clients.delete(client); });
     ws.on("message", (raw, binary) => {
+      if (this.stopping) { this.closeClient(client, 1001, "服务端停止"); ws.terminate(); return; }
       if (client.state === "closed") return;
       try {
         assert(!binary, "invalidFrame", "只接受 JSON 文本帧"); const message = JSON.parse(raw.toString());
@@ -222,14 +230,22 @@ export class PaneServer {
     for (const item of client.needsResync.values()) client.ws.send(JSON.stringify(item)); client.needsResync.clear();
   }
   close(): Promise<void> {
-    if (!this.closePromise) this.closePromise = this.performClose();
+    if (!this.closePromise) { this.stopping = true; this.closePromise = this.performClose(); }
     return this.closePromise;
+  }
+  private terminateConnections(): void {
+    for (const socket of this.upgrades) socket.destroy();
+    for (const client of this.clients) { this.closeClient(client, 1001, "服务端停止"); client.ws.terminate(); }
+    // wss 也包含握手已完成、尚未交付 connection 回调的连接。
+    for (const ws of this.wss.clients) ws.terminate();
   }
   private async performClose(): Promise<void> {
     clearInterval(this.sweep);
-    for (const client of this.clients) { this.closeClient(client, 1001, "服务端停止"); client.ws.terminate(); }
+    this.terminateConnections();
     const errors: unknown[] = []; const inflight = this.sessions.inflight;
     try { await this.sessions.close(); } catch (error) { errors.push(error); }
+    // 网络收尾前再次终结连接，覆盖关闭等待期间的迟到交付。
+    this.terminateConnections();
     // 同时关闭监听与 WebSocket；任一回调缺失都不能阻止另一项开始收尾。
     try {
       await inflight.wait(Promise.all([

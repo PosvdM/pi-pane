@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { WebSocket } from "ws";
 import { acquireInstanceLock } from "pi-hostkit";
-import { piFixture, until } from "./fixtures/helpers.mjs";
+import { piFixture } from "./fixtures/helpers.mjs";
 import { startServer, pair, request } from "./fixtures/client.mjs";
 
 function gate() {
@@ -49,7 +50,7 @@ test("关闭等待健康在途工作时拒绝 ticket 与重连，正常释放实
     const error = await within(closing);
     assert.equal(error, undefined, "健康关闭不能被关闭期间的新 WebSocket 拖成 shutdownTimeout");
     assert.equal(issued.code, 503); assert.equal(issued.value.error, "serverStopping");
-    assert.notEqual(outcome, "authed"); await within(connection.closed);
+    assert.equal(outcome, 503, "新 upgrade 在握手之前返回 HTTP 503"); await within(connection.closed);
     await assertReleased(server, f.root + "/pane");
   } finally {
     work.release(); connection?.ws.terminate(); await closing; await server.close().catch(() => {}); await server.lock.release(); await f.cleanup();
@@ -80,6 +81,30 @@ for (const phase of ["before-handshake", "after-handshake"]) test(`关闭终结�
   }
 });
 
+for (const kind of ["pair", "upload"]) test(`关闭前进入的 ${kind} 请求在读完请求体后复查门禁`, { timeout: 15000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f); const work = gate(); const entered = gate(); let closing; let req;
+  try {
+    const token = await pair(server); const code = server.auth.issuePairCode(); let uploads = 0;
+    server.assets.upload = () => { uploads++; throw new Error("关闭后不能上传"); };
+    const accepted = server.sessions.inflight.run("test.healthy-work", () => work.promise);
+    const body = kind === "pair" ? JSON.stringify({ code }) :
+      '--boundary\r\nContent-Disposition: form-data; name="image"; filename="image.png"\r\nContent-Type: image/png\r\n\r\nimage\r\n' +
+      '--boundary\r\nContent-Disposition: form-data; name="thumb"; filename="thumb.png"\r\nContent-Type: image/png\r\n\r\nthumb\r\n--boundary--\r\n';
+    server.http.once("request", incoming => incoming.once("data", () => entered.release()));
+    const response = new Promise((resolve, reject) => {
+      req = http.request(server.origin + (kind === "pair" ? "/api/auth/pair" : "/api/assets"), {
+        method: "POST", headers: { Authorization: "Bearer " + token, "X-Request-Id": "shutdown-upload", "Content-Type": kind === "pair" ? "application/json" : "multipart/form-data; boundary=boundary" },
+      }, res => { const chunks = []; res.on("data", chunk => chunks.push(chunk)); res.on("end", () => resolve({ code: res.statusCode, value: JSON.parse(Buffer.concat(chunks).toString()) })); });
+      req.on("error", reject); req.write(body.slice(0, -1));
+    });
+    await within(entered.promise); closing = server.close(); req.end(body.slice(-1));
+    const result = await within(response);
+    assert.equal(result.code, 503); assert.equal(result.value.error, "serverStopping"); assert.equal(uploads, 0);
+    if (kind === "pair") assert.ok(server.auth.pair(code).credential, "迟到请求未消费配对码");
+    work.release(); await accepted; await closing; await assertReleased(server, f.root + "/pane");
+  } finally { work.release(); req?.destroy(); await closing?.catch(() => {}); await server.close().catch(() => {}); await server.lock.release(); await f.cleanup(); }
+});
+
 test("关闭期间仅保留实例探测，其他 HTTP 入口统一返回 serverStopping", { timeout: 15000 }, async () => {
   const f = await piFixture(); const server = await startServer(f); const work = gate(); let closing;
   try {
@@ -91,7 +116,9 @@ test("关闭期间仅保留实例探测，其他 HTTP 入口统一返回 serverS
       ["GET", "/api/sessions"], ["GET", "/api/trust"], ["POST", "/api/trust/test"], ["POST", "/api/sessions/open"],
       ...["snapshot", "history", "control", "query", "ui"].map(operation => [operation === "snapshot" || operation === "history" ? "GET" : "POST", "/api/sessions/test/" + operation]),
       ["POST", "/api/assets"], ["POST", "/api/assets/touch"], ["GET", "/api/assets/sha256-" + "a".repeat(64)],
-      ["GET", "/api/blobs/sha256-" + "a".repeat(64)], ["POST", "/bridge/launch"], ["POST", "/bridge/event"], ["GET", "/"],
+      ["GET", "/api/assets/sha256-" + "a".repeat(64) + "/thumb"], ["GET", "/api/blobs/sha256-" + "a".repeat(64)],
+      ["GET", "/api/blobs/sha256-" + "a".repeat(64) + "/thumb"], ["POST", "/bridge/launch"], ["POST", "/bridge/event"],
+      ["GET", "/"], ["GET", "/unknown"], ["PUT", "/api/sessions/open"],
     ]) {
       const result = await request(server, token, route, method === "POST" ? {} : undefined, method);
       assert.equal(result.code, 503, method + " " + route); assert.equal(result.value.error, "serverStopping");
