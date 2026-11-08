@@ -126,13 +126,14 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 | 加载、版本与生命周期 | `plugins-runtime`：本地和 npm 定位符、包与实例双重版本范围、拒绝无效或重复 id、按配置顺序加载、激活失败、迟到 fence、私有目录、来源映射和幂等停用。 |
 | 超时与异常隔离 | `plugins-runtime`、`plugins-operations`：同步抛错、异步拒绝、超时后迟到成功或失败；`plugins-http`：插件失败后真实主会话仍能发送并完成 RPC，同步订阅抛错不关闭共享 WebSocket 或主会话订阅。 |
 | 按需树与重连 | `plugins-main-tree`：热节点及祖先、keyset 分页、epoch、修订号、删除与 2000 条重放边界；`plugin-api-contract`：插件树与流的快照切点、分页、reset；`plugins-host`：循环与无效能力；`plugins-http`：HTTP 快照和 WS 实时变化。 |
-| 只读子会话、面板与渲染目录 | `plugins-http`：快照、流、面板与静态动作目录；`plugins-host`：会话图片提取、来源隔离、渲染器冲突按配置顺序选择及停用清理。 |
-| 动作、发送和表单幂等 | `plugins-operations`：共享键命名空间、内容冲突、并发 pending、返回 pending 后查询、真正迟到的最终结果、24 小时保留、容量限制与原样来源传递；`plugins-http`：浏览器同键重试。 |
+| 只读子会话、面板与渲染目录 | `plugins-http`：快照、流、面板与静态动作目录；`plugins-host`：会话图片提取、来源隔离、渲染器冲突按配置顺序选择、停用清理和退订后的迟到回调隔离。 |
+| 动作、发送和表单幂等 | `plugins-operations`：共享键命名空间、内容冲突、并发 pending、返回 pending 后查询、真正迟到的最终结果、24 小时保留、容量限制与原样来源传递；`plugins-http`：浏览器同键重试，真实确认超时后以原键再次确认并完成。 |
 | 持久表单与待处理区 | `plugins-operations`：排序、revision、权威对齐和并发事件、双标签页 claim、失败释放、cancel、过期由插件裁定；`plugins-http`：两标签页提交仅一次接受，`formRemoved` 包含来源，浏览器重连/tree reset 对齐、并发查询合并及异常隔离。 |
 | 用户在场确认 | `plugins-presence`：凭证与连接绑定、origin 优先与广播回退、首个有效回应、连接断开、严格 JSON、超时/拒绝/停用关闭帧；`plugins-http`：真实 HTTP/WS 路由，其他连接不能结束挑战。 |
 | 保活与主动关闭 | `plugins-holds`：仅列托管、读取历史、预登记 hold、多重 hold、空闲回收、关闭二次确认、旧 release 空操作、进程切换不迁移 hold；`plugins-host`：失败和停用释放插件资源。 |
 | 横幅故障 | `plugins-banners`：原子写、重启、加载失败/停用保留 persistent 并标注不可用、来源恢复后 listBanners 与显式清除、配置移除二次确认/审计、I/O 失败保留旧状态；`plugins-http`：新连接重发、停用和重启、禁止删除仍配置来源。 |
 | 通知、鉴权与关闭门禁 | `plugins-host`：通知按来源去重；`plugins-http`：所有读写使用浏览器凭证；`shutdown-ingress`：插件全路由统一拒绝关闭后的请求，multipart 解析前不插入无关异步路由；`backpressure`：同名不同来源的增量与 resync 隔离。 |
+| 主会话名称 | `plugins-main-title`：真实 pi 改名、扩展清空名称及只读文件更新，同步反映在 mainSessions、树订阅和新快照，状态缓存不覆盖较新名称。 |
 | 公共 API 契约 | `plugin-api-contract`：导出类型与真实示例实现的 TypeScript 编译、原生 RPC 不外泄、当前与上一版本范围协商、畸形范围拒绝，以及测试插件完整能力与故障。 |
 
 ## 图片上限观测

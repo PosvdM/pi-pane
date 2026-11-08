@@ -201,7 +201,7 @@ export default function createPlugin() {
           else if (content.actionId === 'sample.throw') throw new Error('示例动作异常');
           else if (content.actionId === 'sample.presence') {
             if (!ctx) throw new Error('示例插件未激活');
-            await ctx.userPresence.confirm({ title: '确认测试动作', summary: '请确认示例动作的输入。', payload: content.input?.fields ?? {}, origin });
+            await ctx.userPresence.confirm({ title: '确认测试动作', summary: '请确认示例动作的输入。', payload: content.input?.fields ?? {}, origin, ...(content.input?.fields?.timeoutMs === undefined ? {} : { timeoutMs: Number(content.input.fields.timeoutMs) }) });
           } else if (content.actionId === 'sample.emit') {
             child.revision = ++revision;
             /** @type {TreeChange} */

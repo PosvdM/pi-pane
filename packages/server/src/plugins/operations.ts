@@ -337,6 +337,10 @@ export class PluginOperations {
     const running = Promise.resolve().then(run).then(result => {
       const copy = snapshot(result); checkResult(kind, source, copy); return copy;
     }).catch((error): Result => {
+      if (error && typeof error === "object" && (error.code === "timeout" || error.code === "pluginTimeout")) {
+        try { console.warn(`插件 ${source} 的 ${kind} 操作超时，保留原请求标识查询`); } catch { /* 日志故障不影响事务状态。 */ }
+        return unknownResult();
+      }
       try { console.error(`插件 ${source} 的 ${kind} 操作失败：`, error); } catch { /* 日志故障不影响事务结果。 */ }
       return kind === "send" ? { status: "rejected", message: "插件操作失败" } : { status: "failed", message: "插件操作失败" };
     }).then(result => {

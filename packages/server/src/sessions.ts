@@ -17,7 +17,7 @@ import { observeHostkit } from "./hostkit-cleanup.js";
 
 interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
-  state?: any; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>; clients: number; lastActive: number;
+  state?: any; name?: { value: string | undefined }; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>; clients: number; lastActive: number;
   holds: Map<string, { source: string; reason: string }>; ui: Map<string, ExtensionUiRequest>; recentExternal: boolean; closed: boolean;
 }
 const mutations = new Set(["prompt", "steer", "follow_up", "stop", "close", "restart", "set_model", "set_thinking_level", "compact", "new_session", "fork", "clone", "set_session_name"]);
@@ -115,6 +115,7 @@ export class Sessions {
     const existing = this.files.get(fileKey(file)); if (existing) return this.view(existing);
     assert(!this.records.has(id), "sessionIdentityConflict", "另一个文件使用了相同的会话标识", 409);
     const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), clients: 0, lastActive: Date.now(), holds: this.holdsFor(id), ui: new Map(), recentExternal, closed: false };
+    this.readName(session, parsed.entries);
     this.records.set(id, session); this.files.set(fileKey(file), session);
     this.watch(file); this.mainChanged();
     return { ...this.view(session), diagnostics: parsed.diagnostics, ...(busy.held ? { heldBy: busy.record?.host.app } : {}), ...(recentExternal ? { warning: "recentModification" } : {}) };
@@ -125,7 +126,9 @@ export class Sessions {
       if (!session || session.handle || session.closed || current.mtimeMs === previous.mtimeMs && current.size === previous.size) return;
       const model = session.model; const epoch = model.epoch; const owner = session.owner;
       void readSession(file).then((parsed) => {
-        if (!session.handle && !session.closed && session.owner === owner && this.files.get(fileKey(file)) === session && session.model === model && model.epoch === epoch) model.reset(parsed.entries, parsed.leafId);
+        if (!session.handle && !session.closed && session.owner === owner && this.files.get(fileKey(file)) === session && session.model === model && model.epoch === epoch) {
+          model.reset(parsed.entries, parsed.leafId); this.readName(session, parsed.entries); this.mainChanged();
+        }
       }).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     });
   }
@@ -144,9 +147,25 @@ export class Sessions {
   private holdsFor(id: string): Map<string, { source: string; reason: string }> {
     let holds = this.pluginHolds.get(id); if (!holds) { holds = new Map(); this.pluginHolds.set(id, holds); } return holds;
   }
+  private fallbackTitle(session: HostedSession): string {
+    const message = session.model.entries.find((entry) => entry.type === "message" && entry.message?.role === "user")?.message;
+    const content = message?.content;
+    const text = typeof content === "string" ? content : Array.isArray(content) ? content.filter((block: any) => block?.type === "text").map((block: any) => block.text ?? "").join("\n") : "";
+    let title = ""; let length = 0;
+    for (const character of text.trim()) { if (length++ === 200) break; title += character; }
+    return title || session.id;
+  }
+  private setName(session: HostedSession, value: string | undefined): void {
+    session.name = { value };
+    if (session.state) session.state = { ...session.state, sessionName: value };
+  }
+  private readName(session: HostedSession, entries: Entry[]): void {
+    const info = entries.findLast((entry) => entry.type === "session_info");
+    this.setName(session, typeof info?.name === "string" ? info.name : undefined);
+  }
   private mainInfo(session: HostedSession): MainSessionInfo {
     return { ref: { source: "pane", id: session.id }, nodeId: `pane:session:${session.id}`, cwd: session.cwd, sessionFile: session.file,
-      title: session.state?.sessionName ?? this.knownMain.get(session.id)?.title ?? session.id,
+      title: session.name ? session.name.value ?? this.fallbackTitle(session) : this.knownMain.get(session.id)?.title ?? this.fallbackTitle(session),
       hosted: !!session.handle, status: session.model.status };
   }
   private mainChanged(): void { for (const listener of this.mainListeners) { try { listener(); } catch (error) { console.error("主会话状态监听失败：", error); } } }
@@ -329,7 +348,7 @@ export class Sessions {
         this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
       }
     }
-    session.state = state; session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
+    session.state = state; this.setName(session, state.sessionName); session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
     session.model.reset(data.entries as Entry[], data.leafId); session.model.control("idle", "idle", undefined, true); session.recentExternal = false;
     this.mainChanged(); return session;
   }
@@ -340,6 +359,7 @@ export class Sessions {
       this.emitUi(session.id, event); return;
     }
     const previousStatus = session.model.status;
+    if (event.type === "session_info_changed" && (typeof event.name === "string" || event.name === undefined)) this.setName(session, event.name);
     session.model.apply(event); if (session.model.status !== previousStatus || event.type === "session_info_changed") this.mainChanged();
     if (["message_end", "entry_appended", "compaction_end", "session_info_changed", "agent_settled"].includes(event.type)) void this.sync(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
   }

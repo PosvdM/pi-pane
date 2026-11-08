@@ -114,12 +114,12 @@ export class PluginHost {
     for (const off of this.subscriptions.get(source) ?? []) off();
     this.subscriptions.delete(source);
   }
-  private tracked(source: string, subscribe: () => () => void): () => void {
+  private tracked(source: string, subscribe: (current: () => boolean) => () => void): () => void {
     const records = this.subscriptions.get(source) ?? new Set<() => void>(); this.subscriptions.set(source, records);
     let active = true; let cancel: (() => void) | undefined;
     const off = () => { if (!active) return; active = false; records.delete(off); try { cancel?.(); } catch (error) { console.error(`插件 ${source} 的订阅清理失败：`, error); } };
     records.add(off);
-    try { cancel = subscribe(); assert(typeof cancel === "function", "invalidPluginResult", "插件订阅没有返回取消函数", 502); }
+    try { cancel = subscribe(() => active && !this.closing); assert(typeof cancel === "function", "invalidPluginResult", "插件订阅没有返回取消函数", 502); }
     catch (error) { off(); throw error; }
     if (!active) { try { cancel(); } catch { /* 订阅同步回调可能在初始化结束前取消。 */ } }
     return off;
@@ -194,12 +194,13 @@ export class PluginHost {
   treeSubscribe(source: string, after: TreeCursor, emit: (change: TreeChange) => void): () => void {
     const plugin = this.runtime.get(source); assert(plugin.tree, "unsupportedCapability", "插件不提供会话树", 404);
     assert(typeof after?.epoch === "string" && Number.isSafeInteger(after.revision) && after.revision >= 0, "invalidCursor", "树游标无效");
-    return this.tracked(source, () => plugin.tree!.subscribe(after, (change) => {
+    return this.tracked(source, (current) => plugin.tree!.subscribe(after, (change) => {
+      if (!current()) return;
       try {
         const value = change.type === "upsert" ? { ...change, node: this.nodes(source, [change.node], plugin)[0] } : structuredClone(change);
-        if (value.type === "reset") void this.alignForms(source);
-        emit(value);
-      } catch (error) { console.error(`插件 ${source} 的树事件失败：`, error); emit({ type: "reset", epoch: after.epoch }); }
+        if (value.type === "reset" && current()) void this.alignForms(source);
+        if (current()) emit(value);
+      } catch (error) { console.error(`插件 ${source} 的树事件失败：`, error); if (current()) emit({ type: "reset", epoch: after.epoch }); }
     }));
   }
   async snapshot(ref: SessionRef): Promise<SessionSnapshot> {
@@ -220,11 +221,12 @@ export class PluginHost {
   subscribe(ref: SessionRef, after: StreamCursor, emit: (event: SessionStreamEvent) => void): () => void {
     const plugin = this.runtime.get(ref.source); assert(plugin.sessions, "unsupportedCapability", "插件不提供会话视图", 404);
     assert(typeof after?.epoch === "string" && Number.isSafeInteger(after.seq) && after.seq >= 0, "invalidCursor", "会话游标无效");
-    return this.tracked(ref.source, () => plugin.sessions!.subscribe(ref, after, (event) => {
+    return this.tracked(ref.source, (current) => plugin.sessions!.subscribe(ref, after, (event) => {
+      if (!current()) return;
       try {
         assert(event.ref?.source === ref.source && event.ref.id === ref.id, "invalidPluginResult", "插件会话事件来源无效", 502);
-        emit(this.options.assets.detach(event));
-      } catch (error) { console.error(`插件 ${ref.source} 的会话事件失败：`, error); emit({ ref, cursor: after, event: { type: "resync" } }); }
+        const value = this.options.assets.detach(event); if (current()) emit(value);
+      } catch (error) { console.error(`插件 ${ref.source} 的会话事件失败：`, error); if (current()) emit({ ref, cursor: after, event: { type: "resync" } }); }
     }));
   }
   close(): Promise<void> {

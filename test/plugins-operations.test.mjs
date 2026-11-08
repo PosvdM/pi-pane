@@ -108,6 +108,16 @@ for (const kind of ["action", "form", "send"]) {
     assert.equal(count, 2);
   });
 
+  for (const code of ["timeout", "pluginTimeout"]) test(`${kind}：${code} 保留操作身份和 pending，同键可重新查询`, async t => {
+    const { run, set, success } = setup(t); let count = 0;
+    set(async () => { if (++count === 1) throw Object.assign(new Error("正常超时"), { code }); return success; });
+    assert.equal((await run()).status, "pending");
+    assert.equal((await run("key", true)).status, "idempotencyConflict");
+    if (kind === "form") assert.equal((await run("other-key")).status, "alreadyHandled", "确认未知时仍保留原版本 claim");
+    assert.deepEqual(await run(), success); assert.equal(count, 2);
+    assert.deepEqual(await run(), success); assert.equal(count, 2);
+  });
+
   for (const mode of ["同步抛错", "异步拒绝", "迟到拒绝"]) {
     test(`${kind}：${mode}被限制在事务内`, async t => {
       const { run, set } = setup(t);

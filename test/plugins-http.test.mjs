@@ -102,6 +102,26 @@ test("请求来源绑定凭证和连接，用户在场确认只路由发起标�
   } finally { for (const client of clients) client.close(); await server.close(); await f.cleanup(); }
 });
 
+test("真实用户在场确认超时不成为最终失败，同键可再次确认并完成", { timeout: 60000 }, async () => {
+  const f = await piFixture(); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 1000 }); let client;
+  try {
+    const token = await pair(server); client = await connect(server, token);
+    const { publicKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" }); const spki = publicKey.export({ type: "spki", format: "der" });
+    const device = { deviceId: createHash("sha256").update(spki).digest("base64url"), publicKey: spki.toString("base64url"), alg: "ECDSA-P256-SHA256", label: "超时重试设备", connected: true };
+    client.ws.send(JSON.stringify({ type: "device", device }));
+    const idempotencyKey = randomUUID(); const input = { answers: [], fields: { timeoutMs: "500" } };
+    assert.equal((await invoke(server, token, client, "sample.presence", { idempotencyKey, input })).value.status, "pending");
+    await until(() => client.messages.some(message => message.type === "presenceClosed" && message.reason === "timeout"));
+    const first = client.messages.find(message => message.type === "presence").request.id;
+    assert.equal((await invoke(server, token, client, "sample.presence", { idempotencyKey, input })).value.status, "pending");
+    await until(() => client.messages.some(message => message.type === "presence" && message.request.id !== first));
+    const second = client.messages.filter(message => message.type === "presence").at(-1).request.id;
+    client.ws.send(JSON.stringify({ type: "presenceResponse", id: second, response: { proof: { deviceId: device.deviceId, publicKey: device.publicKey, alg: device.alg, signature: Buffer.alloc(64, 2).toString("base64url") } } }));
+    await until(async () => (await invoke(server, token, client, "sample.presence", { idempotencyKey, input })).value.status === "ok");
+    assert.equal(server.plugins.runtime.get("sample").inspection().invocations["sample.presence"], 2);
+  } finally { client?.close(); await server.close(); await f.cleanup(); }
+});
+
 test("浏览器重连与插件 tree reset 对齐持久表单，并发登录合并 pending 查询", { timeout: 60000 }, async () => {
   const f = await piFixture(); const server = await startServer(f, { plugins: [plugin], pluginTimeoutMs: 1000 }); const clients = [];
   try {

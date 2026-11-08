@@ -68,6 +68,32 @@ test("树快照统一修正循环成员并移除未实现的能力，跨来源�
   await assert.rejects(f.host.treeSnapshot("sample", { openNodeIds: [], recentSince: new Date(0).toISOString() }), error => error.code === "invalidPluginResult");
 });
 
+test("树和会话退订、重订及停用统一丢弃迟到回调，取消回调不能重入发送", async t => {
+  const treeChange = { type: "upsert", revision: 100, node: node("sample:late") };
+  const f = await fixture(t, [`export const trees=[],sessions=[],count={pending:0};export default function(){return{id:'sample',paneProtocol:[1,1],async activate(){},
+    forms:{async pending(){count.pending++;return[]}},
+    tree:{subscribe(after,emit){trees.push(emit);return()=>{emit(${JSON.stringify(treeChange)})}}},
+    sessions:{subscribe(ref,after,emit){sessions.push(emit);return()=>{emit({ref:{source:'other',id:ref.id},cursor:after,event:{type:'late'}})}}}}}`]);
+  const tree = [], sessions = []; const ref = { source: "sample", id: "child" }; const cursor = { epoch: "old", seq: 0 };
+  const firstTree = f.host.treeSubscribe("sample", { epoch: "old", revision: 0 }, event => tree.push(event));
+  const firstSession = f.host.subscribe(ref, cursor, event => sessions.push(event));
+  f.modules[0].trees[0](treeChange); f.modules[0].sessions[0]({ ref, cursor, event: { type: "initial" } });
+  assert.equal(tree.length, 1); assert.equal(sessions.length, 1);
+  firstTree(); firstSession(); assert.equal(tree.length, 1); assert.equal(sessions.length, 1);
+  f.host.treeSubscribe("sample", { epoch: "new", revision: 0 }, event => tree.push(event));
+  f.host.subscribe(ref, { epoch: "new", seq: 0 }, event => sessions.push(event));
+  f.modules[0].trees[0]({ type: "reset", epoch: "obsolete" }); f.modules[0].trees[0](treeChange);
+  f.modules[0].sessions[0]({ ref: { source: "other", id: "child" }, cursor, event: { type: "invalid" } });
+  await new Promise(setImmediate); assert.equal(f.modules[0].count.pending, 1);
+  assert.equal(tree.length, 1); assert.equal(sessions.length, 1);
+  f.modules[0].trees[1]({ ...treeChange, revision: 1 }); f.modules[0].sessions[1]({ ref, cursor: { epoch: "new", seq: 1 }, event: { type: "current" } });
+  assert.equal(tree.length, 2); assert.equal(sessions.length, 2);
+  await f.host.runtime.stop("sample");
+  for (const emit of f.modules[0].trees) emit(treeChange);
+  for (const emit of f.modules[0].sessions) emit({ ref, cursor, event: { type: "after-stop" } });
+  assert.equal(tree.length, 2); assert.equal(sessions.length, 2);
+});
+
 test("自定义消息渲染器冲突时按配置顺序选择，不加载第三方前端代码", async t => {
   const f = await fixture(t, ["first", "second"].map(source => `export default function(){return{id:'${source}',paneProtocol:[1,1],async activate(){},renderers:{customMessages:[{customType:'shared',label:'${source}'}]}}}`));
   assert.equal((await f.host.catalog("first")).renderers[0].label, "first");
