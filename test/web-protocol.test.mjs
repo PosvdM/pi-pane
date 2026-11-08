@@ -283,7 +283,7 @@ test("R5-3 HTTP 固定模板先 follow-up 图片 A 再 steer 图片 B，停止�
   } finally { await server.close(); await f.cleanup(); }
 });
 
-for (const sameText of [false, true]) test(`R5-2 HTTP 输入扩展转换图片草稿并追加${sameText ? "同文" : "不同文"}辅助消息，停止时分别恢复图片与文字`, { timeout: 60_000 }, async () => {
+for (const sameText of [false, true]) test(`R5-2 HTTP 输入扩展追加${sameText ? "同文" : "不同文"}辅助消息，完整清出候选分组时只在最后一项恢复图片草稿`, { timeout: 60_000 }, async () => {
   const f = await piFixture({ fallback: { segments: [{ type: "hang" }] } });
   const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
   try {
@@ -300,8 +300,41 @@ for (const sameText of [false, true]) test(`R5-2 HTTP 输入扩展转换图片�
     const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
     assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.equal(stopped.value.status, "done");
     assert.deepEqual(stopped.value.clearedText, [auxiliary, fixed]);
-    assert.deepEqual(stopped.value.clearedDrafts, [[{ type: "text", text: auxiliary }], draft], "辅助消息只能恢复为文字，原输入必须完整恢复图片与前后文字");
+    // 两条正文都与编码文字、图片标记无关；无法确定归属时，共享草稿只在完整清出的最后一个候选处恢复。
+    const expectedDrafts = stopped.value.clearedText.map((text, i, texts) => i === texts.length - 1 ? draft : [{ type: "text", text }]);
+    assert.deepEqual(stopped.value.clearedDrafts, expectedDrafts, "完整候选分组必须只恢复一次原图片草稿，其余候选只恢复实际文字");
+    assert.equal(stopped.value.clearedDrafts.flat().filter(node => node.type === "image").length, 1);
     assert.equal((await requestRecords(f)).filter(row => row.kind === "request").length, 1, "扩展产生的两条消息在停止前均未消费");
+  } finally { await server.close(); await f.cleanup(); }
+});
+
+for (const sameText of [false, true]) test(`R5-2 HTTP ${sameText ? "同文" : "不同文"}候选分组部分消费后，停止时不恢复归属不明的图片草稿`, { timeout: 60_000 }, async () => {
+  const f = await piFixture();
+  const release = path.join(f.root, "release-candidate-turn");
+  await f.setScript({ turns: [{ segments: [{ type: "waitForFile", file: release }, { type: "text", text: "开始处理候选消息" }] }], fallback: { segments: [{ type: "hang" }] } });
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  try {
+    const token = await pair(server); let state = await ready(server, token, f);
+    const [draft] = await queueImageDrafts(server, token, "pane-queue-transform " + (sameText ? "同文辅助" : "不同辅助"));
+    const fixed = "扩展固定正文"; const auxiliary = sameText ? fixed : "扩展辅助消息";
+    const running = await control(server, token, state, { type: "prompt", message: "等待候选分组排队" });
+    assert.equal(running.code, 200, JSON.stringify(running)); state = running.value.snapshot;
+    await until(async () => (await requestRecords(f)).some(row => row.kind === "waiting"));
+    const queued = await control(server, token, await snapshot(server, token, state.ref.id), { type: "prompt", delivery: "followUp" }, { draft });
+    assert.equal(queued.code, 200, JSON.stringify(queued));
+    assert.deepEqual(queued.value.snapshot.inFlight.queue, { steering: [], followUp: [auxiliary, fixed] });
+    await writeFile(release, "继续");
+    await until(async () => (await requestRecords(f)).some(row => row.kind === "hang" && row.request === 2));
+    const consumed = (await requestRecords(f)).find(row => row.kind === "request" && row.request === 2);
+    assert.equal(consumed.lastUser, auxiliary);
+    assert.deepEqual(consumed.context.messages.findLast(message => message.role === "user").content.filter(node => node.type === "image"), [], "首个候选为扩展生成的纯文字消息");
+    await until(async () => (await snapshot(server, token, state.ref.id)).inFlight.queue.followUp.length === 1);
+    assert.deepEqual((await snapshot(server, token, state.ref.id)).inFlight.queue, { steering: [], followUp: [fixed] });
+    const stopped = await control(server, token, await snapshot(server, token, state.ref.id), { type: "stop" });
+    assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.equal(stopped.value.status, "done");
+    assert.deepEqual(stopped.value.clearedText, [fixed]);
+    assert.deepEqual(stopped.value.clearedDrafts, [[{ type: "text", text: fixed }]], "候选已部分消费时不能证明原图片尚未发送，因此不恢复分组草稿");
+    assert.equal((await requestRecords(f)).filter(row => row.kind === "request").length, 2);
   } finally { await server.close(); await f.cleanup(); }
 });
 
