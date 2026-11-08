@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { deflateSync } from "node:zlib";
+import { createHash } from "node:crypto";
 import { readSession } from "../packages/server/dist/store.js";
 import { screenshot } from "./fixtures/browser.mjs";
 import { setup, byId, newSession, idle, replyScript } from "./fixtures/web-e2e.mjs";
@@ -64,8 +65,11 @@ test("Chrome 两张图片占位符的上传、复制、发送和退格重新编�
   const { page, fixture, context } = s;
   await newSession(page, fixture);
   const editor = byId(page, "composer");
+  const red = png(255, 0, 0); const blue = png(0, 0, 255);
+  const hash = bytes => createHash("sha256").update(bytes).digest("hex");
+  assert.notEqual(hash(red), hash(blue));
   await editor.fill("第一张");
-  await byId(page, "image-input").setInputFiles({ name: "red.png", mimeType: "image/png", buffer: png(255, 0, 0) });
+  await byId(page, "image-input").setInputFiles({ name: "red.png", mimeType: "image/png", buffer: red });
   await editor.locator(".chip").waitFor();
   await editor.press("Control+z");
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="composer"] .chip').length === 0);
@@ -73,12 +77,13 @@ test("Chrome 两张图片占位符的上传、复制、发送和退格重新编�
   await editor.locator(".chip").waitFor();
   await editor.press("Control+End");
   await page.keyboard.insertText("中间");
-  await byId(page, "image-input").setInputFiles({ name: "blue.png", mimeType: "image/png", buffer: png(0, 0, 255) });
+  await byId(page, "image-input").setInputFiles({ name: "blue.png", mimeType: "image/png", buffer: blue });
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="composer"] .chip').length === 2);
   await editor.press("Control+End");
   await page.keyboard.insertText("结尾");
   const ids = await editor.locator(".chip").evaluateAll(chips => chips.map(chip => chip.dataset.assetId));
   assert.notEqual(ids[0], ids[1], "两张不同的 PNG 必须产生不同资源");
+  assert.deepEqual(ids, ["sha256-" + hash(red), "sha256-" + hash(blue)], "上传资源必须按顺序对应未缩放的红、蓝原图");
   const cdp = await context.newCDPSession(page);
   await cdp.send("Accessibility.enable");
   await numberedChips(page, cdp, ["[Image #1]", "[Image #2]"]);
@@ -99,7 +104,14 @@ test("Chrome 两张图片占位符的上传、复制、发送和退格重新编�
   const content = users[0].message.content;
   assert.deepEqual(content.map(block => block.type), ["text", "image", "text", "image", "text"]);
   assert.deepEqual(content.filter(block => block.type === "text").map(block => block.text), ["第一张[Image #1]", "中间[Image #2]", "结尾"]);
-  assert.deepEqual(content.filter(block => block.type === "image").map(block => block.mimeType), ["image/png", "image/png"]);
+  const images = content.filter(block => block.type === "image");
+  assert.deepEqual(images.map(block => block.mimeType), ["image/png", "image/png"]);
+  // 1×1 PNG 不经过缩放；磁盘中的两个数据块必须分别对应红、蓝上传原图。
+  assert.deepEqual(images.map(block => hash(Buffer.from(block.data, "base64"))), [hash(red), hash(blue)], "[Image #1] 为红图，[Image #2] 为蓝图，交换图片字节必须失败");
+  for (let i = 0; i < images.length; i++) {
+    assert.equal(content[i * 2].text.endsWith(`[Image #${i + 1}]`), true);
+    assert.equal(hash(Buffer.from(content[i * 2 + 1].data, "base64")), [hash(red), hash(blue)][i]);
+  }
   await page.waitForFunction(() => {
     const images = [...document.querySelectorAll('[data-testid="user-message"] img')];
     return images.length === 2 && images.every(image => image.complete && image.naturalWidth > 0);
