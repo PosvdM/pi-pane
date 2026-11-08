@@ -25,7 +25,7 @@ test("队列镜像：已消费的草稿不会被后来的同文字队列项取�
   const before = items;
   items = reconcile(items, ["T"]);
   claim(before, items, image("b"));
-  assert.equal(asset(restore(items, ["T"])[0]), "b");
+  assert.equal(asset(restore(items, ["T"]).certain[0]), "b");
 });
 
 test("队列镜像：文字或图片标记相符的唯一新增项直接认领", () => {
@@ -37,22 +37,24 @@ test("队列镜像：文字或图片标记相符的唯一新增项直接认领",
   assert.equal(asset(after[2].claim), "a");
 });
 
-test("队列镜像：归属不明时只在全部候选都被清出后取回一次", () => {
+test("队列镜像：归属不明的草稿交给用户确认", () => {
   const after = reconcile([], ["T", "辅助"]);
   claim([], after, image("a"), "/模板 ⟦pane-img:xyz789:1⟧");
-  // 两项都还在：草稿放在最后一个候选的位置，只取回一次。
-  assert.deepEqual(restore(after, ["T", "辅助"]).map(asset), [undefined, "a"]);
-  // 其中一项已被消费：无法确认原草稿是否已发送，不取回，避免重复发送。
-  assert.deepEqual(restore(after, ["辅助"]).map(asset), [undefined]);
+  // 归属不明的草稿不占用任何候选位置，交给用户确认；部分候选已消费时同样交出，不丢弃。
+  for (const texts of [["T", "辅助"], ["辅助"]]) {
+    const result = restore(after, texts);
+    assert.ok(result.certain.every((item) => item === undefined));
+    assert.deepEqual(result.uncertain.map(asset), ["a"]);
+  }
 });
 
 test("队列镜像：清出的文字对应快照后缀，种类分开", () => {
   const mirror = emptyMirror();
   mirror.followUp = reconcile([], ["T"]); claim([], mirror.followUp, image("f"));
   mirror.steering = reconcile([], ["T"]); claim([], mirror.steering, image("s"));
-  const items = [...restore(mirror.steering, ["T"]), ...restore(mirror.followUp, ["T"])];
+  const items = [...restore(mirror.steering, ["T"]).certain, ...restore(mirror.followUp, ["T"]).certain];
   assert.deepEqual(items.map(asset), ["s", "f"]);
   const queue = reconcile([], ["A", "B"]); claim([queue[0]], queue, image("b"));
-  assert.equal(asset(restore(queue, ["B"])[0]), "b");
-  assert.equal(restore(queue, ["X"])[0], undefined);
+  assert.equal(asset(restore(queue, ["B"]).certain[0]), "b");
+  assert.equal(restore(queue, ["X"]).certain[0], undefined);
 });

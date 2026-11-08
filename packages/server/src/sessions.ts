@@ -221,7 +221,13 @@ export class Sessions {
       const kind = command.type === "steer" || (command.type === "prompt" && command.delivery === "steer") ? "steering" as const
         : command.type === "follow_up" || (command.type === "prompt" && command.delivery === "followUp") ? "followUp" as const : undefined;
       const owner = session; const mirrorBefore = kind ? [...owner.queued[kind]] : [];
-      const response = await handle.send(rpc, { trackResult: true });
+      let response: Awaited<ReturnType<typeof handle.send>>;
+      try { response = await handle.send(rpc, { trackResult: true }); }
+      catch (error) {
+        // pi 明确拒绝时输入未入队，释放本次编码记录；结果未知时保留，以便停止时仍能取回。
+        if (encoded && error instanceof PaneError && error.code === "rpcRejected") owner.drafts.delete(encoded.message);
+        throw error;
+      }
       // 只有确实入队（disposition 为 queued）的输入认领队列项；handled、started 和被拒绝的输入不再需要取回，释放草稿记录。
       const queued = response.success && (response.data as any)?.disposition === "queued";
       if (kind && request.draft && queued && owner.handle === handle) claim(mirrorBefore, owner.queued[kind], request.draft, encoded?.message);
@@ -446,6 +452,8 @@ export class Sessions {
     let cleared: any = { steering: [], followUp: [] };
     // clear_queue 会先发出空的 queue_update；发送前取镜像快照，用于把清出的文字对应到原草稿。
     const mirror = { steering: [...session.queued.steering], followUp: [...session.queued.followUp] };
+    // 编码草稿记录会在队列项清出时释放，回退查找使用停止开始时的副本。
+    const encodedDrafts = new Map(session.drafts);
     try {
       const response = await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 }); cleared = response.data;
       if (close) await handle.stop();
@@ -462,18 +470,22 @@ export class Sessions {
     const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
     // 优先按队列镜像取回原草稿（含图片节点），steering 在前、followUp 在后，与 clear_queue 的顺序一致。
     // 镜像无法确认时依次按完整编码文字、图片标记 nonce 查找，都找不到时只放回文字。
-    const items = [...restore(mirror.steering, cleared?.steering ?? []), ...restore(mirror.followUp, cleared?.followUp ?? [])];
+    const steering = restore(mirror.steering, cleared?.steering ?? []); const followUp = restore(mirror.followUp, cleared?.followUp ?? []);
+    const items = [...steering.certain, ...followUp.certain];
+    const uncertain = [...new Set([...steering.uncertain, ...followUp.uncertain])];
     if (!session.handle || session.handle === handle) session.queued = emptyMirror();
     const queuedDrafts = items.map((item) => item?.draft);
+    // 归属不明的草稿只交给用户确认，其候选位置不再按文字回退查找。
+    const grouped = new Set(uncertain.flatMap((claim) => claim.key ? [claim.key] : []));
     const keys = texts.map((text, i) => {
       if (queuedDrafts[i]) return items[i]?.key;
-      if (session.drafts.has(text)) return text;
+      if (encodedDrafts.has(text) && !grouped.has(text)) return text;
       const nonce = /⟦pane-img:([a-z0-9]{6,8}):\d+⟧/.exec(text)?.[1];
-      return nonce ? [...session.drafts.keys()].find((key) => key.includes(`⟦pane-img:${nonce}:`)) : undefined;
+      return nonce ? [...encodedDrafts.keys()].find((key) => !grouped.has(key) && key.includes(`⟦pane-img:${nonce}:`)) : undefined;
     });
-    const drafts = texts.map((text, i) => queuedDrafts[i] ?? ((keys[i] && session.drafts.get(keys[i]!)) || [{ type: "text", text }]));
-    if (!session.handle || session.handle === handle) for (const key of keys) if (key) session.drafts.delete(key);
-    return { status: "done", clearedText: texts, clearedDrafts: drafts };
+    const drafts = texts.map((text, i) => queuedDrafts[i] ?? ((keys[i] && encodedDrafts.get(keys[i]!)) || [{ type: "text", text }]));
+    if (!session.handle || session.handle === handle) for (const key of [...keys, ...grouped]) if (key) session.drafts.delete(key);
+    return { status: "done", clearedText: texts, clearedDrafts: drafts, ...(uncertain.length ? { uncertainDrafts: uncertain.map((claim) => claim.draft) } : {}) };
   }
   private reclaim(): Promise<void> { return this.inflight.run("sessions.reclaim", () => this.performReclaim()); }
   private async performReclaim(): Promise<void> {

@@ -295,9 +295,17 @@ export async function stopRun(): Promise<void> {
     } else toast(outcome.error.message, "error");
     return;
   }
-  if (outcome.result.status === "done" && outcome.result.clearedDrafts.length) {
-    restoredDrafts.set({ sessionId: state.id, drafts: outcome.result.clearedDrafts });
+  if (outcome.result.status === "done") await restoreCleared(state.id, outcome.result);
+}
+
+/** 把清出的排队消息放回输入框；归属不明、可能已发送的草稿先请用户确认。 */
+async function restoreCleared(sessionId: string, result: { clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }): Promise<void> {
+  let drafts = result.clearedDrafts;
+  if (result.uncertainDrafts?.length) {
+    const answer = await ask("是否放回这些草稿", `有 ${result.uncertainDrafts.length} 条带图片的消息被扩展改写过，无法确认是否已经发送。放回输入框后可以检查再决定是否重发。`, [{ label: "不放回", value: "no" }, { label: "放回输入框", value: "yes", primary: true }]);
+    if (answer === "yes") drafts = [...drafts, ...result.uncertainDrafts];
   }
+  if (drafts.length) restoredDrafts.set({ sessionId, drafts });
 }
 
 export async function restart(): Promise<void> {
@@ -324,7 +332,7 @@ export async function closeSession(): Promise<boolean> {
     outcome = await control({ type: "close", confirmHolds: true });
   }
   if (!outcome.ok) { toast(outcome.error.code === "revisionChanged" ? "会话状态已变化，请确认后重新关闭" : outcome.error.message, "error"); return false; }
-  if (outcome.result.status === "done" && outcome.result.clearedDrafts.length) restoredDrafts.set({ sessionId: state.id, drafts: outcome.result.clearedDrafts });
+  if (outcome.result.status === "done") await restoreCleared(state.id, outcome.result);
   toast("会话已关闭");
   if (current.get()?.id === state.id) void reload();
   return true;

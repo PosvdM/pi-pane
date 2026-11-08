@@ -50,20 +50,18 @@ export function claim(before: readonly QueueItem[], after: readonly QueueItem[],
 
 /**
  * clear_queue 之前的镜像与清出的文字对应：两次读取之间只可能有队首项被消费，清出的文字是镜像的后缀。
- * 返回与 texts 等长的草稿数组，无法确认的位置为 undefined；分组草稿只在全部候选都被清出时，放在最后一个候选的位置。
+ * 返回与 texts 等长的归属确定的草稿（无法确认的位置为 undefined），以及归属不明、至少有一个候选被清出的分组草稿。
+ * 分组草稿可能已发送，也可能仍在队列中，由用户确认是否放回，既不自动占用某个候选的位置，也不丢弃。
  */
-export function restore(snapshot: readonly QueueItem[], texts: readonly string[]): (DraftClaim | undefined)[] {
+export function restore(snapshot: readonly QueueItem[], texts: readonly string[]): { certain: (DraftClaim | undefined)[]; uncertain: DraftClaim[] } {
   const offset = snapshot.length - texts.length;
   const items = texts.map((text, i) => {
     const item = offset >= 0 ? snapshot[offset + i] : undefined;
     return item && item.text === text ? item : undefined;
   });
-  return items.map((item, i) => {
-    const claim = item?.claim; if (!claim) return undefined;
-    const positions = items.flatMap((other, j) => other?.claim === claim ? [j] : []);
-    if (positions.length !== claim.candidates) return undefined;
-    return positions.at(-1) === i ? claim : undefined;
-  });
+  const certain = items.map((item) => item?.claim && item.claim.candidates === 1 ? item.claim : undefined);
+  const uncertain = [...new Set(items.flatMap((item) => item?.claim && item.claim.candidates > 1 ? [item.claim] : []))];
+  return { certain, uncertain };
 }
 
 /** 对齐后被移除（已消费或已清出）的项。 */

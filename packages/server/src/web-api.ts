@@ -110,7 +110,8 @@ export interface PaneControlRequest {
 /** 控制命令的结果。HTTP 等待到期为 pending，用同一 requestId 重新提交查询当前状态。 */
 export type PaneControlResult =
   | { status: "accepted"; snapshot: PaneSessionView; result?: PaneCommandOutcome }
-  | { status: "done"; clearedText: string[]; clearedDrafts: DraftNode[][] }
+  // uncertainDrafts：扩展同时入队导致归属不明、可能尚未发送的草稿，由用户确认是否放回输入框。
+  | { status: "done"; clearedText: string[]; clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }
   | { status: "nothingToStop" }
   | { status: "pending" };
 /** 输入类命令的处理方式与其他命令的附加结果。 */
