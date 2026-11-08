@@ -26,7 +26,7 @@
 | `packages/server/src/driver.ts` | hostkit 写锁、启动门闩、RPC、就绪超时、进程停止和运行身份记录 |
 | `packages/server/src/writer-recovery.ts`、`stop-report.ts` | 首次拉起与目标切换的共同恢复检查、不完整报告隔离和停止报告判定 |
 | `packages/server/src/hostkit-cleanup.ts` | hostkit 拒绝中的清理事实识别及同步、异步调用观察 |
-| `packages/server/src/inflight.ts` | 实例共用的关闭门禁、在途操作与资源 owner 登记、完整排空及终止释放检查 |
+| `packages/server/src/inflight.ts` | 实例共用的关闭门禁、在途操作与资源 owner 登记、限时排空、登记来源诊断、超时失败闩及终止释放检查 |
 | `packages/server/src/pi-rpc.ts` | pi 主会话的原生 RPC 信封；不属于通用插件契约 |
 | `packages/server/src/model.ts` | 活动分支、inFlight、同步快照切点、事件缓冲和游标 |
 | `packages/server/src/store.ts` | 只读 v1/v2/v3 解析、pi 会话目录和列表、临时副本 fork |
@@ -62,11 +62,17 @@
 
 `/bridge/launch` 和 `/bridge/event` 是独立的进程级 Agent 通道，不能使用浏览器凭证；其 token 也不能调用 `/api/*`。
 
-控制命令的 HTTP 等待默认 30 秒，超时返回 pending；底层 RPC 继续跟踪实际响应，同一 requestId 不会因等待到期而固定成失败。传输中断导致无法确认结果时返回 rpcResultUnknown，客户端须读取状态核对。stop、close 和 restart 不等待挂起的普通控制操作，检查前置条件后抢占；未执行项返回 controlPreempted，活动 RPC 按真实响应或传输关闭记录结果。排队及 pending 超限返回 429，具体额度与停止通道见 [architecture.md 的“停止与控制队列”](architecture.md#停止与控制队列)。命令受理只递增 revision，生成阶段按实际事件更新；handled 输入、预检拒绝和手动压缩失败不会使空闲会话持续显示 running。已确认的控制响应不受后续状态查询或锁清理故障影响。
+控制命令的 HTTP 等待默认 30 秒，超时返回 pending；底层 RPC 继续跟踪实际响应，同一 requestId 不会因等待到期而固定成失败。传输中断，或停止失败后主动终结本地等待，导致无法确认结果时返回 rpcResultUnknown，客户端须读取状态核对。stop、close 和 restart 不等待挂起的普通控制操作，检查前置条件后抢占；未执行项返回 controlPreempted，活动 RPC 按真实响应、传输关闭或停止失败后的本地等待终结记录结果；最后一种只记为结果未知。排队及 pending 超限返回 429，具体额度与停止通道见 [architecture.md 的“停止与控制队列”](architecture.md#停止与控制队列)。命令受理只递增 revision，生成阶段按实际事件更新；handled 输入、预检拒绝和手动压缩失败不会使空闲会话持续显示 running。已确认的控制响应不受后续状态查询或锁清理故障影响。
 
 首次发送才启动 pi。服务端暂停输入直到 bridgeReady 和初次 RPC 状态/条目读取完成。启动就绪失败的响应在停止、身份复查和写锁处理完成后返回；停止失败时保留锁及运行记录，不因失败响应提前解锁。新会话的真实 pi id 在首次启动时确定；调用方使用响应快照或 pane_session_replaced 的 newRef 更新引用。
 
-服务关闭先封闭实例共用的 Inflight 门禁，新的打开、控制、RPC、UI 回应及 bridge 事件返回 serverStopping。关闭等待已受理 open 的文件读取和锁探测，并取消、等待全部在途启动，包括首次发送、restart 的信任询问、目录读取、取锁、spawn 和就绪等待；取消后的取锁不能继续 spawn。已创建的 handle 在首次持久化前交付。关闭还排空 resume 目标取锁及 bridge 重连初始化，即使退出回调已经摘下 handle，也等待其迟到锁释放；统一屏障还等待已退出写者尚未结束的 RPC 和 bridge 身份核查；全部在途操作结束后才汇总清理错误、关闭 HTTP 和释放实例锁。清理未确认时保留实例锁并返回失败，并发关闭调用等待同一结果。停止失败由 handle 缓存，退出回调摘下 handle 或其他写者成功重启不能清除失败；独立登记须等停止及排空均成功才删除。本实例新产生的恢复隔离和创建 handle 前的清理失败由实例登记保存，关闭时汇总；启动前已有的隔离标记保留为 `Sessions.recoveryDiagnostics`，CLI 输出诊断，正常关闭照常成功。具体生命周期及入口对照表见 [architecture.md 的“关闭与回收”](architecture.md#关闭与回收)和[“统一关闭屏障”](architecture.md#统一关闭屏障)。
+服务关闭先封闭实例共用的 Inflight 门禁，新的打开、控制、RPC、UI 回应及 bridge 事件返回 serverStopping。全部会话同步标记关闭，各写者并行请求停止。统一屏障覆盖已受理 open/probe、在途启动、取锁及 spawn、目标取锁、初始化、持久化、RPC 和 bridge 身份核查；`sessions.close.settle` 也登记停止本身、局部 drain、启动及 handle 收尾，不能先在屏障外无限等待。
+
+关闭一定有界完成或拒绝：停止与全部在途操作排空共用 `ceil(abortTimeoutMs + graceMs + termGraceMs + 7000)` 毫秒，默认 **25000 毫秒**。HTTP/WebSocket 关闭、实例锁释放再分别最多等待 **5000 毫秒**，默认总等待上限 **35000 毫秒**。配置必须可表示为合法 Node.js 定时器；异步期限以事件循环可以运行作为前提。停止失败时，handle 主动终结全部 pane 本地 RPC 等待，未确认的控制结果缓存 `rpcResultUnknown`，不假定远端执行结果，也不修改 hostkit 传输。正常停止仍由真实响应或管道关闭结束等待。
+
+停止/排空超时返回含 `shutdownTimeout` 的关闭失败，错误消息和 `detail.pending` 列出剩余登记的 kind 和调用栈来源；超时不删除登记、不允许进入实例锁释放。成功或失败关闭均进入 HTTP/WebSocket 收尾。清理未确认时保留实例锁、尚未释放的写锁及运行/恢复记录；超时失败闩禁止迟到停止成功再进入写锁释放或记录删除，现场交给下一实例恢复或维护者。已经进入的原生操作不能撤销，实例锁释放超时只报告未确认。并发及重复 close 返回同一个 Promise 和失败，迟到成功不能改变结果。
+
+停止失败由 handle 缓存，退出回调摘下 handle 或其他写者成功重启不能清除失败；独立登记须等停止及排空均成功才删除。本实例新产生的恢复隔离和创建 handle 前的清理失败由实例登记保存，关闭时汇总；启动前已有的隔离标记保留为 `Sessions.recoveryDiagnostics`，CLI 输出诊断，正常关闭照常成功。完整预算、失败闩和入口对照表见 [architecture.md 的“统一关闭屏障”](architecture.md#统一关闭屏障)。
 
 hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清理失败消息或多错误聚合，调用边界立即通知本实例，后续 release、stop 或 drain 成功不能清除登记。完整报告随拒绝交付也保留，因为拒绝可能来自独立身份查询失败。固定依赖的 `spawnManaged` 启动回收没有专用错误码，多错误聚合按清理未确认保守处理；判定器仅用于 hostkit 调用边界，并防止循环上下文导致无限遍历。普通未启动错误、参数错误及业务拒绝不单独登记。取得 handle 前的 release、实际停止和迟到目标清理的拒绝仍全部保留。锁探测会短暂持有原生锁，其 finally 释放失败没有独立标识，因此 probe 的所有拒绝均保守登记。
 
@@ -95,6 +101,7 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 | 11. pane-bridge 未就绪 | bridge-failures：无效/抢先兑换 ticket、服务端拒绝、无就绪、新实例 reload/new 不就绪或断开；在每个定时 new/resume/fork 的 shutdown 及实际 session_start 窗口核对目标共享记录、持锁及存活 writer；协调离线时三种操作均取消；输入审计、停止和再次取锁 |
 | 关闭与在途启动 | shutdown-start-races：真实写锁 acquire 与真实 spawn 返回 gate 均位于 start 返回且 ready 之前；关闭不能提前成功或释放实例锁，放行后无存活写者、运行记录或持有写锁，取消后的取锁不 spawn；信任询问、目录读取、restart 同样登记；resume、reload、已退出 handle 的迟到目标锁及重连初始化均排空；真实 performStop 内注入停止、核查、锁更新、锁释放及运行记录清理失败，等 onExit 和独立登记收尾后再关闭，断言失败及保留实例锁；成功重启不能清除旧失败；启动/切换恢复失败、spawn 后释放失败由实例登记保留；经过真实 spawnWriter → stopFailedWriter 注入 running 记录提交失败及不完整报告或无报告停止拒绝，根进程退出且 release 成功后仍须拒绝关闭，并输出注入前的原始 StopReport；普通未创建进程的 spawn 拒绝在真实写锁释放后允许关闭；acquire、目标 update、被忽略的 clear_queue 以及切换后 release 携带报告的拒绝，即使后续清理成功也保留实例锁；旧隔离只诊断且不阻止下一实例正常关闭；并发关闭共享结果；单元级重绑定同步测试验证旧记录重新托管后真正执行 get_entries |
 | 统一关闭屏障 | shutdown-open-races：在真实 probe 的目录准备阶段暂停，确认 close 未完成且实例锁未释放；放行后执行真实原生锁取得和释放，释放拒绝必须导致并发及重复 close 失败，健康并发正常关闭；关闭开始后的新 open 返回 serverStopping，未进入 probe 准备或原生锁；shutdown-inflight：真实写者停止并排空后，在途 RPC 仍由统一屏障等待，迟到清理事实阻止实例锁释放，普通成功不误报；inflight：同步门禁和登记、成功及同步/异步拒绝的移除、资源 owner 收尾、迟到子操作及终止阶段检查 |
+| 有界关闭与停止失败 | shutdown-bounded：真实 /pane-test-hang 已进入扩展后，在真实 proc.stop 边界分别注入拒绝、存活 leftovers，断言有限时间内 close 拒绝、全部本地 RPC 等待结束、控制结果及重放均为 rpcResultUnknown、HTTP 停止监听、写锁及运行记录和实例锁保留；健康强停仍结束挂起 RPC 并关闭成功；停止边界和额外生产者永久 pending 时到期失败，列出 kind/来源且不释放实例锁；超时后放行真实 proc.stop，进程退出仍保留写锁与运行记录；仅停止后登记永久 pending 同样到期失败；网络回调和实例锁释放永久 pending 分别限时拒绝；inflight：超时不删除登记、迟到排空不能解除失败闩或进入 finalize |
 | 恢复报告隔离 | writer-recovery：真实存活旧 pi 被按身份恢复后，在真实报告上注入 snapshot 不完整；首次拉起和目标切换均拒绝该报告，保留旧身份、stopping 锁和诊断；recovery-failure：在真实停止报告后注入故障，执行 hostkit 原有 failed/throw 解锁分支，检查旧共享记录、存档、重启隔离，另一宿主未恢复不能 spawnWriter 且必须再查旧写者 |
 | handled 与拒绝 | input-state：无模型扩展命令、handled 输入、prompt 预检拒绝保持 idle；compaction-state：空会话 compact 拒绝、扩展取消、provider 失败均由手动结束事件恢复 idle，可按空闲规则回收；自动压缩仍等待 settled |
 | 协议边界 | core、http：空、单元素、多元素、非整数及非数组版本范围均拒绝，首帧带实际协商版本；通用类型声明不导出 pi 原生信封，任一原生信封重新导出的负向断言必须失败 |
