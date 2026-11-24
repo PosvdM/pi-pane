@@ -58,3 +58,47 @@ test("队列镜像：清出的文字对应快照后缀，种类分开", () => {
   assert.equal(asset(restore(queue, ["B"]).certain[0]), "b");
   assert.equal(restore(queue, ["X"]).certain[0], undefined);
 });
+
+test("队列镜像：停止快照后扩展追加消息，按最少追加项对齐，改写过的原草稿作为归属不明交出", () => {
+  const key = "看图 ⟦pane-img:abc123:1⟧";
+  // 唯一认领：改写后的文字去掉了图片标记，又追加了辅助项 X。
+  const single = reconcile([], ["E"]); claim([], single, image("a"), key);
+  let result = restore(single, ["E", "X"]);
+  assert.deepEqual(result.certain, [undefined, undefined]);
+  assert.deepEqual(result.uncertain.map(asset), ["a"]);
+  // 改写后保留图片标记，或文字就是发送时的编码文字：仍是确定归属。
+  for (const text of ["改写 ⟦pane-img:abc123:1⟧", key]) {
+    const marked = reconcile([], [text]); claim([], marked, image("b"), key);
+    result = restore(marked, [text, "X"]);
+    assert.deepEqual(result.certain.map(asset), ["b", undefined]);
+    assert.deepEqual(result.uncertain, []);
+  }
+  // 分组认领：快照 [E, T] 之后追加 X。
+  const grouped = reconcile([], ["E", "T"]); claim([], grouped, image("g"), key);
+  result = restore(grouped, ["E", "T", "X"]);
+  assert.deepEqual(result.certain, [undefined, undefined, undefined]);
+  assert.deepEqual(result.uncertain.map(asset), ["g"]);
+  // 窗口内先消费 E 再追加 X：T 仍对应分组。
+  result = restore(grouped, ["T", "X"]);
+  assert.deepEqual(result.uncertain.map(asset), ["g"]);
+  // 两个候选都已消费，只剩追加项：草稿已发送，不再交出。
+  result = restore(grouped, ["X"]);
+  assert.deepEqual(result, { certain: [undefined], uncertain: [] });
+});
+
+test("队列镜像：停止快照后扩展追加同文消息", () => {
+  // 纯文字草稿的队列文字就是发送文字：放回的内容与清出的文字相同，按确定归属放回，不重复交出。
+  const plain = reconcile([], ["T"]); claim([], plain, [{ type: "text", text: "T" }], "T");
+  let result = restore(plain, ["T", "T"]);
+  assert.deepEqual(result.certain.map((item) => item?.draft), [[{ type: "text", text: "T" }], undefined]);
+  assert.deepEqual(result.uncertain, []);
+  // 改写后的文字与追加项相同：无法区分原项是否已消费，交出一次待检查。
+  const rewritten = reconcile([], ["扩展固定正文"]); claim([], rewritten, image("r"), "原文 ⟦pane-img:def456:1⟧");
+  result = restore(rewritten, ["扩展固定正文", "扩展固定正文"]);
+  assert.deepEqual(result.certain, [undefined, undefined]);
+  assert.deepEqual(result.uncertain.map(asset), ["r"]);
+  // 没有追加时沿用后缀对齐：同文字的较晚项仍在队列中。
+  const two = reconcile([], ["T"]); claim([], two, image("x"));
+  const both = reconcile(two, ["T", "T"]); claim(two, both, image("y"));
+  assert.deepEqual(restore(both, ["T"]).certain.map(asset), ["y"]);
+});

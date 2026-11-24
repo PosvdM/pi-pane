@@ -49,18 +49,26 @@ export function claim(before: readonly QueueItem[], after: readonly QueueItem[],
 }
 
 /**
- * clear_queue 之前的镜像与清出的文字对应：两次读取之间只可能有队首项被消费，清出的文字是镜像的后缀。
- * 返回与 texts 等长的归属确定的草稿（无法确认的位置为 undefined），以及归属不明、至少有一个候选被清出的分组草稿。
- * 分组草稿可能已发送，也可能仍在队列中，由用户确认是否放回，既不自动占用某个候选的位置，也不丢弃。
+ * clear_queue 之前的镜像与清出的文字对应。两次读取之间队首项可能被消费，扩展也可能在队尾追加消息，
+ * 所以清出的文字 = 镜像的后缀 + 追加项；取追加项最少的对齐方式，它保留的镜像项最多。
+ * 返回与 texts 等长的归属确定的草稿（无法确认的位置为 undefined），以及至少有一个候选被清出、但归属不明的草稿。
+ * 归属不明的草稿可能已发送，也可能仍在队列中，交给输入框放回并提示用户检查，不占用某个位置，也不丢弃。
+ * 候选分组的草稿属于这一类；需要假定有追加项才能对齐时，对应位置的文字可能是扩展追加的同文消息，
+ * 除非该位置的文字就是发送时的编码文字或带有同一图片标记，否则也属于这一类。
  */
 export function restore(snapshot: readonly QueueItem[], texts: readonly string[]): { certain: (DraftClaim | undefined)[]; uncertain: DraftClaim[] } {
-  const offset = snapshot.length - texts.length;
-  const items = texts.map((text, i) => {
-    const item = offset >= 0 ? snapshot[offset + i] : undefined;
-    return item && item.text === text ? item : undefined;
-  });
-  const certain = items.map((item) => item?.claim && item.claim.candidates === 1 ? item.claim : undefined);
-  const uncertain = [...new Set(items.flatMap((item) => item?.claim && item.claim.candidates > 1 ? [item.claim] : []))];
+  let appended = 0;
+  while (appended < texts.length && !texts.slice(0, texts.length - appended).every((text, i, base) => snapshot[snapshot.length - base.length + i]?.text === text)) appended++;
+  const offset = snapshot.length - (texts.length - appended);
+  const items = texts.map((_, i) => i < texts.length - appended ? snapshot[offset + i] : undefined);
+  const sure = (item: QueueItem) => {
+    const { candidates, key } = item.claim!;
+    if (candidates !== 1) return false;
+    const nonce = nonceOf(item.text);
+    return appended === 0 || item.text === key || (nonce !== undefined && nonce === nonceOf(key ?? ""));
+  };
+  const certain = items.map((item) => item?.claim && sure(item) ? item.claim : undefined);
+  const uncertain = [...new Set(items.flatMap((item) => item?.claim && !sure(item) ? [item.claim] : []))];
   return { certain, uncertain };
 }
 

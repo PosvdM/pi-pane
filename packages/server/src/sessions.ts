@@ -475,7 +475,7 @@ export class Sessions {
     const uncertain = [...new Set([...steering.uncertain, ...followUp.uncertain])];
     if (!session.handle || session.handle === handle) session.queued = emptyMirror();
     const queuedDrafts = items.map((item) => item?.draft);
-    // 归属不明的草稿只交给用户确认，其候选位置不再按文字回退查找。
+    // 归属不明的草稿另外交出，由输入框放在确定的草稿之后并提示用户检查；其候选位置只放回实际文字，不再按文字回退查找。
     const grouped = new Set(uncertain.flatMap((claim) => claim.key ? [claim.key] : []));
     const keys = texts.map((text, i) => {
       if (queuedDrafts[i]) return items[i]?.key;
