@@ -46,8 +46,8 @@ for (const scenario of ["empty", "extension-cancel", "provider-error"]) test(`�
     assert.match(result.value.message, scenario === "empty" ? /Nothing to compact/ : scenario === "extension-cancel" ? /cancelled/ : /injected compaction provider failure/);
     const end = events.find(e => e.type === "compaction_end"); assert.ok(end); assert.equal(end.reason, "manual"); assert.equal(end.willRetry, false); assert.equal(end.aborted, scenario === "extension-cancel");
     const after = await snapshot(server, token, state.ref.id); assert.equal(after.status, "idle"); assert.equal(after.inFlight.phase, "idle");
-    const real = (await server.sessions.query(state.ref.id, "get_state")).data;
-    assert.equal(real.isCompacting, false); assert.equal(real.isStreaming, false);
+    const real = await server.sessions.query(state.ref.id, "state");
+    assert.equal(real.compacting, false); assert.equal(real.running, false);
     assert.equal(events.some(e => e.type === "agent_start" || e.type === "agent_settled"), false, "手动操作没有生成回合补发 settled");
     off(); await server.sessions.reclaim(); assert.equal((await snapshot(server, token, state.ref.id)).readonly, true);
   } finally { await server.close(); await f.cleanup(); }

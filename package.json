@@ -11,7 +11,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && npm run build --workspace @pi-pane/web",
     "clean": "tsc -b --clean",
     "pretest": "npm run build",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\"",

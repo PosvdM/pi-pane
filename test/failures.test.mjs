@@ -50,7 +50,7 @@ test("停止不响应 abort 的 pi：清空含图片草稿队列并按覆盖范�
     const queued = await control(server, token, await snapshot(server, token, id), { type: "follow_up", message: "排队的文字" }); assert.equal(queued.code, 200, JSON.stringify(queued));
     const stopped = await control(server, token, await snapshot(server, token, id), { type: "stop" });
     assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.deepEqual(stopped.value.clearedText, ["排队的文字"]);
-    const report = stopped.value.stopReport; assert.ok(report); assert.equal(report.leftovers.length, 0);
+    const report = server.sessions.reports.at(-1); assert.equal("stopReport" in stopped.value, false); assert.ok(report); assert.equal(report.leftovers.length, 0);
     assert.equal(report.coverage, process.platform === "win32" ? "job_object" : process.platform === "linux" && containment !== "snapshot" && await linuxCgroupSupport() ? "cgroup" : "snapshot_visible");
     assert.ok(report.steps.some(s => s.step === "abort" && !s.ok));
     await until(async () => await isSameProcess(writer) === "gone", process.platform === "win32" ? 2000 : 1000);
