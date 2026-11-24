@@ -298,12 +298,14 @@ export async function stopRun(): Promise<void> {
 }
 
 /**
- * 把清出的排队消息放回所属会话的输入框：确定的草稿在前，归属不明、可能已发送的草稿在后，由输入框提示用户检查。
- * 不弹确认框，也不看当前导航：草稿按 sessionId 交付，用户已切换到其他会话时存入原会话的待放回记录。
+ * 把清出的排队消息放回发起请求时所在会话的输入框：确定的草稿在前，归属不明、可能已发送的草稿在后，由输入框提示用户检查。
+ * 不弹确认框，也不看当前导航：用户已切换到其他会话时存入原会话的待放回记录。
  */
 function restoreCleared(sessionId: string, result: { clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }): void {
-  const uncertain = result.uncertainDrafts ?? [];
-  deliverRestored(localStorage, sessionId, { drafts: [...result.clearedDrafts, ...uncertain], uncertain: uncertain.length });
+  deliverRestored(localStorage, sessionId, [
+    ...result.clearedDrafts.map((nodes) => ({ nodes, uncertain: false })),
+    ...(result.uncertainDrafts ?? []).map((nodes) => ({ nodes, uncertain: true })),
+  ]);
 }
 
 export async function restart(): Promise<void> {

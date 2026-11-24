@@ -68,6 +68,15 @@ async function draftNodes(page) {
 }
 const stored = (page, key) => page.evaluate(key => JSON.parse(localStorage.getItem(key) ?? "null"), key);
 const toasts = async page => (await byId(page, "toast").allTextContents()).join("\n");
+/** 该会话的待放回记录：每批一个键，按清出时间排序。 */
+const pending = (page, id) => page.evaluate(prefix => Object.keys(localStorage).filter(key => key.startsWith(prefix)).sort()
+  .map(key => JSON.parse(localStorage.getItem(key)).drafts), `pi-pane.restored.${id}.`);
+const NOTICE = "放回的草稿中有 1 条带图片的消息被扩展改写过，可能已经发送，请检查后再决定是否重发。";
+async function noticeShown(page, shown = true) {
+  if (shown) { await byId(page, "restored-notice").waitFor(); assert.match(await byId(page, "restored-notice").textContent(), new RegExp(NOTICE)); }
+  else assert.equal(await byId(page, "restored-notice").count(), 0);
+}
+const batch = draft => [...CLEARED.map(value => ({ nodes: text(value), uncertain: false })), { nodes: draft, uncertain: true }];
 
 /** 在当前会话中开始一轮挂起的回复，排入一条会被扩展改写的图片草稿和一条纯文字草稿。 */
 async function queueDrafts(s) {
@@ -119,24 +128,35 @@ test("取回草稿 Chrome 停止后确定与归属不明的草稿都放回输入
   const want = expected(draft, text("现有草稿"));
   assert.deepEqual(await draftNodes(page), want, "清出的草稿按原顺序放在现有草稿之前，归属不明的排在确定的之后");
   assert.deepEqual(await stored(page, `pi-pane.draft.${a.ref.id}`), want, "放回后立即写入该会话的草稿");
-  assert.equal(await stored(page, `pi-pane.restored.${a.ref.id}`), null);
+  assert.deepEqual(await pending(page, a.ref.id), []);
   await settled(page);
   assert.equal(await byId(page, "choice-dialog").count(), 0, "放回草稿不经确认框");
   assert.match(await toasts(page), /排队中的消息已放回输入框/);
-  assert.match(await toasts(page), /其中 1 条带图片的消息被扩展改写过，可能已经发送/);
+  await noticeShown(page);
+  assert.equal(await stored(page, `pi-pane.restored-notice.${a.ref.id}`), 1, "提示随该会话保存");
   await idle(s);
 
   await page.reload();
   await byId(page, "composer").waitFor();
   await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
   assert.deepEqual(await draftNodes(page), want, "刷新页面后草稿仍在");
+  await noticeShown(page);
+  // R9-2：提示显示在输入框上方，不在通知列表中，只在所属会话显示。
+  assert.doesNotMatch(await toasts(page), /可能已经发送/);
+  await choose(page, b);
+  await noticeShown(page, false);
+  await choose(page, a);
+  await noticeShown(page);
 
   // 明确放弃：用户在输入框中删除，与其他编辑相同；之后切换会话不会再出现。
   await byId(page, "composer").fill("");
   await page.waitForFunction(key => localStorage.getItem(key) === null, `pi-pane.draft.${a.ref.id}`);
+  await noticeShown(page, false);
+  assert.equal(await stored(page, `pi-pane.restored-notice.${a.ref.id}`), null, "草稿处理掉后提示一并清除");
   await choose(page, b);
   await choose(page, a);
   assert.deepEqual(await draftNodes(page), []);
+  await noticeShown(page, false);
   assert.equal((await records(s.fixture.env.FAKE_REQUEST_LOG)).filter(row => row.kind === "request").length, 3, "放回的草稿未自动发送");
 });
 
@@ -178,8 +198,9 @@ for (const kind of ["stop", "close"]) {
       assert.match(await dialog.textContent(), /会话仍被保活/);
       assert.equal(await byId(page, "composer").innerText(), "乙的草稿", "A 的草稿不得进入 B 的输入框");
       assert.doesNotMatch(await toasts(page), /放回输入框|可能已经发送/);
-      assert.deepEqual(await stored(page, `pi-pane.restored.${a.ref.id}`), { drafts: [...CLEARED.map(text), draft], uncertain: 1 }, "A 的草稿存入 A 的待放回记录");
-      assert.equal(await stored(page, `pi-pane.restored.${b.ref.id}`), null);
+      await noticeShown(page, false);
+      assert.deepEqual(await pending(page, a.ref.id), [batch(draft)], "A 的草稿存入 A 的待放回记录，逐条标记归属不明");
+      assert.deepEqual(await pending(page, b.ref.id), []);
       await dialog.locator('[data-choice="cancel"]').click();
       await dialog.waitFor({ state: "detached" });
       assert.equal(bCloses, 1, "取消后不得再提交关闭");
@@ -189,11 +210,12 @@ for (const kind of ["stop", "close"]) {
       const want = expected(draft);
       assert.deepEqual(await draftNodes(page), want);
       assert.deepEqual(await stored(page, `pi-pane.draft.${a.ref.id}`), want);
-      assert.equal(await stored(page, `pi-pane.restored.${a.ref.id}`), null, "放回后删除待放回记录");
-      assert.match(await toasts(page), /其中 1 条带图片的消息被扩展改写过，可能已经发送/);
+      assert.deepEqual(await pending(page, a.ref.id), [], "放回后删除待放回记录");
+      await noticeShown(page);
       assert.equal(await byId(page, "choice-dialog").count(), 0);
       await choose(page, b);
       assert.equal(await byId(page, "composer").innerText(), "乙的草稿");
+      await noticeShown(page, false);
     } finally { deliver.release(); await page.unrouteAll({ behavior: "wait" }); }
   });
 }
@@ -220,7 +242,7 @@ test("取回草稿 Chrome 待放回的草稿在服务端同端口重启、重新
     assertStopped(result, draft);
     await choose(page, b);
     deliver.release();
-    await until(async () => await stored(page, `pi-pane.restored.${a.ref.id}`) !== null);
+    await until(async () => (await pending(page, a.ref.id)).length === 1);
   } finally { deliver.release(); await page.unrouteAll({ behavior: "wait" }); }
 
   const origin = s.server.origin;
@@ -237,5 +259,72 @@ test("取回草稿 Chrome 待放回的草稿在服务端同端口重启、重新
   await paired.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
   await byId(paired, "composer").locator(".chip[data-asset-id]").waitFor();
   assert.deepEqual(await draftNodes(paired), expected(draft), "会话 id 取自会话文件，重启后仍对应原会话");
-  assert.equal(await stored(paired, `pi-pane.restored.${a.ref.id}`), null);
+  assert.deepEqual(await pending(paired, a.ref.id), []);
+  await noticeShown(paired);
+});
+
+test("R9-3 取回草稿 Chrome 有排队消息时在输入框执行 /quit，关闭后只留下取回的草稿", { timeout: 120_000 }, async t => {
+  // 关闭运行中的会话时，abort 产生的 idle 事件触发的统计查询可能晚于进程退出，返回 409 notHosted，界面忽略该结果。
+  const s = await setup(t, replyScript("预热完成"), { serverOptions, allowedErrors: [/status of 409 \(Conflict\)/] }); if (!s) return;
+  const { page } = s;
+  const a = await create(s, "退出甲");
+  const draft = await queueDrafts(s);
+  const closing = page.waitForResponse(response => response.url().endsWith("/control") && response.request().postDataJSON().command.type === "close");
+  await dispatch(page, "/quit");
+  assertStopped(await (await closing).json(), draft);
+  await page.getByText("未启动（发送消息后启动 pi）", { exact: true }).waitFor();
+  await byId(page, "composer").locator(".chip[data-asset-id]").waitFor();
+  await settled(page);
+  const want = expected(draft);
+  assert.deepEqual(await draftNodes(page), want, "已执行的 /quit 不得留在输入框");
+  assert.doesNotMatch(await byId(page, "composer").innerText(), /\/quit/);
+  await page.waitForFunction(({ key, value }) => localStorage.getItem(key) === value, { key: `pi-pane.draft.${a.ref.id}`, value: JSON.stringify(want) });
+  await noticeShown(page);
+});
+
+test("R9-1 取回草稿 Chrome 浏览器存储写入失败时草稿留在内存，只在原会话显示错误提示", { timeout: 120_000 }, async t => {
+  const s = await setup(t, replyScript("预热完成"), { serverOptions, allowedErrors: [/status of 409 \(Conflict\)/] }); if (!s) return;
+  const { page } = s;
+  const b = await create(s, "配额乙");
+  const a = await create(s, "配额甲");
+  const draft = await queueDrafts(s);
+  const deliver = latch(); let result;
+  await page.route("**/api/sessions/*/control", async route => {
+    if (!route.request().url().endsWith(`/${a.ref.id}/control`) || route.request().postDataJSON().command.type !== "stop") return route.continue();
+    const response = await route.fetch();
+    result = await response.json();
+    await deliver.promise; await route.fulfill({ response });
+  });
+  try {
+    await byId(page, "stop").click();
+    await until(() => result);
+    assertStopped(result, draft);
+    await choose(page, b);
+    // 模拟配额已满：之后所有 pi-pane 草稿记录的写入都抛出 QuotaExceededError。
+    await page.evaluate(() => {
+      const original = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (key, value) {
+        if (String(key).startsWith("pi-pane.draft.") || String(key).startsWith("pi-pane.restored")) throw new DOMException("模拟配额已满", "QuotaExceededError");
+        return original.call(this, key, value);
+      };
+    });
+    const delivered = page.waitForResponse(response => response.url().endsWith(`/${a.ref.id}/control`) && response.request().postDataJSON().command.type === "stop");
+    deliver.release(); await (await delivered).finished(); await settled(page);
+    assert.deepEqual(await pending(page, a.ref.id), [], "写入失败，localStorage 中没有记录");
+    assert.equal(await byId(page, "unsaved-notice").count(), 0, "错误提示不显示在 B");
+    assert.equal(await byId(page, "choice-dialog").count(), 0);
+  } finally { deliver.release(); await page.unrouteAll({ behavior: "wait" }); }
+  await choose(page, a);
+  await byId(page, "composer").locator(".chip[data-asset-id]").waitFor();
+  assert.deepEqual(await draftNodes(page), expected(draft), "内存中的草稿放回原会话输入框");
+  await byId(page, "unsaved-notice").waitFor();
+  assert.match(await byId(page, "unsaved-notice").textContent(), /只保存到页面关闭前/);
+  await noticeShown(page);
+  assert.equal(await stored(page, `pi-pane.draft.${a.ref.id}`), null);
+  // 切换会话后草稿仍在内存中。
+  await choose(page, b);
+  assert.equal(await byId(page, "unsaved-notice").count(), 0);
+  await choose(page, a);
+  assert.deepEqual(await draftNodes(page), expected(draft));
+  await byId(page, "unsaved-notice").waitFor();
 });

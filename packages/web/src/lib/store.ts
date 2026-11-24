@@ -3,7 +3,9 @@ import { useEffect, useState } from "preact/hooks";
 
 export class Store<T> {
   private listeners = new Set<() => void>();
-  constructor(private value: T) {}
+  private value: T;
+  // 不用参数属性：Node.js 的类型剥离不支持，纯逻辑测试需要直接导入本文件。
+  constructor(value: T) { this.value = value; }
   get(): T { return this.value; }
   set(next: T | ((value: T) => T)): void {
     this.value = typeof next === "function" ? (next as (value: T) => T)(this.value) : next;

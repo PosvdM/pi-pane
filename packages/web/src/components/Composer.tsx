@@ -6,7 +6,7 @@ import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
 import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { attachComposer, pendingKey, takePending, type RestoredDrafts } from "../lib/restored.ts";
+import { attachComposer, batchPrefix, loadDraft, loadNotice, saveDraft, saveNotice, takePending, unsavedSessions, type RestoredDraft } from "../lib/restored.ts";
 import { closeSession, control, current, editorText, navigation, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
@@ -15,7 +15,6 @@ import type { DraftNode, PaneCommand, PaneControlCommand, PaneThinkingLevel } fr
 import { downloadExport, sidebarOpen } from "../lib/actions.ts";
 
 const DRAFT_MIME = "application/x-pi-pane-draft";
-const draftKey = (id: string) => `pi-pane.draft.${id}`;
 
 export const BUILTIN: { name: string; description: string }[] = [
   { name: "compact", description: "压缩上下文，可附说明" },
@@ -76,6 +75,16 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   const dragged = useRef<HTMLElement | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const external = useStore(editorText);
+  const unsaved = useStore(unsavedSessions).has(sessionId);
+  // 放回的草稿中仍待用户检查的归属不明条数，随会话保存；输入框清空或用户点“知道了”后清除。
+  const [notice, setNotice] = useState(0);
+  const noticeRef = useRef(0);
+  const updateNotice = (count: number) => {
+    if (noticeRef.current === count) return;
+    noticeRef.current = count; setNotice(count); saveNotice(localStorage, sessionId, count);
+  };
+  /** 每次放回的草稿依次记录，提交命令或消息后据此只清除已提交的内容。 */
+  const restoredLog = useRef<DraftNode[][][]>([]);
   const view = model.view;
   const phase = view.inFlight?.phase ?? "idle";
   const running = phase !== "idle" || view.status === "running";
@@ -87,12 +96,13 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     clearTimeout(saveTimer.current);
     const pending = pendingSave.current; pendingSave.current = null;
     if (!pending) return;
-    if (isEmpty(pending.nodes)) localStorage.removeItem(draftKey(pending.sessionId)); else localStorage.setItem(draftKey(pending.sessionId), JSON.stringify(pending.nodes));
+    saveDraft(localStorage, pending.sessionId, pending.nodes);
   };
   const refresh = () => {
     if (!editor.current) return;
     const nodes = readNodes(editor.current);
     setEmpty(isEmpty(nodes));
+    if (isEmpty(nodes)) updateNotice(0);
     const slash = !nodes.some((n) => n.type === "image") ? /^\/(\S*)$/.exec(plainText(nodes)) : null;
     setCompletion(slash ? { query: slash[1], index: 0 } : null);
     pendingSave.current = { sessionId, nodes };
@@ -112,25 +122,34 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     }, () => { /* 无法核对时按存在处理，发送时由服务端校验。 */ });
   };
 
-  // 切换会话时恢复该会话保存在 localStorage 的草稿，再放回停止或关闭时清出、尚未放回的草稿；离开时先写入尚未保存的编辑。
+  // 切换会话时恢复该会话保存的草稿，再放回停止或关闭时清出、尚未放回的草稿；离开时先写入尚未保存的编辑。
   // 用 layout effect 在浏览器绘制和用户输入之前完成恢复，避免覆盖挂载后立即输入的内容。
   useLayoutEffect(() => {
     const el = editor.current!;
-    let nodes: DraftNode[] = [];
-    try { nodes = JSON.parse(localStorage.getItem(draftKey(sessionId)) ?? "[]"); } catch { /* 草稿损坏时丢弃。 */ }
-    setNodes(Array.isArray(nodes) ? nodes : []);
-    // 清出的草稿放在现有草稿之前，并立即写入 localStorage，之后才删除待放回记录。
-    const sink = ({ drafts, uncertain }: RestoredDrafts) => {
-      setNodes(prependDrafts(drafts, readNodes(el)));
+    let alive = true;
+    noticeRef.current = loadNotice(localStorage, sessionId); setNotice(noticeRef.current);
+    setNodes(loadDraft(localStorage, sessionId));
+    // 清出的草稿放在现有草稿之前，并立即保存，之后才删除待放回记录。
+    const sink = (drafts: RestoredDraft[]) => {
+      const nodes = drafts.map((draft) => draft.nodes);
+      setNodes(prependDrafts(nodes, readNodes(el)));
       flush();
+      restoredLog.current.push(nodes);
+      const uncertain = drafts.filter((draft) => draft.uncertain).length;
+      if (uncertain) updateNotice(noticeRef.current + uncertain);
       toast("排队中的消息已放回输入框");
-      if (uncertain) toast(`其中 ${uncertain} 条带图片的消息被扩展改写过，可能已经发送，请检查后再决定是否重发`, "warning", true);
     };
-    const detach = attachComposer(localStorage, sessionId, sink);
+    const detach = attachComposer(sessionId, sink);
+    // 同一会话可能在多个标签页挂载：用 Web Lock 串行取走待放回记录，避免同一批放回两次。
+    const take = () => {
+      const run = () => { if (alive) takePending(localStorage, sessionId, sink); };
+      if (navigator.locks) void navigator.locks.request(batchPrefix(sessionId), run); else run();
+    };
+    take();
     // 其他标签页在本会话的输入框未挂载时存入的待放回草稿。
-    const onStorage = (event: StorageEvent) => { if (event.key === pendingKey(sessionId) && event.newValue) takePending(localStorage, sessionId, sink); };
+    const onStorage = (event: StorageEvent) => { if (event.key?.startsWith(batchPrefix(sessionId)) && event.newValue) take(); };
     addEventListener("storage", onStorage);
-    return () => { removeEventListener("storage", onStorage); detach(); flush(); };
+    return () => { alive = false; removeEventListener("storage", onStorage); detach(); flush(); };
   }, [sessionId]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;
@@ -289,6 +308,18 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     return "prompt";
   }
 
+  /**
+   * 提交成功后从输入框删除已提交的内容。等待期间用户编辑过时保留输入框；等待期间放回的草稿
+   * （例如 /quit 关闭会话时清出的排队消息）在已提交内容之前，只删除已提交的部分。
+   */
+  function clearSubmitted(el: HTMLDivElement, nodes: DraftNode[], mark: number) {
+    if (!el.isConnected) return;
+    let expected = nodes; let rest: DraftNode[] = [];
+    for (const restored of restoredLog.current.slice(mark)) { expected = prependDrafts(restored, expected); rest = prependDrafts(restored, rest); }
+    if (JSON.stringify(readNodes(el)) !== JSON.stringify(normalize(expected))) return;
+    if (isEmpty(rest)) { el.innerHTML = ""; refresh(); } else { setNodes(rest); flush(); }
+  }
+
   async function send(delivery?: "steer" | "follow_up") {
     const el = editor.current; if (!el || busy || blocked) return;
     // 操作归属：等待期间导航到其他会话后，不再弹确认框或重发到新会话。
@@ -296,6 +327,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     const stale = () => navigation() !== owner || !el.isConnected;
     const nodes = readNodes(el);
     if (isEmpty(nodes)) return;
+    const mark = restoredLog.current.length;
     setCompletion(null);
     const command = parseSlash(nodes);
     let viaPrompt = false;
@@ -305,7 +337,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
       try { outcome = await slash(command.name, command.args); }
       finally { setBusy(false); }
       if (outcome === "failed") return;
-      if (outcome === "ok") { if (el.isConnected && JSON.stringify(readNodes(el)) === JSON.stringify(nodes)) { el.innerHTML = ""; refresh(); } return; }
+      if (outcome === "ok") { clearSubmitted(el, nodes, mark); return; }
       viaPrompt = true;
     }
     if (el.querySelector(".chip.expired")) { toast("图片已过期，请重新添加", "warning"); return; }
@@ -322,7 +354,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
         const outcome = await control(type === "prompt" && promptDelivery ? { type, delivery: promptDelivery } : { type }, nodes);
         if (stale()) return;
         if (outcome.ok) {
-          if (el.isConnected && JSON.stringify(readNodes(el)) === JSON.stringify(nodes)) { el.innerHTML = ""; refresh(); }
+          clearSubmitted(el, nodes, mark);
           if (outcome.result.status === "accepted" && outcome.result.result?.handled) toast("消息已由扩展处理");
           return;
         }
@@ -370,6 +402,13 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
               <span class="cmd">/{item.name}</span><span class="desc">{item.description}</span><span class="src">{item.source}</span>
             </div>
           ))}
+        </div>
+      )}
+      {unsaved && <div class="composer-notice error" data-testid="unsaved-notice" role="alert">浏览器存储空间不足，这个会话的草稿只保存到页面关闭前。请先发送或复制草稿，或清理浏览器存储。</div>}
+      {notice > 0 && (
+        <div class="composer-notice warn" data-testid="restored-notice">
+          <span>放回的草稿中有 {notice} 条带图片的消息被扩展改写过，可能已经发送，请检查后再决定是否重发。</span>
+          <button class="btn ghost" data-testid="restored-notice-dismiss" onClick={() => updateNotice(0)}>知道了</button>
         </div>
       )}
       {blocked && <div class="composer-blocked">{blocked}</div>}
