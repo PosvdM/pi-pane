@@ -57,6 +57,7 @@
 | `lib/api.ts`、`lib/auth.ts` | HTTP 调用与错误、配对、标签页凭证共享和失效处理 |
 | `lib/ws.ts` | WebSocket 首帧鉴权、断线重连和游标续订 |
 | `lib/session.ts`、`lib/session-model.ts` | 会话导航、快照、控制命令与状态查询；按游标投影会话事件 |
+| `lib/response-order.ts` | 并发请求的采用规则：响应比已采用的结果新才采用，失败不撤销已采用的结果 |
 | `lib/draft.ts`、`lib/images.ts`、`lib/blobs.ts` | 图文草稿运算、图片缩放与上传、鉴权取图及 blob URL 缓存 |
 | `lib/restored.ts` | 输入框草稿的保存（写入失败时暂存内存）、在途提交与页面关闭后的取回、归属不明提示；停止、关闭清出或没有送达的草稿按会话交给输入框，未挂载时存入待放回记录 |
 | `lib/markdown.ts` | 不可信 Markdown 的链接过滤、远程图片替代和代码高亮 |

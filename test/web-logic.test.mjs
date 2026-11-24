@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { fromSnapshot, apply, prependHistory } from "../packages/web/src/lib/session-model.ts";
 import { normalize, plainText, prependDrafts, displayQueued, parseSlash, isEmpty, imageIds } from "../packages/web/src/lib/draft.ts";
 import { canonicalize, JcsError } from "../packages/web/src/lib/jcs.ts";
+import { ResponseOrder } from "../packages/web/src/lib/response-order.ts";
 import { SessionModel } from "../packages/server/dist/model.js";
 import { NUMBER_VECTORS, hexToDouble, SAMPLE_INPUT, SAMPLE_OUTPUT, SORT_INPUT, SORT_EXPECTED_OUTPUT } from "./fixtures/jcs-vectors.mjs";
 
@@ -168,4 +169,34 @@ test("JCS 拒绝非有限数、孤立代理项及不可表示的 JSON 输入", (
   for (const value of [NaN, Infinity, -Infinity, "\ud800", "\udc00", { "\ud800": 1 }, { x: "\udc00" }, undefined, 1n, () => 1, { x: undefined }, new Date()]) {
     assert.throws(() => canonicalize(value), JcsError);
   }
+});
+
+test("并发请求只采用比已采用结果新的响应，失败不撤销已采用的结果", () => {
+  // 后发请求失败时，先发请求晚到的成功响应仍比已采用的结果新，应当采用，错误继续显示。
+  let order = new ResponseOrder();
+  const first = order.begin(), second = order.begin();
+  assert.equal(order.fail(second), true);
+  assert.equal(order.failedSinceAdopted, true);
+  assert.equal(order.pending, true);
+  assert.equal(order.succeed(first), true);
+  assert.equal(order.failedSinceAdopted, true, "后发请求的失败比采用的结果新");
+  assert.equal(order.pending, false);
+
+  // 后发请求已采用时，先发请求晚到的成功或失败都不覆盖。
+  order = new ResponseOrder();
+  const a = order.begin(), b = order.begin(), c = order.begin(), d = order.begin();
+  assert.equal(order.succeed(c), true);
+  assert.equal(order.succeed(a), false);
+  assert.equal(order.fail(b), false);
+  assert.equal(order.failedSinceAdopted, false);
+  assert.equal(order.succeed(d), true, "更晚发出的请求即使最后到也采用");
+  assert.equal(order.pending, false);
+
+  // 失败之后有更新的成功时，错误不再显示。
+  order = new ResponseOrder();
+  const x = order.begin();
+  assert.equal(order.fail(x), true);
+  const y = order.begin();
+  assert.equal(order.succeed(y), true);
+  assert.equal(order.failedSinceAdopted, false);
 });
