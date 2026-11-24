@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { readSession } from "../packages/server/dist/store.js";
@@ -43,16 +44,27 @@ test("Chrome 新会话首轮在跟随打开的快照之前结束，侧栏仍列�
   await newSession(page, fixture);
   const placeholder = await byId(page, "chat").getAttribute("data-session-id");
   const credential = await page.evaluate(() => JSON.parse(sessionStorage.getItem("pi-pane.auth")).credential);
-  // 扣住跟随替换打开新会话的快照请求，直到服务端确认首轮已经结束，使快照之后不再有 idle 事件。
-  let followed = null;
+  // 扣住跟随替换打开新会话的快照请求，直到首轮确实结束：重绑定时新会话先处于 idle、尚无条目，
+  // 所以还要求助手回复已持久化、会话文件已创建。这样快照之后不再有 idle 事件。
+  let followed = null, gate = null;
+  const firstTurnDone = async id => {
+    const view = await snapshot(server, credential, id);
+    return view.status === "idle" && view.inFlight?.phase === "idle" && view.sessionFile && existsSync(view.sessionFile)
+      && view.entries.some(entry => entry.message?.role === "assistant" && textOf(entry.message) === "已回复");
+  };
   await page.route("**/api/sessions/*/snapshot", async route => {
     const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/")[3]);
     if (id === placeholder || followed) { await route.continue(); return; }
     followed = id;
-    await until(async () => { const view = await snapshot(server, credential, id); return view.status === "idle" && view.inFlight?.phase === "idle"; }, 30_000);
+    // 等待超时或出错时也放行快照，错误留给测试正文报告。
+    gate = until(() => firstTurnDone(id), 30_000).then(() => null, error => error);
+    await gate;
     await route.continue();
   });
   await send(page, "首轮立即结束");
+  await until(() => followed, 15_000);
+  assert.ifError(await gate);
+  await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.getAttribute("data-session-id") === id, followed);
   const view = await idle(s);
   assert.equal(view.ref.id, followed, "页面应跟随替换打开新会话");
   await sessionItem(page, view.sessionFile).waitFor({ timeout: 5_000 });
