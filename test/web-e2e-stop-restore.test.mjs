@@ -519,9 +519,10 @@ test("提交即清空 Chrome 提交后、结果返回前刷新页面，内容回
   await until(() => hits === 1);
   assert.equal(await byId(page, "composer").innerText(), "");
   assert.deepEqual(await flights(page, a.ref.id), [text("刷新前的在途消息")]);
-  await page.unrouteAll({ behavior: "ignoreErrors" });
+  // 拦截保持到刷新：解除拦截会放行被扣住的请求，它可能在刷新前送达，提交以已送达结束。刷新时浏览器取消该请求，服务端收不到。
   await page.reload();
   await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
+  assert.equal((await records(s.fixture.env.FAKE_REQUEST_LOG)).filter(row => JSON.stringify(row).includes("刷新前的在途消息")).length, 0, "被扣住的提交不能送达");
   await page.waitForFunction(() => document.querySelector('[data-testid="composer"]')?.innerText === "刷新前的在途消息", null, { timeout: 10_000 });
   await noticeShown(page);
   assert.deepEqual(await flights(page, a.ref.id), []);
