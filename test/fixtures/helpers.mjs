@@ -23,7 +23,10 @@ export async function until(fn, ms = 10_000, interval = 25) {
 let pi;
 export async function piInstall() {
   pi ??= await locatePi(process.env.PI_PACKAGE ? { piPath: process.env.PI_PACKAGE } : {});
-  if (pi.version !== "1.5.0") throw new Error(`驱动集成测试要求 pi 1.5.0，当前为 ${pi.version}`);
+  if (!pi.supported) throw new Error(`驱动集成测试要求 pi 1.5.x 或 1.6.x，当前为 ${pi.version}`);
+  // CI 按矩阵安装指定版本的 pi，断言测试实际使用的就是该版本。
+  const expected = process.env.HOSTKIT_TEST_PI_VERSION;
+  if (expected && pi.version !== expected) throw new Error(`HOSTKIT_TEST_PI_VERSION 要求 pi ${expected}，实际找到 ${pi.version}（${pi.packageDir}）`);
   return pi;
 }
 export async function piFixture(script = { turns: [] }) {
