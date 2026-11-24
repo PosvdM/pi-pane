@@ -1,7 +1,7 @@
 // 当前打开的会话：取快照、订阅事件、发送控制命令、处理冲突与会话替换。
 import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
-import { prependDrafts } from "./draft.ts";
+import { deliverRestored } from "./restored.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
@@ -23,8 +23,6 @@ export interface Current {
 export const current = new Store<Current | null>(null);
 export const sessionList = new Store<{ items: PaneSessionListItem[]; loading: boolean; error?: string }>({ items: [], loading: false });
 
-/** 停止或冲突后需要放回输入框的草稿；输入框订阅后取走。 */
-export const restoredDrafts = new Store<{ sessionId: string; drafts: DraftNode[][] } | null>(null);
 /** 扩展用 set_editor_text 设置的输入框文字。 */
 export const editorText = new Store<{ sessionId: string; text: string; seq: number } | null>(null);
 
@@ -296,26 +294,16 @@ export async function stopRun(): Promise<void> {
     } else toast(outcome.error.message, "error");
     return;
   }
-  if (outcome.result.status === "done") await restoreCleared(state.id, outcome.result);
+  if (outcome.result.status === "done") restoreCleared(state.id, outcome.result);
 }
 
 /**
- * 把清出的排队消息放回该会话的输入框。归属不明、可能已发送的草稿也放回（排在后面）并提示用户检查，
- * 不弹确认框：确认框可能被关闭、被替换或出现在已切换的会话里，会丢失草稿。
+ * 把清出的排队消息放回所属会话的输入框：确定的草稿在前，归属不明、可能已发送的草稿在后，由输入框提示用户检查。
+ * 不弹确认框，也不看当前导航：草稿按 sessionId 交付，用户已切换到其他会话时存入原会话的待放回记录。
  */
-async function restoreCleared(sessionId: string, result: { clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }): Promise<void> {
-  const drafts = [...result.clearedDrafts, ...(result.uncertainDrafts ?? [])];
-  if (result.uncertainDrafts?.length) toast(`有 ${result.uncertainDrafts.length} 条带图片的消息被扩展改写过，无法确认是否已发送，已一并放回输入框，请检查后再发送`, "warning", true);
-  if (!drafts.length) return;
-  // 已切换到其他会话时直接写入原会话保存的草稿，回到该会话时恢复；不占用当前输入框的取回槽位。
-  if (current.get()?.id !== sessionId) {
-    const key = `pi-pane.draft.${sessionId}`;
-    let existing: DraftNode[] = [];
-    try { existing = JSON.parse(localStorage.getItem(key) ?? "[]"); } catch { /* 损坏的草稿按空处理。 */ }
-    localStorage.setItem(key, JSON.stringify(prependDrafts(drafts, Array.isArray(existing) ? existing : [])));
-    return;
-  }
-  restoredDrafts.set({ sessionId, drafts });
+function restoreCleared(sessionId: string, result: { clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }): void {
+  const uncertain = result.uncertainDrafts ?? [];
+  deliverRestored(localStorage, sessionId, { drafts: [...result.clearedDrafts, ...uncertain], uncertain: uncertain.length });
 }
 
 export async function restart(): Promise<void> {
@@ -342,7 +330,7 @@ export async function closeSession(): Promise<boolean> {
     outcome = await control({ type: "close", confirmHolds: true });
   }
   if (!outcome.ok) { toast(outcome.error.code === "revisionChanged" ? "会话状态已变化，请确认后重新关闭" : outcome.error.message, "error"); return false; }
-  if (outcome.result.status === "done") await restoreCleared(state.id, outcome.result);
+  if (outcome.result.status === "done") restoreCleared(state.id, outcome.result);
   toast("会话已关闭");
   if (current.get()?.id === state.id) void reload();
   return true;

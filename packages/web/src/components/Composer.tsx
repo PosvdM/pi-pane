@@ -6,7 +6,8 @@ import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
 import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { closeSession, control, current, editorText, navigation, restoredDrafts, stopRun, type ControlOutcome } from "../lib/session.ts";
+import { attachComposer, pendingKey, takePending, type RestoredDrafts } from "../lib/restored.ts";
+import { closeSession, control, current, editorText, navigation, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
 import { ask, overlay, toast } from "../lib/ui-state.ts";
@@ -74,7 +75,6 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   const [preview, setPreview] = useState<{ url: string; x: number; y: number } | null>(null);
   const dragged = useRef<HTMLElement | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const restored = useStore(restoredDrafts);
   const external = useStore(editorText);
   const view = model.view;
   const phase = view.inFlight?.phase ?? "idle";
@@ -112,21 +112,26 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     }, () => { /* 无法核对时按存在处理，发送时由服务端校验。 */ });
   };
 
-  // 切换会话时恢复该会话保存在 localStorage 的草稿；离开时先写入尚未保存的编辑。
+  // 切换会话时恢复该会话保存在 localStorage 的草稿，再放回停止或关闭时清出、尚未放回的草稿；离开时先写入尚未保存的编辑。
   // 用 layout effect 在浏览器绘制和用户输入之前完成恢复，避免覆盖挂载后立即输入的内容。
   useLayoutEffect(() => {
+    const el = editor.current!;
     let nodes: DraftNode[] = [];
     try { nodes = JSON.parse(localStorage.getItem(draftKey(sessionId)) ?? "[]"); } catch { /* 草稿损坏时丢弃。 */ }
     setNodes(Array.isArray(nodes) ? nodes : []);
-    return flush;
+    // 清出的草稿放在现有草稿之前，并立即写入 localStorage，之后才删除待放回记录。
+    const sink = ({ drafts, uncertain }: RestoredDrafts) => {
+      setNodes(prependDrafts(drafts, readNodes(el)));
+      flush();
+      toast("排队中的消息已放回输入框");
+      if (uncertain) toast(`其中 ${uncertain} 条带图片的消息被扩展改写过，可能已经发送，请检查后再决定是否重发`, "warning", true);
+    };
+    const detach = attachComposer(localStorage, sessionId, sink);
+    // 其他标签页在本会话的输入框未挂载时存入的待放回草稿。
+    const onStorage = (event: StorageEvent) => { if (event.key === pendingKey(sessionId) && event.newValue) takePending(localStorage, sessionId, sink); };
+    addEventListener("storage", onStorage);
+    return () => { removeEventListener("storage", onStorage); detach(); flush(); };
   }, [sessionId]);
-  // 停止或关闭时清出的排队消息放回输入框，放在现有草稿之前。
-  useEffect(() => {
-    if (!restored || restored.sessionId !== sessionId || !editor.current) return;
-    restoredDrafts.set(null);
-    setNodes(prependDrafts(restored.drafts, readNodes(editor.current)));
-    toast("排队中的消息已放回输入框");
-  }, [restored, sessionId]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;
     editorText.set(null);
