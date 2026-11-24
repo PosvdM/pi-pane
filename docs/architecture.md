@@ -88,6 +88,8 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。
 
+前端（`packages/web/src/lib/session.ts`）在侧栏加载、点击刷新、新建或按文件打开会话、按 id 打开会话（包括跟随会话替换）之后重新请求 `GET /api/sessions`；当前会话回到 idle、被替换或变为只读时，延迟 500 毫秒刷新。pi 在写入首条对话消息时才创建会话文件，新建会话的文件在首轮开始后才出现；跟随替换打开新会话时，首轮可能在取快照前已经结束，订阅后不会再收到 idle 事件，所以打开后立即刷新一次，不依赖后续事件。并发的刷新只采用最后发出的请求的结果。
+
 前端的 `GET /api/sessions`（`PaneSessionList`）、插件的 `MainSessionsApi` 与主会话树使用同一份会话目录（`packages/server/src/session-catalog.ts`）：每次读取存储目录后，把每一行转换为只含所需字段的 `StoredSession`，已在服务端登记的会话再叠加实时状态。两处取值相同的字段如下。
 
 | 字段 | 来源 | `PaneSessionListItem` | `MainSessionInfo` 与树节点 |

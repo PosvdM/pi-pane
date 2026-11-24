@@ -42,13 +42,19 @@ const NETWORK_RETRY_MS = 120000;
 
 const LAST_SESSION_KEY = "pi-pane.lastSession";
 
+/** 最近一次列表请求的序号：并发刷新时只采用最后发出的请求的结果，晚到的旧响应不能覆盖新列表。 */
+let listRequest = 0;
+
 export async function refreshList(): Promise<void> {
+  const mine = ++listRequest;
   sessionList.set((s) => ({ ...s, loading: true, error: undefined }));
   try {
     const { sessions } = await api<PaneSessionList>("/api/sessions");
+    if (mine !== listRequest) return;
     sessions.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
     sessionList.set({ items: sessions, loading: false });
   } catch (error) {
+    if (mine !== listRequest) return;
     sessionList.set((s) => ({ ...s, loading: false, error: (error as Error).message }));
   }
 }
@@ -139,6 +145,9 @@ export async function open(id: string): Promise<void> {
     setModel(id, view);
     attach(id);
     void refreshAuxiliary();
+    // 跟随会话替换打开新会话时，首轮可能在取快照前已经结束，订阅后不再收到 idle 事件；
+    // 会话文件此时已写入，打开后立即刷新列表，不依赖之后的事件。
+    void refreshList();
   } catch (error) {
     if (nav !== mine) return;
     if (error instanceof ApiError && error.status === 404) {

@@ -5,7 +5,8 @@ import path from "node:path";
 import { readSession } from "../packages/server/dist/store.js";
 import { screenshot } from "./fixtures/browser.mjs";
 import { until } from "./fixtures/helpers.mjs";
-import { setup, byId, newSession, send, sessionView, idle, records, replyScript, slowReply } from "./fixtures/web-e2e.mjs";
+import { snapshot } from "./fixtures/client.mjs";
+import { setup, byId, newSession, send, sessionView, idle, records, replyScript, slowReply, sessionItem } from "./fixtures/web-e2e.mjs";
 
 const messages = (disk, role) => disk.entries.filter(entry => entry.message?.role === role).map(entry => entry.message);
 const textOf = message => message.content.filter(block => block.type === "text").map(block => block.text).join("");
@@ -34,6 +35,27 @@ test("Chrome 配对、新建会话和安全 Markdown 回复", { timeout: 90_000 
   await byId(page, "session-item").filter({ hasText: "请返回完整 Markdown 回复" }).waitFor();
   assert.equal(new URL(page.url()).hash, "");
   await screenshot(page, "e2e-conversation-markdown");
+});
+
+test("Chrome 新会话首轮在跟随打开的快照之前结束，侧栏仍列出该会话", { timeout: 90_000 }, async t => {
+  const s = await setup(t, replyScript("已回复")); if (!s) return;
+  const { page, fixture, server } = s;
+  await newSession(page, fixture);
+  const placeholder = await byId(page, "chat").getAttribute("data-session-id");
+  const credential = await page.evaluate(() => JSON.parse(sessionStorage.getItem("pi-pane.auth")).credential);
+  // 扣住跟随替换打开新会话的快照请求，直到服务端确认首轮已经结束，使快照之后不再有 idle 事件。
+  let followed = null;
+  await page.route("**/api/sessions/*/snapshot", async route => {
+    const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/")[3]);
+    if (id === placeholder || followed) { await route.continue(); return; }
+    followed = id;
+    await until(async () => { const view = await snapshot(server, credential, id); return view.status === "idle" && view.inFlight?.phase === "idle"; }, 30_000);
+    await route.continue();
+  });
+  await send(page, "首轮立即结束");
+  const view = await idle(s);
+  assert.equal(view.ref.id, followed, "页面应跟随替换打开新会话");
+  await sessionItem(page, view.sessionFile).waitFor({ timeout: 5_000 });
 });
 
 test("Chrome 流式断网恢复后仅显示一条与磁盘一致的完整回复", { timeout: 90_000 }, async t => {
