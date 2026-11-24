@@ -27,8 +27,9 @@ async function dispatch(page, text, button) {
   assert.equal(await editor.innerText(), text, "提交前输入不得被草稿初始化覆盖");
   if (button) await action.click(); else await editor.press("Enter");
 }
+/** 提交已结束且没有放回：提交即清空输入框，所以还要等输入框的 aria-busy 移除。 */
 async function cleared(page) {
-  await page.waitForFunction(() => document.querySelector('[data-testid="composer"]')?.textContent === "");
+  await page.waitForFunction(() => document.querySelector('[data-testid="composer"]')?.textContent === "" && !document.querySelector('[data-testid="composer"]').hasAttribute("aria-busy"));
 }
 async function settled(page) {
   await page.waitForLoadState("networkidle");
@@ -280,6 +281,8 @@ test("N4 Chrome A 的 409 控制回包晚于导航 B 时不弹确认、不重取
     await deliver.promise; await route.fulfill({ response });
   });
   try {
+    // 先等页面网络空闲：下面要扣住 A 的控制请求，扣住期间网络不会再空闲，之后的 settled 只能依赖此前已经达到的空闲状态。
+    await settled(page);
     await dispatch(page, text); await until(() => captured);
     await dispatch(other, "/thinking high"); await cleared(other);
     forward.release(); await until(() => rejected);

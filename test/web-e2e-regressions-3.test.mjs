@@ -25,8 +25,9 @@ async function dispatch(page, text) {
   assert.equal(await editor.innerText(), text);
   await editor.press("Enter");
 }
+/** 提交已结束且没有放回：提交即清空输入框，所以还要等输入框的 aria-busy 移除。 */
 async function cleared(page) {
-  await page.waitForFunction(() => document.querySelector('[data-testid="composer"]')?.textContent === "");
+  await page.waitForFunction(() => document.querySelector('[data-testid="composer"]')?.textContent === "" && !document.querySelector('[data-testid="composer"]').hasAttribute("aria-busy"));
 }
 async function settled(page) {
   await page.waitForLoadState("networkidle");

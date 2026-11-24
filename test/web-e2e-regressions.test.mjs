@@ -170,7 +170,7 @@ test("R2 Chrome 内置命令遇到真实 revision 冲突时保留完整输入", 
     await send(page, "/name 这份名称参数必须保留");
     await until(() => captured);
     await send(other, "/thinking high");
-    await other.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "");
+    await other.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "" && !document.querySelector('[data-testid="composer"]').hasAttribute("aria-busy"));
     const response = page.waitForResponse(response => response.url().endsWith("/control") && response.status() === 409);
     gate.release();
     assert.equal((await (await response).json()).error, "revisionChanged");
@@ -189,7 +189,7 @@ test("R3 Chrome 另一标签页同步名称与思考级别", { timeout: 90_000 }
   const other = await secondTab(s);
   await send(page, "/name 跨标签页新名字");
   for (const tab of [page, other]) await tab.waitForFunction(() => document.querySelector('[data-testid="session-title"]')?.textContent === "跨标签页新名字");
-  await page.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "");
+  await page.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "" && !document.querySelector('[data-testid="composer"]').hasAttribute("aria-busy"));
   await send(page, "/thinking high");
   for (const tab of [page, other]) await tab.waitForFunction(() => document.querySelector('[data-testid="thinking-button"]')?.textContent === "思考：high");
   const view = await sessionView(s, other);
@@ -297,7 +297,7 @@ test("R5 Chrome 服务端执行后丢弃响应，自动复用请求且模型只�
   try {
     await send(page, "响应丢失但不得重复执行");
     await byId(page, "toast").filter({ hasText: "网络中断，恢复后自动核对这次操作的结果" }).waitFor();
-    await page.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "");
+    await page.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "" && !document.querySelector('[data-testid="composer"]').hasAttribute("aria-busy"));
     await page.waitForFunction(() => document.querySelectorAll('[data-testid="assistant-message"]').length === 2);
     const view = await idle(s);
     assert.ok(bodies.length >= 2);

@@ -52,7 +52,7 @@ test("Chrome 两个标签页并发发送时以真实 409 要求确认且只排�
     await byId(other, "choice-dialog").locator('[data-choice="follow_up"]').click();
     await byId(other, "choice-dialog").waitFor({ state: "detached" });
     await page.waitForFunction(() => document.querySelector('[data-testid="queue"]')?.textContent.includes("来自第二个标签页"));
-    await other.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "");
+    await other.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "" && !document.querySelector('[data-testid="composer"]').hasAttribute("aria-busy"));
     assert.equal(pending.length, 2);
     assert.equal(pending[1].command.type, "follow_up");
     assert.notEqual(pending[1].requestId, pending[0].requestId);

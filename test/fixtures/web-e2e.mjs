@@ -9,7 +9,8 @@ export const slowReply = (text, delayMs = 60) => ({ segments: [{ type: "text", c
 export const byId = (page, id) => page.locator(`[data-testid="${id}"]`);
 
 export async function records(file) {
-  try { return (await readFile(file, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line)); }
+  // 日志按行追加，每行以换行结尾；末尾没有换行的是对方尚未写完的行，留到下次读取。
+  try { const text = await readFile(file, "utf8"); return text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(line => JSON.parse(line)); }
   catch (error) { if (error.code === "ENOENT") return []; throw error; }
 }
 

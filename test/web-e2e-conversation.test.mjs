@@ -80,7 +80,7 @@ test("Chrome 停止后按原顺序取回两条排队消息并保留现有草稿"
   for (let i = 0; i < queued.length; i++) {
     await send(page, queued[i], "follow-up");
     await page.waitForFunction(count => document.querySelectorAll('[data-testid="queue"] .queued').length === count, i + 1);
-    await page.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "");
+    await page.waitForFunction(() => document.querySelector('[data-testid="composer"]').textContent === "" && !document.querySelector('[data-testid="composer"]').hasAttribute("aria-busy"));
   }
   assert.deepEqual(await byId(page, "queue").locator(".queued").allTextContents(), queued.map(text => "排队" + text));
   await byId(page, "composer").fill("尚未发送的草稿");
