@@ -86,12 +86,30 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 ### 会话列表
 
-会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。HTTP 返回 `PaneSessionList`：`path` 映射为 `sessionFile`，`firstMessage` 的前 200 个字符作为 `title`，空会话的 pi 占位标题转换为空字符串；`created`/`modified` 转为 ISO 时间，`parentSessionPath` 映射为 `parentSessionFile`。列表不下发 `allMessagesText` 等消息全文；`hosted` 按匹配 `fileKey` 的写者是否接受输入填写，已登记记录附带 `status`。
+会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。
+
+前端的 `GET /api/sessions`（`PaneSessionList`）、插件的 `MainSessionsApi` 与主会话树使用同一份会话目录（`packages/server/src/session-catalog.ts`）：每次读取存储目录后，把每一行转换为只含所需字段的 `StoredSession`，已在服务端登记的会话再叠加实时状态。两处取值相同的字段如下。
+
+| 字段 | 来源 | `PaneSessionListItem` | `MainSessionInfo` 与树节点 |
+| --- | --- | --- | --- |
+| 名称 | 登记会话已读到名称时用实时名称，否则用存储目录；都按 `normalizeSessionName` 去除两端空白，空值视为未设置 | `name`，未设置时省略 | 标题优先使用名称 |
+| 首条文本标题 | 登记会话已读到名称时取模型条目中的首条用户文本，否则用存储目录的 `firstUserText`；按 `fallbackSessionTitle` 截取前 200 个 Unicode 字符 | `title`，没有文本时为空字符串，由前端显示占位文字 | 没有名称时的标题，没有文本时回退为会话 id |
+| 消息数 | 登记会话为模型中 `message` 条目数（与 pi 目录的计数规则相同），否则用存储目录 | `messageCount` | `messageCount` |
+| 托管 | 登记会话是否有 pi 进程（写者句柄存在，包括启动和停止过程中） | `hosted` | `hosted`；`availability` 为 `online` 或 `archived` |
+| 状态 | 登记会话的模型状态 | `status`，未登记时省略 | `status`，未登记时为 `idle` |
+| 文件与目录 | 登记会话的当前文件和 `cwd`，否则用存储目录 | `sessionFile`、`cwd` | `sessionFile`、`cwd` |
+
+两处有意保留的差异：
+
+- **时间：** 列表的 `modifiedAt` 只用存储目录的时间（pi 按最后一条消息的时间计算），侧栏按它排序和判断“最近 7 天”，打开或订阅会话不会改变侧栏顺序。树的 `lastActivityAt` 取该时间与登记会话最近活动时间（收到事件、订阅、保活变化）中较新的值，用于选出快照中的热节点。`createdAt` 与 `parentSessionFile` 只在列表中提供。
+- **范围：** 列表按存储目录中的文件逐个列出，登记会话按 `fileKey` 匹配，尚未写入存储的新会话不出现。树和 `MainSessionsApi.get` 按会话 id 合并，包含尚未写入存储的登记会话，插件可以在首次写入前取得并保活它。
+
+快照视图（`GET /api/sessions/:id/snapshot`）的 `hosted` 表示写者是否接受输入，决定输入框能否发送，与列表的托管含义不同。列表不下发 `allMessagesText` 等消息全文。
 
 - 存储位置按 pi 的规则确定（依据：pi `docs/sessions.md`、`docs/settings.md`）：环境变量 `PI_CODING_AGENT_SESSION_DIR` 优先，其次是 agent 目录（默认 `~/.pi/agent`，可由 `PI_CODING_AGENT_DIR` 覆盖）下 `settings.json` 的 `sessionDir`，都没有时用 `<agent 目录>/sessions/`。
 - 项目的 `.pi/settings.json` 也可以设置 `sessionDir`（pi 在信任判断之前就读取它，依据：pi `docs/configuration.md`）。pi-pane 对已知的项目目录（打开过或新建过会话的 `cwd`）另外读取这个设置，把那里的会话一并列出。
 - 用 pi 导出的 `SessionManager.listAll(sessionDir)` / `SessionManager.list(cwd, sessionDir)` 读取列表（依据：`dist/core/session-manager.d.ts`）。
-- 名称从会话元数据读取；托管期间收到 `session_info_changed` 时先更新名称，再通知插件上下文和主会话树。打开、只读刷新、重绑定和在线事件统一去除名称两端空白，并将空值归一化为未设置。名称缓存与普通 RPC 状态对象相互独立，名称刷新不改写该对象，状态查询也不会覆盖较新的名称；只读文件监视同样刷新名称。名称被清空后，标题使用首条文本用户消息的前 200 个完整 Unicode 字符；文本块以空格连接，去除两端空白后没有文本时使用会话 id。目录、只读和托管记录共用 `session-title.ts` 的名称与标题规则。
+- 名称从会话元数据读取；托管期间收到 `session_info_changed` 时先更新名称，再通知插件上下文和主会话树。打开、只读刷新、重绑定和在线事件统一去除名称两端空白，并将空值归一化为未设置。名称缓存与普通 RPC 状态对象相互独立，名称刷新不改写该对象，状态查询也不会覆盖较新的名称；只读文件监视同样刷新名称。名称被清空后，标题使用首条文本用户消息的前 200 个完整 Unicode 字符；文本块以空格连接，去除两端空白后没有文本时插件协议使用会话 id，前端列表使用空字符串。目录、只读、托管记录和前端列表共用 `session-title.ts` 的名称与标题规则。
 - `PiStore.list()` 保留 pi 的原目录字段，并提供去除无消息占位语义的 `firstUserText`。占位字面量也可能是真实用户输入，适配层只在歧义时只读复核首条文本，不能按字面量一律删除。
 - 按项目（工作目录）分组；每个会话显示名称、最后修改时间、消息数。默认只显示托管中、浏览器里打开着、最近 7 天活动过的会话，其余折叠进各项目下的“历史”，展开时分页加载（与 [plugin-api.md](plugin-api.md#按需加载) 的按需加载规则相同）。
 

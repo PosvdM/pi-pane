@@ -3,7 +3,7 @@ import { watchFile, unwatchFile } from "node:fs";
 import { readFile, readdir, rm, mkdir, stat, writeFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { stopByIdentity, probeSessionWriterLock, type ProcessIdentity, type StopReport } from "pi-hostkit";
-import type { DraftNode, MainSessionInfo, MainSessionsApi, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
+import type { DraftNode, MainSessionsApi, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
 import type { ControlRequest } from "./pi-rpc.js";
 import type { PaneSessionList, PaneSessionView, PaneQueryResults, PaneQueryType, PaneUiAnswerRequest, PaneUiAnswerResult, PaneUiRequest, PaneServerMessage } from "./web-api.js";
 import { isPaneQueryType, isUiDialog, queryCommands, toPaneOutcome, toPaneQuery, toPaneSessionListItem, toPaneState, toPaneUiRequest, toPiControlCommand, toPiUiAnswer, type PaneUiDialog } from "./web-adapter.js";
@@ -18,7 +18,8 @@ import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
-import { firstUserText, normalizeSessionName, sessionTitle } from "./session-title.js";
+import { normalizeSessionName } from "./session-title.js";
+import { catalogEntry, toMainSessionInfo, toStoredSession, type CatalogEntry, type LiveSession, type StoredSession } from "./session-catalog.js";
 import { claim, emptyMirror, reconcile, removed, restore, type QueueMirror } from "./queue-mirror.js";
 
 interface HostedSession {
@@ -36,7 +37,7 @@ export class Sessions {
   private records = new Map<string, HostedSession>(); private files = new Map<string, HostedSession>();
   private driver: RpcSubprocessDriver; private timer: ReturnType<typeof setInterval>; private projects = new Set<string>();
   private state: Record<string, unknown> = {};
-  private readonly knownMain = new Map<string, MainSessionInfo>();
+  private storedById = new Map<string, StoredSession>();
   private readonly mainListeners = new Set<() => void>();
   private readonly pluginHolds = new Map<string, Map<string, { source: string; reason: string }>>();
   private stateQueue = new ControlQueue();
@@ -149,28 +150,38 @@ export class Sessions {
   }
   snapshot(id: string): PaneSessionView { return this.view(this.record(id)); }
   history(id: string, before: string, limit?: number): any { return this.record(id).model.history(before, limit); }
-  /** 存储目录的原始行，同时刷新插件可见的主会话目录。 */
-  async listRows(): Promise<any[]> {
-    const rows = await this.store.list([...this.projects]);
-    this.knownMain.clear();
-    for (const row of rows) if (typeof row.id === "string" && typeof row.path === "string" && typeof row.cwd === "string") this.knownMain.set(row.id, {
-      ref: { source: "pane", id: row.id }, nodeId: `pane:session:${row.id}`, cwd: row.cwd,
-      sessionFile: row.path, title: sessionTitle(row.name, row.firstUserText ?? row.firstMessage, row.id), hosted: false, status: "idle",
-    });
+  /**
+   * 重新读取存储目录，并通知插件与主会话树。前端会话列表、主会话树和插件的 get 都由存储目录加上登记会话的实时状态投影，
+   * 投影规则见 session-catalog.ts。
+   */
+  async refreshCatalog(): Promise<StoredSession[]> {
+    const rows = (await this.store.list([...this.projects])).map(toStoredSession).filter((row): row is StoredSession => !!row);
+    this.storedById = new Map(rows.map((row) => [row.id, row]));
     this.mainChanged(); return rows;
   }
+  /** 前端会话列表：存储目录中的每个文件一项，登记会话按文件匹配叠加实时状态。 */
   async list(): Promise<PaneSessionList> {
-    const rows = await this.listRows();
-    return { sessions: rows.map(row => {
-      const session = this.files.get(fileKey(row.path));
-      return toPaneSessionListItem(row, session?.handle?.acceptingInput === true, session?.model.status);
+    const rows = await this.refreshCatalog();
+    return { sessions: rows.map((row) => {
+      const session = this.files.get(fileKey(row.file));
+      return toPaneSessionListItem({ ...catalogEntry(row.id, row, session && this.live(session)), stored: row });
     }) };
+  }
+  /** 主会话目录：按会话 id 合并存储目录与登记会话，包含尚未写入存储的登记会话。 */
+  catalog(): CatalogEntry[] {
+    const ids = new Set([...this.storedById.keys(), ...this.records.keys()]);
+    return [...ids].map((id) => this.catalogEntry(id)!);
+  }
+  private catalogEntry(id: string): CatalogEntry | undefined {
+    const stored = this.storedById.get(id); const session = this.records.get(id);
+    return stored || session ? catalogEntry(id, stored, session && this.live(session)) : undefined;
+  }
+  private live(session: HostedSession): LiveSession {
+    return { file: session.file, cwd: session.cwd, ...(session.name ? { name: session.name } : {}), entries: session.model.entries, lastActive: session.lastActive,
+      hosted: !!session.handle, status: session.model.status, holds: [...session.holds.values()].map((hold) => ({ ...hold })) };
   }
   private holdsFor(id: string): Map<string, { source: string; reason: string }> {
     let holds = this.pluginHolds.get(id); if (!holds) { holds = new Map(); this.pluginHolds.set(id, holds); } return holds;
-  }
-  private fallbackTitle(session: HostedSession): string {
-    return sessionTitle(undefined, firstUserText(session.model.entries), session.id);
   }
   private setName(session: HostedSession, value: string | undefined): void {
     session.name = { value: normalizeSessionName(value) };
@@ -179,27 +190,11 @@ export class Sessions {
     const info = entries.findLast((entry) => entry.type === "session_info");
     this.setName(session, typeof info?.name === "string" ? info.name : undefined);
   }
-  private mainInfo(session: HostedSession): MainSessionInfo {
-    return { ref: { source: "pane", id: session.id }, nodeId: `pane:session:${session.id}`, cwd: session.cwd, sessionFile: session.file,
-      title: session.name ? session.name.value ?? this.fallbackTitle(session) : this.knownMain.get(session.id)?.title ?? this.fallbackTitle(session),
-      hosted: !!session.handle, status: session.model.status };
-  }
   private mainChanged(): void { for (const listener of this.mainListeners) { try { listener(); } catch (error) { console.error("主会话状态监听失败：", error); } } }
-  mainSessionCatalog(): MainSessionInfo[] {
-    const all = new Map(this.knownMain);
-    for (const session of this.records.values()) all.set(session.id, this.mainInfo(session));
-    return structuredClone([...all.values()]);
-  }
-  mainSessionDetails(id: string): { holds: { source: string; reason: string }[]; messageCount: number; lastActivityAt: string } | undefined {
-    const session = this.records.get(id); if (!session) return undefined;
-    return { holds: [...session.holds.values()].map((hold) => ({ ...hold })),
-      messageCount: session.model.entries.filter((entry) => entry.type === "message").length,
-      lastActivityAt: new Date(session.lastActive).toISOString() };
-  }
   mainSessions(source: string): MainSessionsApi {
     return {
-      list: () => [...this.records.values()].filter((session) => !!session.handle).map((session) => this.mainInfo(session)),
-      get: (id) => { const session = this.records.get(id); return session ? this.mainInfo(session) : structuredClone(this.knownMain.get(id)); },
+      list: () => [...this.records.values()].filter((session) => !!session.handle).map((session) => toMainSessionInfo(this.catalogEntry(session.id)!)),
+      get: (id) => { const entry = this.catalogEntry(id); return entry && toMainSessionInfo(entry); },
       onChange: (listener) => { this.mainListeners.add(listener); return () => { this.mainListeners.delete(listener); }; },
       hold: (ref, reason) => { assert(ref.source === "pane", "invalidHold", "只能保活主会话"); return this.hold(ref.id, source, reason); },
     };

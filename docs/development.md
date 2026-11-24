@@ -37,6 +37,7 @@
 | `packages/server/src/model.ts` | 活动分支、inFlight、同步快照切点、事件缓冲和游标 |
 | `packages/server/src/store.ts` | 只读 v1/v2/v3 解析、pi 会话目录和列表、目录占位消歧、临时副本 fork |
 | `packages/server/src/session-title.ts` | 服务端统一名称归一化、首条文本提取和 Unicode 标题回退，供目录/只读/托管及 Web 适配复用 |
+| `packages/server/src/session-catalog.ts` | 会话目录：存储目录的一行叠加登记会话的实时状态，投影为前端会话列表项、`MainSessionInfo` 和主会话树行 |
 | `packages/server/src/assets.ts` | 上传资源、草稿编码、历史图片引用、缓存与清理 |
 | `packages/server/src/bridge.ts` | 独立的 Agent 级回连凭证和实例 fencing |
 | `packages/server/src/trust.ts` | 启动前及进程内切换时的信任预判与询问 |
@@ -115,7 +116,7 @@ node --test --test-concurrency=1 test/web-*.test.mjs test/ui-extension.test.mjs 
 | `POST /api/auth/pair` | `{code}` 换取 `{credential, instanceId}` |
 | `POST /api/auth/code`、`POST /api/auth/logout` | 已登录浏览器生成新码、吊销当前凭证 |
 | `POST /api/ws-ticket` | 获取 30 秒一次性 ticket |
-| `GET /api/sessions` | `PaneSessionList`，含标题、ISO 时间、父会话文件、`hosted` 和已登记会话的 `status`；不含消息全文 |
+| `GET /api/sessions` | `PaneSessionList`，含名称、标题、ISO 时间、父会话文件、`hosted` 和已登记会话的 `status`；不含消息全文。与插件协议共用会话目录，字段对应见 [architecture.md](architecture.md#会话列表) |
 | `POST /api/sessions/open` | `{requestId,cwd,sessionFile?,fork?}`；只读打开，省略文件时预分配路径；并发同路径复用已登记记录，服务关闭时返回 503 serverStopping |
 | `GET /api/sessions/:id/snapshot` | `PaneSessionView`；附带 `cwd`、`sessionFile`、`hosted`、最近的 pane `state`、实际项目信任状态和 hold 原因；打开会话也使用该视图 |
 | `GET /api/sessions/:id/history?before=<id>&limit=50` | 按父链读取更早的聊天分支条目 |
@@ -247,6 +248,7 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 | 通知、鉴权与关闭门禁 | `plugins-host`：通知按来源去重；`plugins-http`：所有读写使用浏览器凭证；`shutdown-ingress`：插件全路由统一拒绝关闭后的请求，multipart 解析前不插入无关异步路由；`backpressure`：同名不同来源的增量与 resync 隔离。 |
 | 主会话增量目录 | `plugins-main-sync`：模型保持idle，增量条目提交后插件收到onChange，树取得新标题/消息数；无新条目不伪造树变更，目录和记录合并时保留较新活动时间。 |
 | 主会话名称 | `plugins-main-title`：真实 pi 改名、扩展清空名称、重启后的只读打开及只读文件更新，同步反映在 mainSessions、树订阅和新快照，状态缓存不覆盖较新名称；所有名称入口统一处理空白和清空值，目录与打开前后覆盖长Unicode、无文本、真实占位字面量及文本块矩阵。 |
+| 前端列表与插件目录一致 | `plugins-main-title`：同一矩阵在打开前后比较 `GET /api/sessions`、`MainSessionsApi.get` 与树节点的名称、标题（列表无文本时为空字符串，树回退为 id）、消息数、托管、状态、文件和目录；托管中改名与清空名称后列表与插件目录取值相同；`web-api`：登记会话的消息数取模型、修改时间取存储目录、空白名称视为未设置；`plugins-main-sync`：活动时间取存储目录与登记会话中较新的值。 |
 | 公共 API 契约 | `plugin-api-contract`：导出类型与真实示例实现的 TypeScript 编译、原生 RPC 不外泄、当前与上一版本范围协商、畸形范围拒绝，以及测试插件完整能力与故障。 |
 
 ## 图片上限观测

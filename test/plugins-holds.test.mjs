@@ -59,7 +59,7 @@ test("插件主会话适配区分历史与托管，未打开的 hold 在启动�
     assert.equal(historical.hosted, false);
     assert.equal(historical.status, "idle");
     assert.equal(historical.sessionFile, file);
-    assert.ok(server.sessions.mainSessionCatalog().some((info) => info.ref.id === id));
+    assert.ok(server.sessions.catalog().some((entry) => entry.id === id));
     assert.deepEqual(api.list(), []);
 
     const opened = await open(server, token, fixture, { sessionFile: file });

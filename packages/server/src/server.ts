@@ -19,7 +19,8 @@ import { observeHostkit } from "./hostkit-cleanup.js";
 import { CLOSE_IO_TIMEOUT_MS } from "./inflight.js";
 import { PluginHost } from "./plugins/host.js";
 import { NOT_PLUGIN_ROUTE, pluginHttp } from "./plugins/http.js";
-import { MainTree, type MainTreeRow } from "./plugins/main-tree.js";
+import { MainTree } from "./plugins/main-tree.js";
+import { toMainTreeRow } from "./session-catalog.js";
 import { isForbiddenPort, listenAvoidingForbidden } from "./ports.js";
 
 export interface PaneServerOptions extends Partial<Omit<SessionManagerOptions, "pi" | "bridgeUrl" | "instanceId" | "extensionPath">> {
@@ -71,7 +72,6 @@ async function upload(req: IncomingMessage): Promise<{ image: Buffer; mimeType: 
 export class PaneServer {
   readonly auth = new AuthStore(); readonly broker = new BridgeBroker(); readonly assets: AssetStore;
   readonly sessions: Sessions; readonly trust: TrustDecisions; readonly http: http.Server; readonly plugins: PluginHost; readonly mainTree: MainTree;
-  private mainTreeMetadata = new Map<string, { lastActivityAt?: string; messageCount?: number }>();
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024, perMessageDeflate: false });
   private readonly upgrades = new Set<Duplex>(); private stopping = false;
   private readonly clients = new Set<Client>(); private port = 0; private lock?: HeldLock; private sweep?: ReturnType<typeof setInterval>; private closePromise?: Promise<void>;
@@ -83,14 +83,8 @@ export class PaneServer {
     }, (id, request) => { for (const client of this.clients) if (client.subscriptions.has(subscriptionKey("session", "pane", id))) this.push(client, { type: "ui_request", ref: { source: "pane", id }, request }); },
     (sessionId, id, reason) => { for (const client of this.clients) if (client.subscriptions.has(subscriptionKey("session", "pane", sessionId))) this.push(client, { type: "ui_resolved", ref: { source: "pane", id: sessionId }, id, reason }); });
     this.mainTree = new MainTree({
-      load: async () => {
-        const rows = await this.sessions.listRows();
-        this.mainTreeMetadata = new Map(rows.map((row) => [row.id, {
-          lastActivityAt: row.modified instanceof Date ? row.modified.toISOString() : typeof row.modified === "string" ? row.modified : undefined,
-          messageCount: Number.isSafeInteger(row.messageCount) ? row.messageCount : undefined,
-        }]));
-        return this.mainTreeRows();
-      }, current: () => this.mainTreeRows(), watch: (listener) => this.sessions.mainSessions("pane").onChange(listener),
+      load: async () => { await this.sessions.refreshCatalog(); return this.mainTreeRows(); },
+      current: () => this.mainTreeRows(), watch: (listener) => this.sessions.mainSessions("pane").onChange(listener),
     });
     this.plugins = new PluginHost({ home: options.home, plugins: options.plugins ?? [], assets: this.assets,
       mainSessions: (source) => this.sessions.mainSessions(source), emit: (message) => this.broadcast(message), timeoutMs: options.pluginTimeoutMs });
@@ -118,7 +112,7 @@ export class PaneServer {
     try {
       const lock = await server.sessions.inflight.run("server.acquireInstanceLock", () => observeHostkit(() => acquireInstanceLock("pi-pane", options.home), (error) => server.sessions.recordCleanupFailure(error))); assert(lock, "instanceBusy", "同一数据目录已有 pi-pane 服务端", 409); server.lock = lock;
       await server.sessions.recover();
-      if (options.plugins?.length) await server.sessions.listRows();
+      if (options.plugins?.length) await server.sessions.refreshCatalog();
       await server.plugins.start();
       server.port = await listenAvoidingForbidden(server.http, "127.0.0.1", port);
       // 驱动延迟到第一次发送才启动，监听端口确定后设置回连地址。
@@ -283,14 +277,7 @@ export class PaneServer {
       this.push(client, { type: "notification", notification: { id: randomUUID(), source, level: "error", title: "插件订阅失败", body: "该插件的实时订阅不可用，主会话仍可使用。" } });
     }
   }
-  private mainTreeRows(): MainTreeRow[] {
-    return this.sessions.mainSessionCatalog().map((info) => {
-      const stored = this.mainTreeMetadata.get(info.ref.id); const current = this.sessions.mainSessionDetails(info.ref.id);
-      const lastActivityAt = !current?.lastActivityAt ? stored?.lastActivityAt : !stored?.lastActivityAt ? current.lastActivityAt
-        : Date.parse(stored.lastActivityAt) > Date.parse(current.lastActivityAt) ? stored.lastActivityAt : current.lastActivityAt;
-      return { info, ...stored, ...current, ...(lastActivityAt ? { lastActivityAt } : {}) };
-    });
-  }
+  private mainTreeRows() { return this.sessions.catalog().map(toMainTreeRow); }
   private disposeClient(client: Client): void {
     this.plugins.presence.disconnect(client.id);
     for (const off of client.subscriptions.values()) { try { off(); } catch (error) { console.error("浏览器订阅清理失败：", error); } }
