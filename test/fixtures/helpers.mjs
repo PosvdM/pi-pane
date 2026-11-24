@@ -25,8 +25,10 @@ export async function piInstall() {
   pi ??= await locatePi(process.env.PI_PACKAGE ? { piPath: process.env.PI_PACKAGE } : {});
   if (!pi.supported) throw new Error(`驱动集成测试要求 pi 1.5.x 或 1.6.x，当前为 ${pi.version}`);
   // CI 按矩阵安装指定版本的 pi，断言测试实际使用的就是该版本。
+  // 变量已设置但为空通常说明矩阵或脚本展开失败，不按未指定版本处理。
   const expected = process.env.HOSTKIT_TEST_PI_VERSION;
-  if (expected && pi.version !== expected) throw new Error(`HOSTKIT_TEST_PI_VERSION 要求 pi ${expected}，实际找到 ${pi.version}（${pi.packageDir}）`);
+  if (expected === "") throw new Error("HOSTKIT_TEST_PI_VERSION 已设置但为空，请指定 pi 版本或取消该变量");
+  if (expected !== undefined && pi.version !== expected) throw new Error(`HOSTKIT_TEST_PI_VERSION 要求 pi ${expected}，实际找到 ${pi.version}（${pi.packageDir}）`);
   return pi;
 }
 export async function piFixture(script = { turns: [] }) {

@@ -17,7 +17,7 @@
 
 前端使用 Vite 和 Preact。体积检查累计 `packages/web/dist` 中全部 HTML、JavaScript 和 CSS 文件以 gzip level 9 压缩后的字节数，总和不得超过 300 KiB。`npm test` 的 `pretest` 包含完整构建及体积检查；直接运行 `node --test` 不执行构建。
 
-`PI_PACKAGE` 可在测试时指定 pi 包目录。未设置时用 hostkit 的定位规则，先查官方安装目录，再查全局 npm。测试使用真实 pi 和本地假 provider，不访问模型服务；找到的 pi 不在支持范围内时测试失败。设置 `HOSTKIT_TEST_PI_VERSION` 时，测试还要求找到的 pi 正好是该版本，CI 用它确认测的是矩阵指定的版本。测试的 HOME、USERPROFILE、agent 目录、锁目录和会话文件位于临时现场；Chrome 使用独立的临时配置目录。服务端拒绝配置中的非法端口与 Fetch 禁止端口；测试使用 `port: 0` 自动分配端口，遇到禁止端口时关闭监听后重试，最多尝试 20 次，端口判断、重试及配置拒绝后的实例锁可用性由 `test/ports.test.mjs` 验证。设置 `KEEP_FIXTURES=1` 可保留现场。
+`PI_PACKAGE` 可在测试时指定 pi 包目录。未设置时用 hostkit 的定位规则，先查官方安装目录，再查全局 npm。测试使用真实 pi 和本地假 provider，不访问模型服务；找到的 pi 不在支持范围内时测试失败。设置 `HOSTKIT_TEST_PI_VERSION` 时，测试还要求找到的 pi 正好是该版本，CI 用它确认测的是矩阵指定的版本；该变量设为空字符串时测试直接失败。测试的 HOME、USERPROFILE、agent 目录、锁目录和会话文件位于临时现场；Chrome 使用独立的临时配置目录。服务端拒绝配置中的非法端口与 Fetch 禁止端口；测试使用 `port: 0` 自动分配端口，遇到禁止端口时关闭监听后重试，最多尝试 20 次，端口判断、重试及配置拒绝后的实例锁可用性由 `test/ports.test.mjs` 验证。设置 `KEEP_FIXTURES=1` 可保留现场。
 
 ## 源码结构
 
