@@ -30,7 +30,7 @@ pi-pane 不替代终端：会话仍然是 pi 自己的会话文件，在终端�
 
 ## 运行环境与安全
 
-- Node.js 24 及以上；pi 1.5.x（`>=1.5.0 <1.6.0`），依次从配置项 `piPath`、pi 官方安装脚本的安装目录、全局 npm 目录查找。
+- Node.js 24 及以上；pi 1.5.x 或 1.6.x（`>=1.5.0 <1.7.0`），依次从配置项 `piPath`、pi 官方安装脚本的安装目录、全局 npm 目录查找。
 - Windows、macOS、Linux 同时支持。
 - 浏览器只支持 Chrome；其他浏览器（含 Edge 等 Chromium 内核）不测、不承诺。
 - 只监听 `127.0.0.1`，浏览器只能用 `http://127.0.0.1:<端口>`（默认 4319）访问。
@@ -65,7 +65,7 @@ packages/
 
 ## 开发运行
 
-需要 Node.js 24 及以上、npm、pi 1.5.x，以及构建 pi-hostkit 原生模块所需的 Python 和 C/C++ 工具链。
+需要 Node.js 24 及以上、npm、pi 1.5.x 或 1.6.x，以及构建 pi-hostkit 原生模块所需的 Python 和 C/C++ 工具链。
 
 ```sh
 npm ci

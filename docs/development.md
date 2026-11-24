@@ -2,9 +2,9 @@
 
 ## 环境与构建
 
-需要 Node.js 24 及以上、npm、pi 1.5.0 和原生模块编译工具链。Windows 使用带 C++ 工作负载的 Visual Studio Build Tools；macOS 使用 Xcode Command Line Tools；Linux 使用 Python 3、gcc 和 make。
+需要 Node.js 24 及以上、npm、pi 1.5.x 或 1.6.x 和原生模块编译工具链。Windows 使用带 C++ 工作负载的 Visual Studio Build Tools；macOS 使用 Xcode Command Line Tools；Linux 使用 Python 3、gcc 和 make。
 
-`npm ci` 安装固定 git 提交的 pi-hostkit，依赖的 prepare 脚本构建 TypeScript 和原生模块。本仓库固定到 `b6659ea30a63e7b35b8c7f16cdfa22e7dd5442a6`，路径并发创建复核、Linux 进程状态有界重读及 Windows Job 退出可见性由 hostkit 处理。没有 npm 发布包，也不要求本地链接其他仓库。
+`npm ci` 安装固定 git 提交的 pi-hostkit，依赖的 prepare 脚本构建 TypeScript 和原生模块。本仓库固定到 `ebb76757038e622f7d12b4da0cf2091f8a3c89e9`，其支持的 pi 版本为 `>=1.5.0 <1.7.0`；路径并发创建复核、Linux 进程状态有界重读及 Windows Job 退出可见性由 hostkit 处理。没有 npm 发布包，也不要求本地链接其他仓库。
 
 | 命令 | 用途 |
 | --- | --- |
@@ -17,7 +17,7 @@
 
 前端使用 Vite 和 Preact。体积检查累计 `packages/web/dist` 中全部 HTML、JavaScript 和 CSS 文件以 gzip level 9 压缩后的字节数，总和不得超过 300 KiB。`npm test` 的 `pretest` 包含完整构建及体积检查；直接运行 `node --test` 不执行构建。
 
-`PI_PACKAGE` 可在测试时指定 pi 包目录。未设置时用 hostkit 的定位规则，先查官方安装目录，再查全局 npm。测试使用真实 pi 1.5.0 和本地假 provider，不访问模型服务。测试的 HOME、USERPROFILE、agent 目录、锁目录和会话文件位于临时现场；Chrome 使用独立的临时配置目录。服务端拒绝配置中的非法端口与 Fetch 禁止端口；测试使用 `port: 0` 自动分配端口，遇到禁止端口时关闭监听后重试，最多尝试 20 次，端口判断、重试及配置拒绝后的实例锁可用性由 `test/ports.test.mjs` 验证。设置 `KEEP_FIXTURES=1` 可保留现场。
+`PI_PACKAGE` 可在测试时指定 pi 包目录。未设置时用 hostkit 的定位规则，先查官方安装目录，再查全局 npm。测试使用真实 pi 和本地假 provider，不访问模型服务；找到的 pi 不在支持范围内时测试失败。设置 `HOSTKIT_TEST_PI_VERSION` 时，测试还要求找到的 pi 正好是该版本，CI 用它确认测的是矩阵指定的版本。测试的 HOME、USERPROFILE、agent 目录、锁目录和会话文件位于临时现场；Chrome 使用独立的临时配置目录。服务端拒绝配置中的非法端口与 Fetch 禁止端口；测试使用 `port: 0` 自动分配端口，遇到禁止端口时关闭监听后重试，最多尝试 20 次，端口判断、重试及配置拒绝后的实例锁可用性由 `test/ports.test.mjs` 验证。设置 `KEEP_FIXTURES=1` 可保留现场。
 
 ## 源码结构
 
@@ -33,7 +33,7 @@
 | `packages/server/src/hostkit-cleanup.ts` | hostkit 拒绝中的清理事实识别及同步、异步调用观察 |
 | `packages/server/src/inflight.ts` | 实例共用的关闭门禁、在途操作与资源 owner 登记、限时排空、登记来源诊断、超时失败闩及终止释放检查 |
 | `packages/server/src/pi-rpc.ts` | pi 主会话的原生 RPC 信封；不属于通用插件契约 |
-| `packages/server/src/pi-commands.ts` | pi 1.5.0 终端专用命令名单与消息开头识别；由会话控制在启动前检查 |
+| `packages/server/src/pi-commands.ts` | pi 终端专用命令名单与消息开头识别；由会话控制在启动前检查 |
 | `packages/server/src/model.ts` | 活动分支、inFlight、同步快照切点、事件缓冲和游标 |
 | `packages/server/src/store.ts` | 只读 v1/v2/v3 解析、pi 会话目录和列表、目录占位消歧、临时副本 fork |
 | `packages/server/src/session-title.ts` | 服务端统一名称归一化、首条文本提取和 Unicode 标题回退，供目录/只读/托管及 Web 适配复用 |
@@ -270,7 +270,7 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 ## CI 与平台边界
 
-矩阵为 ubuntu-latest auto/snapshot、macos-latest auto、windows-latest auto，安装 pi 1.5.0。Linux auto 启动用户 systemd 实例并要求 cgroup 支持。其他平台的停止保证以 StopReport.coverage 为准；snapshot_visible 只覆盖快照见过的进程，空 leftovers 不能证明整棵进程树没有残留。
+矩阵为 ubuntu-latest auto/snapshot、macos-latest auto、windows-latest auto，每种组合分别安装 pi 1.5.0 和 1.6.0，共 8 个任务。Linux auto 启动用户 systemd 实例并要求 cgroup 支持。其他平台的停止保证以 StopReport.coverage 为准；snapshot_visible 只覆盖快照见过的进程，空 leftovers 不能证明整棵进程树没有残留。
 
 停止判定同时核对覆盖范围、leftovers、快照完整性和写者身份。snapshot cleanup 中的发信号错误（如进程退出竞态中的 EPERM）只在最终 verify 独立确认通过、leftovers 为空时可接受；pane 自己的停止或报告复查无法确认时保留尚未释放的写锁。hostkit 恢复 failed/throw 时已经自行解锁，旧共享记录仍留存写者，其他宿主必须再次恢复检查。三种恢复拒绝路径都写入 recovery/ 持久标记并阻止自动重试。边界由 stop-report、writer-recovery 和 recovery-failure 测试固定；核查与解除隔离的完整步骤见 [architecture.md 的“会话写锁”](architecture.md#会话写锁)。
 
