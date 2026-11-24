@@ -8,7 +8,7 @@ pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起
 
 ## 设计约束
 
-- **基座是 pi**（`@earendil-works/pi-coding-agent` 1.5.x），不重写 Agent 运行时、Provider、压缩。
+- **基座是 pi**（`@earendil-works/pi-coding-agent` 1.5.x 和 1.6.x），不重写 Agent 运行时、Provider、压缩。
 - **每个主会话一个 `pi --mode rpc` 子进程**。一个会话的工具卡死或崩溃只影响它自己。只实现这一种会话驱动，保留 `SessionDriver` 接口。
 - **界面只是界面**：pi-pane 不认识“子代理”“会议”，只提供会话树、面板、动作、表单、通知、用户在场确认这些通用接口。
 - **轻量**：前端打包目标 300 KiB（gzip，不含图片资源）以内；不做终端、Git、文件编辑器等功能（见“明确不做”）。
@@ -17,10 +17,10 @@ pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起
 
 ## pi 版本与定位
 
-- 支持的 pi 版本：`>=1.5.0 <1.6.0`。本文中“依据”指向的文件以 1.5.0 为准，路径相对于 pi 的包目录。
+- 支持的 pi 版本：`>=1.5.0 <1.7.0`，即 1.5.x 和 1.6.x。本文中“依据”指向的文件以 1.5.0 为准，路径相对于 pi 的包目录；1.6.0 与 1.5.0 行为不同的地方在相应位置注明。
 - 定位用 hostkit 的 `locatePi`：先看 `~/.pi/pane/config.json` 的 `piPath`（pi 包目录或 `cli.js` 的路径），再看 pi 官方安装脚本（`install.sh`、`install.ps1`）的安装目录（默认 `~/.pi/agent/install`，由其中的 `current-version` 指定当前版本），最后看全局 npm 根目录（`npm root -g`）下的 `@earendil-works/pi-coding-agent`。查找顺序、版本检查和 Windows 上调用 `npm` 的方式以 [pi-hostkit 设计文档的“定位 pi”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#定位-pi)为准。
-- 入口是 `package.json` 的 `bin.pi`（1.5.0 中为 `dist/bundle/cli.js`）。版本不在支持范围内或找不到 pi 时，pi-pane 拒绝启动，在终端说明原因和 `piPath` 的用法。
-- pi 1.5.0 要求 Node.js 22.19 及以上（`package.json` 的 `engines`），pi-pane 自己要求 Node.js 24 及以上，用同一个 Node.js（`process.execPath`）运行 pi。
+- 入口是 `package.json` 的 `bin.pi`（1.5.x 和 1.6.x 中为 `dist/bundle/cli.js`）。版本不在支持范围内或找不到 pi 时，pi-pane 拒绝启动，在终端说明原因和 `piPath` 的用法。
+- pi 1.5.0 和 1.6.0 都要求 Node.js 22.19 及以上（`package.json` 的 `engines`），pi-pane 自己要求 Node.js 24 及以上，用同一个 Node.js（`process.execPath`）运行 pi。
 
 ## 组件
 
@@ -87,6 +87,15 @@ node <pi>/dist/bundle/cli.js --mode rpc
 ### 会话列表
 
 会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。
+
+前端（`packages/web/src/lib/session.ts`）在以下时机重新请求 `GET /api/sessions`：
+
+- 立即刷新：侧栏挂载、点击刷新按钮、新建或按文件打开会话成功后、按 id 打开会话成功后。自动跟随会话替换走按 id 打开的路径，在新会话打开成功后立即刷新。
+- 延迟 500 毫秒刷新：当前会话回到 idle、变为只读，或收到不自动跟随的会话替换事件。
+
+pi 1.5.x 和 1.6.x 在写入首条用户消息时创建会话文件。跟随替换打开新会话时，首轮可能在取快照前已经结束，订阅后不会再收到 idle 事件，因此打开成功后立即刷新，不依赖后续事件。侧栏只随当前会话的事件刷新：在新会话的首条消息写入前切到其他会话，该会话要等下一次刷新才出现在列表中（#20）。
+
+多次刷新并发时，按发出顺序编号，响应比已采用的列表新才采用（`lib/response-order.ts`）：先发的请求晚到时不覆盖较新的列表；请求失败时只显示错误，保留已采用的列表。
 
 前端的 `GET /api/sessions`（`PaneSessionList`）、插件的 `MainSessionsApi` 与主会话树使用同一份会话目录（`packages/server/src/session-catalog.ts`）：每次读取存储目录后，把每一行转换为只含所需字段的 `StoredSession`，已在服务端登记的会话再叠加实时状态。两处取值相同的字段如下。
 
@@ -448,7 +457,7 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 | `get_commands` 返回的扩展命令、技能、提示模板 | 原样通过 pane `prompt` 发送；运行中可携带 `delivery: "steer"` 或 `"followUp"`。技能和模板展开后按该方式排队，扩展命令立即执行并忽略送达字段 |
 | 终端专用内置命令（如 `/settings`、`/tree`、`/reload`、`/login`、`/import`、`/trust`、`/bug`） | 服务端在启动 pi 之前检查；未托管时直接返回 400 `unsupportedCommand`，提示“pi-pane 不支持 /xxx，请在终端中使用 pi”。已托管时先查询 `get_commands`，存在同名资源命令则允许发送，否则拒绝且不发给模型 |
 
-服务端在 `packages/server/src/pi-commands.ts` 维护终端专用命令名单，依据 pi 1.5.0 的内置命令列表和交互命令分发，排除上表中由 pi-pane 实现的命令。检查覆盖 `prompt`、`steer`、`follow_up` 的实际文本，包括草稿编码结果；同名资源命令的存在性每次查询，不缓存到下一次会话绑定。pane `prompt.delivery` 在服务端映射为 pi RPC 的 `streamingBehavior`，只接受 `"steer"` 和 `"followUp"`；其他控制命令携带此字段时返回 400 `invalidCommand`。字段属于幂等命令内容，不能用同一 `requestId` 改变送达方式。
+服务端在 `packages/server/src/pi-commands.ts` 维护终端专用命令名单，依据 pi 1.5.0 的内置命令列表和交互命令分发（1.6.0 的这两处与 1.5.0 相同），排除上表中由 pi-pane 实现的命令。检查覆盖 `prompt`、`steer`、`follow_up` 的实际文本，包括草稿编码结果；同名资源命令的存在性每次查询，不缓存到下一次会话绑定。pane `prompt.delivery` 在服务端映射为 pi RPC 的 `streamingBehavior`，只接受 `"steer"` 和 `"followUp"`；其他控制命令携带此字段时返回 400 `invalidCommand`。字段属于幂等命令内容，不能用同一 `requestId` 改变送达方式。
 
 输入 `/` 时，补全列表包含上表的内置命令和 `get_commands` 返回的命令（显示 `description` 和来源）。会话的扩展重新加载或切换后重新获取。
 
@@ -601,7 +610,7 @@ pane-bridge 是 pi-pane 用 `-e` 加载进每个主会话的 pi 扩展，负责�
 进程内的 new、resume、fork、clone 和 reload 会拆掉旧的扩展实例、重新实例化扩展；旧实例捕获的 `pi`、`ctx` 在替换后失效（依据：pi `docs/extensions.md` 的“Session replacement lifecycle and footguns”、`dist/core/agent-session-runtime.js`）。pi 以 `moduleCache: false` 加载扩展模块（依据：`dist/core/extensions/loader.js` 第 481–485 行），模块级变量也不能保证保留。此时环境变量里的 ticket 已经删除，新实例不能再兑换。做法：
 
 1. **进程级保存连接**：pane-bridge 第一次兑换后，把连接对象（凭证、服务端地址、启动配置）存在 `globalThis[Symbol.for("pi-pane.bridge")]`。后续实例加载时先查这里，有就复用，不再读环境变量。
-2. **实例认证与重绑定**：新实例加载时先用进程级凭证和递增序号认证，服务端立即拒绝旧实例的回连。已认证但未就绪的实例可以协调写锁和查询信任决定，不能接收会话输入。新实例在自己的 `session_start` 里向服务端发送 `bridgeReady`，带上实例序号、当前 `sessionFile` 和 `ctx.isProjectTrusted()`。注意：RPC 模式下的会话替换（new、resume、fork、clone）会触发两次 `session_start`（runtimeHost 替换与 RPC rebind 各一次）。pane-bridge 实例必须做幂等处理，复用同一个就绪 Promise，每实例只绑定一次监听、只发一次 `bridgeReady`；服务端也做幂等接收。服务端只接受序号最大的实例，旧实例之后的请求一律拒绝。旧实例在 `session_shutdown` 里注销自己的监听，不关闭进程级连接。
+2. **实例认证与重绑定**：新实例加载时先用进程级凭证和递增序号认证，服务端立即拒绝旧实例的回连。已认证但未就绪的实例可以协调写锁和查询信任决定，不能接收会话输入。新实例在自己的 `session_start` 里向服务端发送 `bridgeReady`，带上实例序号、当前 `sessionFile` 和 `ctx.isProjectTrusted()`。注意：pi 1.5.x 的 RPC 模式下，会话替换（new、resume、fork、clone）会触发两次 `session_start`（runtimeHost 替换与 RPC rebind 各一次）；pi 1.6.0 只触发一次（pi #10470）。由于仍支持 1.5.x，pane-bridge 实例必须做幂等处理，复用同一个就绪 Promise，每实例只绑定一次监听、只发一次 `bridgeReady`；服务端也做幂等接收。服务端只接受序号最大的实例，旧实例之后的请求一律拒绝。旧实例在 `session_shutdown` 里注销自己的监听，不关闭进程级连接。
 3. **就绪前不恢复输入**：服务端从收到 `session_shutdown`（含 reload）起暂停该进程的控制队列。初始化在状态和条目读取、旧锁释放及持久化之后复查 stopping 与切换代次，只有仍有效的初始化才能提交重绑定并恢复输入。每次拉起都有独立的启动归属标记，随 handle 迁移；就绪回调显式携带来源 handle，事件和退出回调也核对启动归属，旧写者不能修改后来启动的写者。就绪回调早于 start 返回时同样按来源 handle 绑定。
 4. **未就绪即终止**：新会话的 `session_start` 之后在就绪超时（暂定 10 秒）内没有收到 `bridgeReady`，或重绑定失败（如进程级连接对象不存在，新实例不自行申请凭证），服务端立即按 hostkit 的流程终止该 pi 进程（`clear_queue` → `abort` → 终止进程树），把会话标为 `interrupted`。界面以只读方式显示会话内容，提供“重启”，重启时用新 ticket 重新拉起。不让进程在暂停状态下存活，也不提供“不用 pane-bridge 继续”：会话写锁靠 pane-bridge 在 `session_before_switch`、`session_shutdown` 时请求，没有它的进程只要还活着，扩展命令或扩展自己的定时器就能切换会话，目标文件会在没有取锁的情况下被 `SessionManager.open()` 打开（依据：[pi-hostkit 设计文档“取得锁的时机”](https://github.com/PosvdM/pi-hostkit/blob/main/docs/design.md#取得锁的时机)的情况 ③、`dist/core/agent-session-runtime.js` 第 129–135 行）。
 5. **首次拉起同样处理**：拉起后 pane-bridge 没有在就绪超时内完成兑换并发出 `bridgeReady`（扩展加载失败、ticket 被抢先兑换、回连失败等）时，服务端不向该进程发送任何输入，按第 4 步终止进程，会话显示原因并提供“重启”。若 ticket 被抢先兑换或非法，pi 直接以退出码 1 退出，服务端遇到启动阶段退出码 1 当成 ticket 或启动失败处理，记下诊断，不自动重试。

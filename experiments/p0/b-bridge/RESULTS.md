@@ -8,6 +8,7 @@
 - 所有 provider 请求由共用 harness 的 `p0-fake/scripted` 处理。没有调用 Claude、GPT 或 Gemini，没有访问真实模型服务。
 - 所有会话、配置、测试密钥、图片和日志均位于临时目录。子进程的 `HOME` 和 `PI_CODING_AGENT_DIR` 由 harness 隔离，没有读取或写入真实用户的 `~/.pi`。
 - Windows：待测。Linux：待测。下文的「通过」仅指本轮 macOS 测量范围，不表示已经完成三平台验证。
+- 本组在 pi 1.6.0 上的复测结果见“pi 1.6.0 的差异”。
 
 ## 总结
 
@@ -161,6 +162,22 @@ pi 1.5.0 的 RPC new、resume、fork、clone 路径在 runtime 完成替换时 r
 ```
 
 该反例使 pane #9 判为部分通过。原始失败日志保留在 `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-b-run-bf9gWw/verification.tap`，现场为 `/var/folders/0d/1h73_ysx6818yv_98vhrj3580000gn/T/pi-p0-axCLKV`。幂等保护后的 10 个 requestId 全部满足严格的 1/1/1，因此当前结论恢复通过；没有放宽请求或回应次数断言。
+
+### pi 1.6.0 的差异
+
+pi 1.6.0 的 RPC new、resume、fork、clone 只在 runtime 完成替换时 rebind 一次，同一扩展实例只收到一次 `session_start`（CHANGELOG 的 #10470；`dist/modes/rpc/rpc-mode.js` 的 `rebindSession` 先 `session.subscribe` 再绑定扩展，各命令分支不再第二次 rebind）。pi-pane 同时支持 1.5.x 和 1.6.x，上面的幂等约束保持不变。
+
+2026-11-24 在同一台 macOS（Node.js `v26.12.0`，`PATH` 中的 pi `1.6.0`）用 `node experiments/p0/b-bridge/run.mjs` 重跑，没有刷新仓库中的证据文件：
+
+- 21 项中 17 项通过、1 项失败、3 项跳过，跳过项与 1.5.0 相同；进程审计没有存活的 pi 或 MCP 进程。
+- 失败项是“pane #9：new/resume/fork/clone/reload 连续替换”。它在全部替换完成后断言“至少有一个实例收到两次 `session_start`”，这条断言记录的是 1.5.0 的行为，在 1.6.0 上不成立。十次替换的计数均为 `http:1`、`response:1`、`pong:1`、`starts:1`，例如：
+
+```json
+{"observation":"form-counts","requestId":"form-0-new_session-2","instance":2,"http":1,"response":1,"pong":1,"starts":1}
+```
+
+- 该断言失败后，同一测试中其后的断言（bridgeReady 总数、未就绪门禁等）没有执行。临时跳过这一条断言、单独运行该测试，其余断言全部通过；仓库中的测试代码没有修改，仍按 1.5.0 记录。
+- 其余各项的通过与跳过情况与 1.5.0 的记录相同。清单 #5 的 `export_html` 用户渲染 3 次仍为 `I1,I2,I3,T1+T2+T3+tail`（pi #11868 在 1.6.0 没有修复）。
 
 ### stdio 备选的实测范围
 

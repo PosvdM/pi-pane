@@ -2,6 +2,7 @@
 import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
 import { deliverRestored } from "./restored.ts";
+import { ResponseOrder } from "./response-order.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
@@ -42,19 +43,29 @@ const NETWORK_RETRY_MS = 120000;
 
 const LAST_SESSION_KEY = "pi-pane.lastSession";
 
+/** 并发刷新时，响应比已采用的列表新才采用；请求失败只显示错误，保留已采用的列表。 */
+const listOrder = new ResponseOrder();
+
 export async function refreshList(): Promise<void> {
+  const mine = listOrder.begin();
   sessionList.set((s) => ({ ...s, loading: true, error: undefined }));
   try {
     const { sessions } = await api<PaneSessionList>("/api/sessions");
-    sessions.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
-    sessionList.set({ items: sessions, loading: false });
+    const adopt = listOrder.succeed(mine);
+    if (adopt) sessions.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+    sessionList.set((s) => ({
+      items: adopt ? sessions : s.items,
+      loading: listOrder.pending,
+      error: listOrder.failedSinceAdopted ? s.error : undefined,
+    }));
   } catch (error) {
-    sessionList.set((s) => ({ ...s, loading: false, error: (error as Error).message }));
+    const report = listOrder.fail(mine);
+    sessionList.set((s) => ({ ...s, loading: listOrder.pending, error: report ? (error as Error).message : s.error }));
   }
 }
 
 let listTimer: ReturnType<typeof setTimeout> | undefined;
-/** 会话文件在首次回复后才落盘，运行结束或会话替换后刷新侧栏列表。 */
+/** 当前会话回到 idle、变为只读或被替换（不跟随）后延迟刷新侧栏列表：新建会话的文件在首条用户消息写入时才创建。 */
 function scheduleListRefresh(): void {
   clearTimeout(listTimer);
   listTimer = setTimeout(() => { void refreshList(); }, 500);
@@ -139,6 +150,9 @@ export async function open(id: string): Promise<void> {
     setModel(id, view);
     attach(id);
     void refreshAuxiliary();
+    // 跟随会话替换打开新会话时，首轮可能在取快照前已经结束，订阅后不再收到 idle 事件；
+    // 打开后立即刷新列表，不依赖之后的事件。
+    void refreshList();
   } catch (error) {
     if (nav !== mine) return;
     if (error instanceof ApiError && error.status === 404) {
