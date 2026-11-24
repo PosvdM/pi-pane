@@ -6,8 +6,8 @@ import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
 import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { attachComposer, batchPrefix, clearSubmitted, loadDraft, loadUncertain, releaseWatch, remainingUncertain, saveDraft, saveUncertain, takePending, unsavedSessions, watchRestored, type RestoreWatch } from "../lib/restored.ts";
-import { closeSession, control, current, editorText, navigation, stopRun, type ControlOutcome } from "../lib/session.ts";
+import { addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions } from "../lib/restored.ts";
+import { closeSession, control, current, editorText, navigation, outcomeUnknown, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
 import { ask, overlay, toast } from "../lib/ui-state.ts";
@@ -76,12 +76,9 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const external = useStore(editorText);
   const unsaved = useStore(unsavedSessions).has(sessionId);
-  // 放回输入框、仍待用户检查的归属不明草稿，随会话保存。输入框中删除或改动过的条目不再计入；用户点“知道了”后全部清除。
-  const [notice, setNotice] = useState(0);
-  const uncertain = useRef<DraftNode[][]>([]);
-  const updateUncertain = (id: string, drafts: DraftNode[][]) => {
-    uncertain.current = drafts; setNotice(drafts.length); saveUncertain(localStorage, id, drafts);
-  };
+  // 取回的草稿中归属不明的条数，按会话保存；用户点“知道了”、清空输入框或该会话发送成功一条消息后移除。
+  useStore(noticeChanged);
+  const notice = loadNotice(localStorage, sessionId)?.count ?? 0;
   const view = model.view;
   const phase = view.inFlight?.phase ?? "idle";
   const running = phase !== "idle" || view.status === "running";
@@ -95,14 +92,12 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     if (!pending) return;
     saveDraft(localStorage, pending.sessionId, pending.nodes);
   };
-  const refresh = () => {
+  /** 读取输入框内容并安排保存。byUser：由用户编辑引起，此时清空输入框即移除归属不明提示。 */
+  const refresh = (byUser = true) => {
     if (!editor.current) return;
     const nodes = readNodes(editor.current);
     setEmpty(isEmpty(nodes));
-    if (uncertain.current.length) {
-      const left = remainingUncertain(nodes, uncertain.current);
-      if (left.length !== uncertain.current.length) updateUncertain(sessionId, left);
-    }
+    if (byUser && isEmpty(nodes)) clearNotice(localStorage, sessionId);
     const slash = !nodes.some((n) => n.type === "image") ? /^\/(\S*)$/.exec(plainText(nodes)) : null;
     setCompletion(slash ? { query: slash[1], index: 0 } : null);
     pendingSave.current = { sessionId, nodes };
@@ -113,7 +108,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   const setNodes = (nodes: DraftNode[]) => {
     const el = editor.current; if (!el) return;
     el.innerHTML = nodesHtml(nodes);
-    refresh();
+    refresh(false);
     const ids = imageIds(nodes);
     if (!ids.length) return;
     void api<{ missing: string[] }>("/api/assets/touch", { requestId: newId(), assetIds: ids }).then(({ missing }) => {
@@ -122,34 +117,39 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     }, () => { /* 无法核对时按存在处理，发送时由服务端校验。 */ });
   };
 
-  // 切换会话时恢复该会话保存的草稿，再放回停止或关闭时清出、尚未放回的草稿；离开时先写入尚未保存的编辑。
+  // 切换会话时恢复该会话保存的草稿，再放回停止、关闭或提交失败时取回、尚未放回的草稿；离开时先写入尚未保存的编辑。
   // 用 layout effect 在浏览器绘制和用户输入之前完成恢复，避免覆盖挂载后立即输入的内容。
   useLayoutEffect(() => {
     const el = editor.current!;
-    uncertain.current = loadUncertain(localStorage, sessionId); setNotice(uncertain.current.length);
+    let alive = true; let timer: ReturnType<typeof setTimeout> | undefined;
     setNodes(loadDraft(localStorage, sessionId));
     const detach = attachComposer(sessionId, {
-      // 清出的草稿放在现有草稿之前，并立即保存，之后才删除待放回记录。
-      deliver: (drafts) => {
+      // 取回的草稿放在现有草稿之前，并立即保存，之后才删除待放回记录。
+      deliver: (drafts, message) => {
         setNodes(prependDrafts(drafts.map((draft) => draft.nodes), readNodes(el)));
         flush();
-        const added = drafts.filter((draft) => draft.uncertain).map((draft) => draft.nodes);
-        if (added.length) updateUncertain(sessionId, [...uncertain.current, ...added]);
-        toast("排队中的消息已放回输入框");
+        const uncertain = drafts.filter((draft) => draft.uncertain).length;
+        if (uncertain) addNotice(localStorage, sessionId, uncertain);
+        if (message) toast(message, uncertain ? "warning" : undefined);
       },
-      read: () => readNodes(el),
-      write: (nodes) => { setNodes(nodes); flush(); },
     });
     // 同一会话可能在多个标签页挂载：用 Web Lock 串行取走待放回记录，避免同一批放回两次。
     const take = () => {
       const run = () => { takePending(localStorage, sessionId); };
       if (navigator.locks) void navigator.locks.request(batchPrefix(sessionId), run); else run();
     };
-    take();
-    // 其他标签页在本会话的输入框未挂载时存入的待放回草稿。
-    const onStorage = (event: StorageEvent) => { if (event.key?.startsWith(batchPrefix(sessionId)) && event.newValue) take(); };
+    // 已无页面等待结果的在途提交（提交后刷新或关闭了页面）按结果无法确认放回。
+    const recover = () => {
+      void recoverFlights(localStorage, sessionId).then((wait) => { if (alive && wait !== null) timer = setTimeout(recover, wait + 50); });
+    };
+    take(); recover();
+    // 其他标签页存入的待放回草稿，以及其他标签页对提示的修改。
+    const onStorage = (event: StorageEvent) => {
+      if (event.key?.startsWith(batchPrefix(sessionId)) && event.newValue) take();
+      if (event.key === noticeKey(sessionId)) noticeChanged.set((n) => n + 1);
+    };
     addEventListener("storage", onStorage);
-    return () => { removeEventListener("storage", onStorage); detach(); flush(); };
+    return () => { alive = false; clearTimeout(timer); removeEventListener("storage", onStorage); detach(); flush(); };
   }, [sessionId]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;
@@ -274,8 +274,8 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
    * 处理斜杠命令。返回 ok：已执行，清空输入；failed：执行失败，保留输入；
    * prompt：扩展命令、技能或提示模板，原样用 prompt 发送（运行中也用 prompt，扩展命令立即执行）。
    */
-  async function slash(name: string, args: string): Promise<"ok" | "failed" | "prompt"> {
-    const ran = async (command: PaneControlCommand, okText?: string) => (await runCommand(command, okText)).ok ? "ok" as const : "failed" as const;
+  async function slash(name: string, args: string): Promise<"ok" | "failed" | "unknown" | "prompt"> {
+    const ran = async (command: PaneControlCommand, okText?: string) => { const outcome = await runCommand(command, okText); return outcome.ok ? "ok" as const : outcomeUnknown(outcome.error) ? "unknown" as const : "failed" as const; };
     switch (name) {
       case "compact": return ran({ type: "compact", ...(args ? { customInstructions: args } : {}) }, "已压缩");
       case "model": {
@@ -294,7 +294,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
         return ran({ type: "set_session_name", name: args }, "已设置会话名称");
       case "export": {
         const outcome = await runCommand({ type: "export" });
-        if (!outcome.ok) return "failed";
+        if (!outcome.ok) return outcomeUnknown(outcome.error) ? "unknown" : "failed";
         if (outcome.result.status === "accepted" && outcome.result.result?.exportId) await downloadExport(outcome.result.result.exportId);
         return "ok";
       }
@@ -302,13 +302,28 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
       case "clone": return ran({ type: "clone" });
       case "resume": sidebarOpen.set(true); return "ok";
       case "session": overlay.set("session-info"); return "ok";
-      case "quit": return (await closeSession()) ? "ok" : "failed";
+      case "quit": return closeSession();
     }
     // 其余命令原样用 prompt 发送；只能在终端使用的 pi 内置命令由服务端拒绝（unsupportedCommand）。
     return "prompt";
   }
 
-  async function send(delivery?: "steer" | "follow_up") {
+  /** 发送前的本地检查；不通过时提示原因，输入框不变。 */
+  function sendable(el: HTMLDivElement, nodes: DraftNode[]): boolean {
+    if (el.querySelector(".chip.expired")) { toast("图片已过期，请重新添加", "warning"); return false; }
+    if (uploads) { toast("图片仍在上传", "warning"); return false; }
+    const ids = imageIds(nodes);
+    const problem = checkImages(ids); if (problem) { toast(problem, "warning"); return false; }
+    if (ids.length && view.state?.model && !view.state.model.images) { toast("当前模型不支持图片，请切换模型", "warning"); return false; }
+    return true;
+  }
+
+  /**
+   * 提交输入框内容。提交即清空：内容移入该会话的在途提交，输入框和草稿存储立即清空；送达后丢弃在途记录，
+   * 不再改动输入框；失败或结果无法确认时按取回草稿的路径放回原会话，放在期间新写的内容之前。
+   * forced：用户确认送达方式后重新提交。
+   */
+  async function send(delivery?: "steer" | "follow_up", forced?: "prompt" | "steer" | "follow_up") {
     const el = editor.current; if (!el || busy || blocked) return;
     // 操作归属：等待期间导航到其他会话后，不再弹确认框或重发到新会话。
     const owner = navigation();
@@ -316,57 +331,53 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     const nodes = readNodes(el);
     if (isEmpty(nodes)) return;
     setCompletion(null);
-    // 记录等待期间放回该会话输入框的草稿（例如 /quit 关闭会话时清出的排队消息），提交成功后只删除已提交的部分。
-    const watch = watchRestored(sessionId);
-    try { await submit(el, nodes, watch, stale, delivery); }
-    finally { releaseWatch(watch); }
+    const command = forced ? null : parseSlash(nodes);
+    if (!command && !sendable(el, nodes)) return;
+    const flight = beginSubmit(localStorage, sessionId, nodes);
+    // aria-busy 与清空同步设置，结束（包括放回）后移除：屏幕阅读器和测试据此判断提交是否已结束。
+    el.innerHTML = ""; el.setAttribute("aria-busy", "true"); refresh(false); flush();
+    setBusy(true);
+    let result: { end: "sent" | "failed" | "unknown"; conflict?: boolean } = { end: "unknown" };
+    try { result = await submit(nodes, command, stale, flight.at, delivery, forced); }
+    finally { finishSubmit(localStorage, flight, result.end); el.removeAttribute("aria-busy"); setBusy(false); }
+    if (!result.conflict) return;
+    // 用户看到的状态已过期：草稿已放回输入框，按最新状态请用户重新确认，不自动重发。
+    const latest = current.get()?.model?.view;
+    const nowRunning = (latest?.inFlight?.phase ?? "idle") !== "idle";
+    if (latest?.inFlight?.phase === "stopping") { toast("会话正在停止，请稍后再发送", "warning"); return; }
+    const answer = nowRunning
+      ? await ask("会话已开始运行", "另一个标签页刚刚改变了会话状态。这条消息怎么发送？", [{ label: "取消", value: "cancel" }, { label: "排队（follow-up）", value: "follow_up" }, { label: "追加（steer）", value: "steer", primary: true }])
+      : await ask("会话已停下", "另一个标签页刚刚改变了会话状态。是否作为新消息发送？", [{ label: "取消", value: "cancel" }, { label: "发送", value: "prompt", primary: true }]);
+    if (!answer || answer === "cancel" || stale()) return;
+    await send(undefined, answer as "prompt" | "steer" | "follow_up");
   }
 
-  async function submit(el: HTMLDivElement, nodes: DraftNode[], watch: RestoreWatch, stale: () => boolean, delivery?: "steer" | "follow_up") {
-    const command = parseSlash(nodes);
+  /** 执行一次提交，返回结果：sent、failed（确定没有执行）或 unknown；conflict 表示需要用户重新确认送达方式。 */
+  async function submit(nodes: DraftNode[], command: { name: string; args: string } | null, stale: () => boolean, since: number, delivery?: "steer" | "follow_up", forced?: "prompt" | "steer" | "follow_up"): Promise<{ end: "sent" | "failed" | "unknown"; conflict?: boolean }> {
     let viaPrompt = false;
     if (command) {
-      setBusy(true);
-      let outcome: "ok" | "failed" | "prompt";
-      try { outcome = await slash(command.name, command.args); }
-      finally { setBusy(false); }
-      if (outcome === "failed") return;
-      // 等待期间已切到其他会话时，从原会话保存的草稿中删除。
-      if (outcome === "ok") { clearSubmitted(localStorage, watch, nodes); return; }
+      const outcome = await slash(command.name, command.args);
+      if (outcome === "ok") return { end: "sent" };
+      if (outcome !== "prompt") return { end: outcome };
       viaPrompt = true;
+      if (uploads) { toast("图片仍在上传", "warning"); return { end: "failed" }; }
     }
-    if (el.querySelector(".chip.expired")) { toast("图片已过期，请重新添加", "warning"); return; }
-    if (uploads) { toast("图片仍在上传", "warning"); return; }
-    const ids = imageIds(nodes);
-    const problem = checkImages(ids); if (problem) { toast(problem, "warning"); return; }
-    if (ids.length && view.state?.model && !view.state.model.images) { toast("当前模型不支持图片，请切换模型", "warning"); return; }
-    let type: "prompt" | "steer" | "follow_up" = running && !viaPrompt ? delivery ?? "steer" : "prompt";
+    const type = forced ?? (running && !viaPrompt ? delivery ?? "steer" : "prompt");
     // 运行中经 prompt 展开的技能、提示模板需要送达方式；扩展命令立即执行，服务端忽略此字段。
     const promptDelivery = viaPrompt && running ? (delivery === "follow_up" ? "followUp" as const : "steer" as const) : undefined;
-    setBusy(true);
-    try {
-      for (;;) {
-        const outcome = await control(type === "prompt" && promptDelivery ? { type, delivery: promptDelivery } : { type }, nodes);
-        if (outcome.ok) {
-          clearSubmitted(localStorage, watch, nodes);
-          if (!stale() && outcome.result.status === "accepted" && outcome.result.result?.handled) toast("消息已由扩展处理");
-          return;
-        }
-        if (stale()) return;
-        if (outcome.error.code === "unsupportedCommand") { toast(outcome.error.message, "warning"); return; }
-        if (outcome.error.code !== "revisionChanged") { toast(outcome.error.message, "error"); return; }
-        if (viaPrompt) { toast("会话状态已变化，请确认后重新执行命令", "warning"); return; }
-        // 用户看到的状态已过期：按最新状态请用户重新确认，草稿保留，不自动重发。
-        const latest = current.get()?.model?.view;
-        const nowRunning = (latest?.inFlight?.phase ?? "idle") !== "idle";
-        if (latest?.inFlight?.phase === "stopping") { toast("会话正在停止，请稍后再发送", "warning"); return; }
-        const answer = nowRunning
-          ? await ask("会话已开始运行", "另一个标签页刚刚改变了会话状态。这条消息怎么发送？", [{ label: "取消", value: "cancel" }, { label: "排队（follow-up）", value: "follow_up" }, { label: "追加（steer）", value: "steer", primary: true }])
-          : await ask("会话已停下", "另一个标签页刚刚改变了会话状态。是否作为新消息发送？", [{ label: "取消", value: "cancel" }, { label: "发送", value: "prompt", primary: true }]);
-        if (!answer || answer === "cancel" || stale()) return;
-        type = answer as typeof type;
-      }
-    } finally { setBusy(false); }
+    const outcome = await control(type === "prompt" && promptDelivery ? { type, delivery: promptDelivery } : { type }, nodes);
+    if (outcome.ok) {
+      // 发送成功一条消息即视为用户已处理之前取回的归属不明草稿；等待期间新放回的不受影响。
+      if (!command) clearNotice(localStorage, sessionId, since);
+      if (!stale() && outcome.result.status === "accepted" && outcome.result.result?.handled) toast("消息已由扩展处理");
+      return { end: "sent" };
+    }
+    const end = outcomeUnknown(outcome.error) ? "unknown" as const : "failed" as const;
+    if (stale()) return { end };
+    if (outcome.error.code === "unsupportedCommand") { toast(outcome.error.message, "warning"); return { end }; }
+    if (outcome.error.code !== "revisionChanged") { toast(outcome.error.message, "error"); return { end }; }
+    if (viaPrompt) { toast("会话状态已变化，请确认后重新执行命令", "warning"); return { end }; }
+    return { end, conflict: true };
   }
 
   function onKeyDown(event: KeyboardEvent) {
@@ -402,8 +413,8 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
       {unsaved && <div class="composer-notice error" data-testid="unsaved-notice" role="alert">浏览器存储空间不足，这个会话的草稿只保存到页面关闭前。请先发送或复制草稿，或清理浏览器存储。</div>}
       {notice > 0 && (
         <div class="composer-notice warn" data-testid="restored-notice">
-          <span>放回的草稿中有 {notice} 条无法确认是否已经发送（排队期间扩展改写或追加过消息），请检查后再决定是否重发。</span>
-          <button class="btn ghost" data-testid="restored-notice-dismiss" onClick={() => updateUncertain(sessionId, [])}>知道了</button>
+          <span>取回的草稿中有 {notice} 条无法确认是否已经发送，请检查后再决定是否重发。</span>
+          <button class="btn ghost" data-testid="restored-notice-dismiss" onClick={() => clearNotice(localStorage, sessionId)}>知道了</button>
         </div>
       )}
       {blocked && <div class="composer-blocked">{blocked}</div>}
@@ -417,7 +428,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
           aria-label="消息输入框"
           data-testid="composer"
           data-placeholder={running ? "Enter 追加（steer），Alt+Enter 排队（follow-up）" : "输入消息，Enter 发送，Shift+Enter 换行，/ 查看命令"}
-          onInput={refresh}
+          onInput={() => refresh()}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
           onCopy={(e) => onCopy(e)}

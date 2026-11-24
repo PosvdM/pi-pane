@@ -229,6 +229,12 @@ export function navigation(): number { return nav; }
 
 export type ControlOutcome = { ok: true; result: PaneControlResult } | { ok: false; error: ApiError };
 
+/** 失败的控制操作是否可能已经在服务端执行：网络中断、响应无效、结果未知或服务端内部错误。 */
+export function outcomeUnknown(error: ApiError): boolean {
+  const cause = error.code === "navigated" && error.cause instanceof ApiError ? error.cause : error;
+  return ["network", "invalidResponse", "rpcResultUnknown", "unknown", "navigated"].includes(cause.code) || cause.status >= 500;
+}
+
 /** 发送一条控制命令。等待到期返回 pending 时，用同一 requestId 和同一内容重复提交，直到得到最终结果。 */
 export async function control(command: PaneControlCommand, draft?: DraftNode[]): Promise<ControlOutcome> {
   const state = current.get(); const model = state?.model;
@@ -272,7 +278,8 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[]):
   } catch (error) {
     let failure = error instanceof ApiError ? error : new ApiError(0, "unknown", String(error));
     if (failure.code === "network" || failure.code === "invalidResponse") failure = new ApiError(0, "network", "网络中断，这次操作可能已经执行。请在连接恢复后查看会话，再决定是否重发");
-    if (nav !== mine) return { ok: false, error: new ApiError(0, "navigated", "已切换到其他会话，原操作未完成，请回到原会话查看") };
+    // 已导航时保留原错误，供调用方判断这次操作是否可能已经执行。
+    if (nav !== mine) return { ok: false, error: Object.assign(new ApiError(0, "navigated", "已切换到其他会话，原操作未完成，请回到原会话查看"), { cause: failure }) };
     if (failure.code === "epochChanged") { await reload(); }
     else if (failure.code === "revisionChanged") { await reload(); }
     else if (failure.code === "rpcResultUnknown") { await reload(); }
@@ -320,22 +327,22 @@ export async function restart(): Promise<void> {
   if (!outcome.ok) toast(outcome.error.message, "error");
 }
 
-/** 关闭会话；返回是否已关闭（失败或用户取消时为 false）。 */
-export async function closeSession(): Promise<boolean> {
-  const state = current.get(); if (!state?.model) return false;
+/** 关闭会话。返回 ok：已关闭；failed：失败或用户取消；unknown：无法确认是否已关闭。 */
+export async function closeSession(): Promise<"ok" | "failed" | "unknown"> {
+  const state = current.get(); if (!state?.model) return "failed";
   const owner = nav;
   let outcome = await control({ type: "close" });
   if (!outcome.ok && outcome.error.code === "holdsConfirmation") {
     const holds = current.get()?.model?.view.holds.map((h) => `· ${h.reason}（${h.source}）`).join("\n") ?? "";
     const answer = await ask("关闭会话", `会话仍被保活：\n${holds}\n仍要关闭吗？`, [{ label: "取消", value: "cancel" }, { label: "关闭", value: "ok", danger: true }]);
-    if (answer !== "ok" || nav !== owner) return false;
+    if (answer !== "ok" || nav !== owner) return "failed";
     outcome = await control({ type: "close", confirmHolds: true });
   }
-  if (!outcome.ok) { toast(outcome.error.code === "revisionChanged" ? "会话状态已变化，请确认后重新关闭" : outcome.error.message, "error"); return false; }
+  if (!outcome.ok) { toast(outcome.error.code === "revisionChanged" ? "会话状态已变化，请确认后重新关闭" : outcome.error.message, "error"); return outcomeUnknown(outcome.error) ? "unknown" : "failed"; }
   if (outcome.result.status === "done") restoreCleared(state.id, outcome.result);
   toast("会话已关闭");
   if (current.get()?.id === state.id) void reload();
-  return true;
+  return "ok";
 }
 
 /** 扩展 UI 状态的归属会话变化时清理。 */
