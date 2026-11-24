@@ -85,7 +85,7 @@ test("A resume 已打开的 B 后扩展永久等待，控制队列随写者迁�
     const queued = { requestId: randomUUID(), expectedEpoch: rebound.cursor.epoch, expectedRevision: rebound.controlRevision, command: { type: "set_session_name", name: "不得绕过活动操作" } };
     assert.deepEqual((await request(server, token, bRoute, queued)).value, { status: "pending" });
     const stop = { requestId: randomUUID(), expectedEpoch: rebound.cursor.epoch, expectedRevision: rebound.controlRevision, command: { type: "stop" } };
-    const stopped = await final(server, token, bRoute, stop); assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.ok(stopped.value.stopReport);
+    const stopped = await final(server, token, bRoute, stop); assert.equal(stopped.code, 200, JSON.stringify(stopped)); assert.ok(server.sessions.reports.at(-1)); assert.equal("stopReport" in stopped.value, false);
     assert.equal(await isSameProcess(handle.identity), "gone"); assert.equal((await probeSessionWriterLock(target)).held, false);
     const original = await final(server, token, route, body); assert.equal(original.value.error, "rpcResultUnknown");
     assert.equal((await final(server, token, bRoute, queued)).value.error, "controlPreempted");
@@ -218,7 +218,7 @@ test("控制响应后的状态查询迟到于停止，不提交旧 handle 的状
     const stopped = await final(server, token, route, { requestId: randomUUID(), expectedEpoch: current.cursor.epoch, expectedRevision: current.controlRevision, command: { type: "close" } });
     assert.equal(stopped.code, 200, JSON.stringify(stopped)); await handle.exited;
     gate.resolve(); const confirmed = await final(server, token, route, body);
-    assert.equal(confirmed.code, 200, JSON.stringify(confirmed)); assert.equal(confirmed.value.response.success, true);
+    assert.equal(confirmed.code, 200, JSON.stringify(confirmed)); assert.equal(confirmed.value.status, "accepted"); assert.equal("response" in confirmed.value, false);
     assert.equal(source.state, state, "已停止写者的迟到 get_state 不能提交到会话");
     assert.equal(source.model.readonly, true);
   } finally { gate.resolve(); await server.close(); await f.cleanup(); }

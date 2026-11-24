@@ -20,6 +20,7 @@ import { CLOSE_IO_TIMEOUT_MS } from "./inflight.js";
 import { PluginHost } from "./plugins/host.js";
 import { NOT_PLUGIN_ROUTE, pluginHttp } from "./plugins/http.js";
 import { MainTree, type MainTreeRow } from "./plugins/main-tree.js";
+import { isForbiddenPort, listenAvoidingForbidden } from "./ports.js";
 
 export interface PaneServerOptions extends Partial<Omit<SessionManagerOptions, "pi" | "bridgeUrl" | "instanceId" | "extensionPath">> {
   home: string; piPath?: string; port?: number; agentDir?: string; extensionPath?: string; webRoot?: string;
@@ -76,13 +77,14 @@ export class PaneServer {
   private readonly clients = new Set<Client>(); private port = 0; private lock?: HeldLock; private sweep?: ReturnType<typeof setInterval>; private closePromise?: Promise<void>;
   private constructor(private readonly options: PaneServerOptions, private readonly store: PiStore) {
     this.assets = new AssetStore(options.home);
-    this.trust = new TrustDecisions(store, () => [...this.clients].some((c) => c.state === "authed"), (request) => this.broadcast({ type: "project_trust", request }));
+    this.trust = new TrustDecisions(store, () => [...this.clients].some((c) => c.state === "authed"), (request) => this.broadcast({ type: "project_trust", request }), 55000, (id) => this.broadcast({ type: "project_trust_resolved", id }));
     this.sessions = new Sessions(this.assets, store, this.trust, this.broker, {
       ...options, pi: store.install, instanceId: this.auth.instanceId, bridgeUrl: "", extensionPath: options.extensionPath ?? fileURLToPath(new URL("../../bridge-extension/dist/index.js", import.meta.url)),
-    }, (id, request) => { for (const client of this.clients) if (client.subscriptions.has(subscriptionKey("session", "pane", id))) this.push(client, { type: "ui_request", ref: { source: "pane", id }, request }); });
+    }, (id, request) => { for (const client of this.clients) if (client.subscriptions.has(subscriptionKey("session", "pane", id))) this.push(client, { type: "ui_request", ref: { source: "pane", id }, request }); },
+    (sessionId, id, reason) => { for (const client of this.clients) if (client.subscriptions.has(subscriptionKey("session", "pane", sessionId))) this.push(client, { type: "ui_resolved", ref: { source: "pane", id: sessionId }, id, reason }); });
     this.mainTree = new MainTree({
       load: async () => {
-        const rows = await this.sessions.list();
+        const rows = await this.sessions.listRows();
         this.mainTreeMetadata = new Map(rows.map((row) => [row.id, {
           lastActivityAt: row.modified instanceof Date ? row.modified.toISOString() : typeof row.modified === "string" ? row.modified : undefined,
           messageCount: Number.isSafeInteger(row.messageCount) ? row.messageCount : undefined,
@@ -105,6 +107,9 @@ export class PaneServer {
     this.auth.onRevoke((credential) => { for (const client of this.clients) if (client.credential === credential) this.closeClient(client, 4403, "凭证已失效"); });
   }
   static async start(options: PaneServerOptions): Promise<PaneServer> {
+    const port = options.port === undefined ? 4319 : options.port;
+    assert(Number.isInteger(port) && port >= 0 && port <= 65535, "invalidPort", "端口必须为 1–65535 的整数，或使用 0 自动分配");
+    assert(port === 0 || !isForbiddenPort(port), "forbiddenPort", `浏览器会拒绝访问端口 ${port}，请更换端口`);
     await ensurePrivateDir(options.home);
     const pi = await locatePi(options.piPath ? { piPath: options.piPath } : {}); assert(pi.supported, "piVersion", `不支持的 pi 版本：${pi.version}`);
     const home = options.env?.HOME ?? process.env.HOME ?? process.env.USERPROFILE ?? "";
@@ -113,13 +118,12 @@ export class PaneServer {
     try {
       const lock = await server.sessions.inflight.run("server.acquireInstanceLock", () => observeHostkit(() => acquireInstanceLock("pi-pane", options.home), (error) => server.sessions.recordCleanupFailure(error))); assert(lock, "instanceBusy", "同一数据目录已有 pi-pane 服务端", 409); server.lock = lock;
       await server.sessions.recover();
-      if (options.plugins?.length) await server.sessions.list();
+      if (options.plugins?.length) await server.sessions.listRows();
       await server.plugins.start();
-      await new Promise<void>((resolve, reject) => { server.http.once("error", reject); server.http.listen(options.port ?? 4319, "127.0.0.1", () => { server.http.off("error", reject); resolve(); }); });
-      server.port = (server.http.address() as { port: number }).port;
+      server.port = await listenAvoidingForbidden(server.http, "127.0.0.1", port);
       // 驱动延迟到第一次发送才启动，监听端口确定后设置回连地址。
       server.sessions.setBridgeUrl(server.origin);
-      server.sweep = setInterval(() => { server.auth.sweep(); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
+      server.sweep = setInterval(() => { server.auth.sweep(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
       return server;
     } catch (error) { await server.close().catch(() => {}); throw error; }
   }
@@ -159,8 +163,14 @@ export class PaneServer {
         if (pluginResult !== NOT_PLUGIN_ROUTE) { sendJson(res, 200, pluginResult); return; }
         this.assertAccepting();
       }
-      if (req.method === "GET" && pathname === "/api/sessions") { sendJson(res, 200, { sessions: await this.sessions.list() }); return; }
+      if (req.method === "GET" && pathname === "/api/sessions") { sendJson(res, 200, await this.sessions.list()); return; }
       if (req.method === "GET" && pathname === "/api/trust") { sendJson(res, 200, { requests: this.trust.list() }); return; }
+      const exported = pathname.match(/^\/api\/exports\/([^/]+)$/);
+      if (req.method === "GET" && exported) {
+        const content = await this.sessions.exports.download(exported[1]);
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Content-Disposition", 'attachment; filename="pi-session.html"'); res.end(content); return;
+      }
       const trust = pathname.match(/^\/api\/trust\/([^/]+)$/);
       if (req.method === "POST" && trust) {
         const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); this.trust.answer(trust[1], body.decision); return { status: "done" }; })); return;
@@ -201,15 +211,21 @@ export class PaneServer {
       throw new PaneError("notFound", "接口不存在", 404);
     }
     if (req.method === "GET" && this.options.webRoot) {
-      const root = await import("node:fs/promises").then((fs) => fs.realpath(this.options.webRoot!));
+      let root: string;
+      try { root = await import("node:fs/promises").then((fs) => fs.realpath(this.options.webRoot!)); }
+      catch (error) { if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw new PaneError("notFound", "Web 界面未构建，请运行 npm run build", 404); throw error; }
       const target = path.resolve(root, "." + decodeURIComponent(pathname === "/" ? "/index.html" : pathname));
       assert(target.startsWith(root + path.sep), "notFound", "文件不存在", 404);
-      const actual = await import("node:fs/promises").then((fs) => fs.realpath(target)); assert(actual.startsWith(root + path.sep), "notFound", "文件不存在", 404);
+      let actual: string;
+      try { actual = await import("node:fs/promises").then((fs) => fs.realpath(target)); }
+      catch (error) { if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw new PaneError("notFound", "文件不存在", 404); throw error; }
+      assert(actual.startsWith(root + path.sep), "notFound", "文件不存在", 404);
       assert((await stat(actual)).isFile(), "notFound", "文件不存在", 404);
-      const types: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
+      const types: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+        ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".webp": "image/webp", ".woff2": "font/woff2", ".json": "application/json; charset=utf-8", ".map": "application/json; charset=utf-8" };
       res.setHeader("Content-Type", types[path.extname(actual)] ?? "application/octet-stream"); res.end(await readFile(actual)); return;
     }
-    throw new PaneError("notFound", "M1 只提供服务端接口，Web 界面在 M2 实现", 404);
+    throw new PaneError("notFound", "Web 界面未构建，请运行 npm run build", 404);
   }
   private connection(ws: WebSocket): void {
     if (this.stopping) { ws.on("error", () => {}); ws.terminate(); return; }
@@ -241,8 +257,10 @@ export class PaneServer {
           const key = subscriptionKey("session", message.ref.source, message.ref.id);
           client.subscriptions.get(key)?.(); client.subscriptions.delete(key);
           const emit = (event: any) => this.push(client, { type: "session", ...event });
-          if (message.ref.source === "pane") client.subscriptions.set(key, this.sessions.subscribe(message.ref.id, message.after as StreamCursor, emit));
-          else this.pluginSubscription(client, message.ref.source, key, () => this.plugins.subscribe(message.ref, message.after, emit));
+          const ref = { source: message.ref.source, id: message.ref.id };
+          // 重新订阅时，待回答的询问只补发给本连接，不广播给已订阅的其他标签页。
+          if (ref.source === "pane") client.subscriptions.set(key, this.sessions.subscribe(ref.id, message.after as StreamCursor, emit, (request) => this.push(client, { type: "ui_request", ref, request })));
+          else this.pluginSubscription(client, ref.source, key, () => this.plugins.subscribe(message.ref, message.after, emit));
         } else if (message.type === "unsubscribe") { const key = subscriptionKey("session", message.ref?.source, message.ref?.id); client.subscriptions.get(key)?.(); client.subscriptions.delete(key); }
         else if (message.type === "treeSubscribe") {
           assert(typeof message.source === "string", "invalidRef", "树来源无效");
