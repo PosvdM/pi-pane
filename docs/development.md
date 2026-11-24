@@ -13,7 +13,7 @@
 | `node packages/web/scripts/check-bundle.mjs` | 对已有前端产物执行 gzip 体积检查；需先构建 |
 | `npm test` | 先构建，再用 node --test 顺序运行测试文件 |
 | `node --test test/<文件>.test.mjs` | 运行单个测试文件；修改源码后先构建 |
-| `npm start` | 启动 API 服务端 |
+| `npm start` | 启动 API 服务端、插件宿主和前端 |
 
 前端使用 Vite 和 Preact。体积检查累计 `packages/web/dist` 中全部 HTML、JavaScript 和 CSS 文件以 gzip level 9 压缩后的字节数，总和不得超过 300 KiB。`npm test` 的 `pretest` 包含完整构建及体积检查；直接运行 `node --test` 不执行构建。
 
@@ -35,12 +35,17 @@
 | `packages/server/src/pi-rpc.ts` | pi 主会话的原生 RPC 信封；不属于通用插件契约 |
 | `packages/server/src/pi-commands.ts` | pi 1.5.0 终端专用命令名单与消息开头识别；由会话控制在启动前检查 |
 | `packages/server/src/model.ts` | 活动分支、inFlight、同步快照切点、事件缓冲和游标 |
-| `packages/server/src/store.ts` | 只读 v1/v2/v3 解析、pi 会话目录和列表、临时副本 fork |
+| `packages/server/src/store.ts` | 只读 v1/v2/v3 解析、pi 会话目录和列表、目录占位消歧、临时副本 fork |
+| `packages/server/src/session-title.ts` | 服务端统一名称归一化、首条文本提取和 Unicode 标题回退，供目录/只读/托管及 Web 适配复用 |
+| `packages/server/src/session-catalog.ts` | 会话目录：存储目录的一行叠加登记会话的实时状态，投影为前端会话列表项、`MainSessionInfo` 和主会话树行 |
 | `packages/server/src/assets.ts` | 上传资源、草稿编码、历史图片引用、缓存与清理 |
 | `packages/server/src/bridge.ts` | 独立的 Agent 级回连凭证和实例 fencing |
 | `packages/server/src/trust.ts` | 启动前及进程内切换时的信任预判与询问 |
+| `packages/server/src/plugins/` | 插件加载与隔离、按需主会话树、上下文资源、事务幂等、持久表单、用户在场确认和横幅 |
 | `packages/bridge-extension/src/` | 会话替换和写锁回报、信任决定、就绪握手、图片顺序还原 |
 | `packages/web/` | Vite 与 Preact 浏览器界面、会话事件投影、草稿和 IndexedDB 设备密钥管理 |
+
+插件宿主通过通用 HTTP 和 WebSocket 提供能力，浏览器中的插件界面尚未实现。多题表单通道保留事件名称和 BridgeFormOutcome 类型，未启用时返回协议已有的 aborted。
 
 ## 前端结构
 
@@ -111,7 +116,7 @@ node --test --test-concurrency=1 test/web-*.test.mjs test/ui-extension.test.mjs 
 | `POST /api/auth/pair` | `{code}` 换取 `{credential, instanceId}` |
 | `POST /api/auth/code`、`POST /api/auth/logout` | 已登录浏览器生成新码、吊销当前凭证 |
 | `POST /api/ws-ticket` | 获取 30 秒一次性 ticket |
-| `GET /api/sessions` | `PaneSessionList`，含标题、ISO 时间、父会话文件、`hosted` 和已登记会话的 `status`；不含消息全文 |
+| `GET /api/sessions` | `PaneSessionList`，含名称、标题、ISO 时间、父会话文件、`hosted` 和已登记会话的 `status`；不含消息全文。与插件协议共用会话目录，字段对应见 [architecture.md](architecture.md#会话列表) |
 | `POST /api/sessions/open` | `{requestId,cwd,sessionFile?,fork?}`；只读打开，省略文件时预分配路径；并发同路径复用已登记记录，服务关闭时返回 503 serverStopping |
 | `GET /api/sessions/:id/snapshot` | `PaneSessionView`；附带 `cwd`、`sessionFile`、`hosted`、最近的 pane `state`、实际项目信任状态和 hold 原因；打开会话也使用该视图 |
 | `GET /api/sessions/:id/history?before=<id>&limit=50` | 按父链读取更早的聊天分支条目 |
@@ -152,7 +157,7 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 
 ## WebSocket
 
-连接 `/ws` 后，第一帧为 `{type:"auth",ticket,paneProtocol:[1,1]}`。五秒内没有有效首帧即关闭，拒绝后不再处理任何帧。鉴权后第一条消息为 `banners`，插件宿主未接入时数组为空，并附上协商版本和 connectionId。
+连接 `/ws` 后，第一帧为 `{type:"auth",ticket,paneProtocol:[1,1]}`。五秒内没有有效首帧即关闭，拒绝后不再处理任何帧。鉴权后第一条消息为 `banners`，包含当前横幅、协商版本和 connectionId，随后逐条重发当前持久表单。
 
 订阅：`{type:"subscribe",ref:{source:"pane",id},after:{epoch,seq}}`。取消订阅：`{type:"unsubscribe",ref}`。事件使用 plugin-api.md 的会话流形状。
 
@@ -161,6 +166,8 @@ hostkit 调用的拒绝若通过 `cause` 或 `errors` 携带停止报告、清�
 信任询问通过 `{type:"project_trust",request:{id,cwd,expiresAt}}` 推送，回答或到期后广播 `{type:"project_trust_resolved",id}`；没有浏览器时返回 undecided，不把它等同于不信任。
 
 CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配置文件 `webRoot` 覆盖。目录不存在时服务仍可启动，非 API 路径返回 404“Web 界面未构建，请运行 npm run build”。
+
+插件的 HTTP 路由、非 `pane` 会话订阅、树订阅、设备注册与用户在场回应统一定义在 [architecture.md](architecture.md#插件-http-接口)。M3 的 v1 兼容扩展包括 `formRemoved.source` 与 `presenceClosed.reason`；持久表单按完整 `(source, formId)` 隔离，并在启动、树 reset 与浏览器连接时对齐；签名由插件后台验证。
 
 每会话保留最近 2000 条事件，并用 32 MiB 字节限额限制缓冲；单条事件仍可保留。发送缓冲达到 1 MiB 时合并连续文本增量；达到 8 MiB 时以 resync 替换待发会话增量。非会话消息仍积压超过 1 MiB 时关闭慢连接。浏览器慢不会阻塞 RPC stdout。
 
@@ -223,6 +230,27 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 
 测试文件路径均为 `test/<名称>.test.mjs`。三平台都运行服务端测试，不用模拟进程替代真实 pi。Chrome 路径由本机安装或 CHROME_PATH/CHROME_BIN 定位；本机不存在时明确跳过。CI 的全部矩阵项设置 `PANE_TEST_REQUIRE_CHROME=1`，三平台均须实际运行 Chrome，找不到 Chrome 必须失败。
 
+## M3 服务端自动化验收
+
+验收仅使用 `test/fixtures/pane-plugin/` 的测试插件，不依赖 agora，也不包含浏览器界面验收。源码构建后可运行 `node --test --test-concurrency=1 test/plugins-*.test.mjs test/plugin-api-contract.test.mjs`；完整回归使用 `npm test`。
+
+| 验收项 | 测试文件与断言 |
+| --- | --- |
+| 加载、版本与生命周期 | `plugins-runtime`：本地和 npm 定位符、包与实例双重版本范围、拒绝无效或重复 id、按配置顺序加载、激活失败、迟到 fence、私有目录、来源映射和幂等停用。 |
+| 超时与异常隔离 | `plugins-runtime`、`plugins-operations`：同步抛错、异步拒绝、超时后迟到成功或失败；`plugins-http`：插件失败后真实主会话仍能发送并完成 RPC，同步订阅抛错不关闭共享 WebSocket 或主会话订阅。 |
+| 按需树与重连 | `plugins-main-tree`：热节点及祖先、keyset 分页、epoch、修订号、删除与 2000 条重放边界；`plugin-api-contract`：插件树与流的快照切点、分页、reset；`plugins-host`：循环与无效能力；`plugins-http`：HTTP 快照和 WS 实时变化。 |
+| 只读子会话、面板与渲染目录 | `plugins-http`：快照、流、面板与静态动作目录；`plugins-host`：会话图片提取、来源隔离、渲染器冲突按配置顺序选择、停用清理和退订后的迟到回调隔离。 |
+| 动作、发送和表单幂等 | `plugins-operations`：共享键命名空间、内容冲突、并发 pending、返回 pending 后查询、真正迟到的最终结果、24 小时保留、容量限制与原样来源传递；`plugins-http`：浏览器同键重试，真实确认超时后以原键再次确认并完成。 |
+| 持久表单与待处理区 | `plugins-operations`：排序、revision、权威对齐和并发事件、双标签页 claim、失败释放、cancel、过期由插件裁定；`plugins-http`：两标签页提交仅一次接受，`formRemoved` 包含来源，浏览器重连/tree reset 对齐、并发查询合并及异常隔离。 |
+| 用户在场确认 | `plugins-presence`：凭证与连接绑定、origin 优先与广播回退、首个有效回应、连接断开、严格 JSON、超时/拒绝/停用关闭帧；`plugins-http`：真实 HTTP/WS 路由，其他连接不能结束挑战。 |
+| 保活与主动关闭 | `plugins-holds`：仅列托管、读取历史、预登记 hold、多重 hold、空闲回收、关闭二次确认、旧 release 空操作、进程切换不迁移 hold；`plugins-host`：失败和停用释放插件资源。 |
+| 横幅故障 | `plugins-banners`：原子写、重启、加载失败/停用保留 persistent 并标注不可用、来源恢复后 listBanners 与显式清除、配置移除二次确认/审计、I/O 失败保留旧状态；`plugins-http`：新连接重发、停用和重启、禁止删除仍配置来源。 |
+| 通知、鉴权与关闭门禁 | `plugins-host`：通知按来源去重；`plugins-http`：所有读写使用浏览器凭证；`shutdown-ingress`：插件全路由统一拒绝关闭后的请求，multipart 解析前不插入无关异步路由；`backpressure`：同名不同来源的增量与 resync 隔离。 |
+| 主会话增量目录 | `plugins-main-sync`：模型保持idle，增量条目提交后插件收到onChange，树取得新标题/消息数；无新条目不伪造树变更，目录和记录合并时保留较新活动时间。 |
+| 主会话名称 | `plugins-main-title`：真实 pi 改名、扩展清空名称、重启后的只读打开及只读文件更新，同步反映在 mainSessions、树订阅和新快照，状态缓存不覆盖较新名称；所有名称入口统一处理空白和清空值，目录与打开前后覆盖长Unicode、无文本、真实占位字面量及文本块矩阵。 |
+| 前端列表与插件目录一致 | `plugins-main-title`：同一矩阵在打开前后比较 `GET /api/sessions`、`MainSessionsApi.get` 与树节点的名称、标题（列表无文本时为空字符串，树回退为 id）、消息数、托管、状态、文件和目录；托管中改名与清空名称后列表与插件目录取值相同；`web-api`：登记会话的消息数取模型、修改时间取存储目录、空白名称视为未设置；`plugins-main-sync`：活动时间取存储目录与登记会话中较新的值。 |
+| 公共 API 契约 | `plugin-api-contract`：导出类型与真实示例实现的 TypeScript 编译、原生 RPC 不外泄、当前与上一版本范围协商、畸形范围拒绝，以及测试插件完整能力与故障。 |
+
 ## 图片上限观测
 
 M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一次完整测试使用合法 PNG tEXt 块补齐字节数，关闭 pi 自动缩放，以观察原始字节上限，不代表高分辨率照片或真实模型语义验证。
@@ -250,4 +278,4 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 Windows Job 模式在停止返回前独立确认已知成员退出；platform 测试在 StopReport 返回后立即核对已知后代身份，不设置额外退出观察窗口，也不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
 
-Chrome 测试覆盖真实输入框、BroadcastChannel、流式重连、扩展对话框和生产设备密钥，具体断言见[自动化验收映射](#自动化验收映射)。`userPresence` 确认流程、持久表单和插件宿主属于 M3，未纳入当前端到端验收；浏览器场景也未覆盖带图片的队列停止取回、图片拖动与剪切、全部数量/大小/模型能力边界及所有内置斜杠命令。HTML 导出的图片排列由 pi 决定，插件接口类型完整导出不表示插件宿主已实现。
+Chrome 测试覆盖真实输入框、BroadcastChannel、流式重连、扩展对话框和生产设备密钥，具体断言见[自动化验收映射](#自动化验收映射)。插件宿主由 Node 测试覆盖（见 [M3 服务端自动化验收](#m3-服务端自动化验收)）；浏览器中的插件界面、`userPresence` 确认界面、持久表单界面和 agora 联调尚未实现，不在端到端验收中。浏览器场景也未覆盖带图片的队列停止取回、图片拖动与剪切、全部数量/大小/模型能力边界及所有内置斜杠命令。HTML 导出的图片排列由 pi 决定。插件宿主的合作式超时不能隔离同步死循环或阻塞计算，也不能强制撤销插件后台已经受理的操作。

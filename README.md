@@ -2,7 +2,7 @@
 
 pi-pane 是 [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) 编码智能体的轻量 Web 界面。它在浏览器里显示和操作 pi 会话；子代理、会议等功能由插件提供，pi-pane 只提供通用的显示接口。
 
-> **当前状态：M2 前端核心。** 可以在 Chrome 里配对后查看、新建、切换会话，发送消息、看流式回复、停止，使用斜杠命令、图片占位符和 pi 扩展对话框。插件宿主、子会话树和待处理区在 M3 实现。开发与验收说明见 [docs/development.md](docs/development.md)。
+> **当前状态：M2 前端核心与 M3 插件服务端。** 可以在 Chrome 里配对后查看、新建、切换会话，发送消息、看流式回复、停止，使用斜杠命令、图片占位符和 pi 扩展对话框。服务端另提供可信插件宿主（按需树、只读子会话、面板、动作、持久表单、通知、用户在场确认、hold 和横幅），通过 HTTP 与 WebSocket 接口使用；插件界面和 agora 联调尚未实现。开发与验收说明见 [docs/development.md](docs/development.md)。
 
 ## 为什么要做
 
@@ -17,7 +17,7 @@ pi-pane 不替代终端：会话仍然是 pi 自己的会话文件，在终端�
 
 ## 功能范围
 
-以下为完整 MVP 的目标范围。插件接口（会话树中的插件节点、面板、动作、持久表单、横幅、用户在场确认）在 M3 实现，其余功能已可用。
+以下为完整 MVP 的目标范围。插件的服务端能力已实现，浏览器中的插件界面（会话树中的插件节点、面板、持久表单与待处理区、横幅、用户在场确认）尚未实现，其余功能已可用。
 
 - **托管主会话**：每个打开的会话对应一个 `pi --mode rpc` 子进程，加载你自己的 pi 扩展、技能和配置，和在终端里运行 pi 一样。没在运行的会话可以只读查看，第一次发送时再启动。
 - **聊天**：Markdown、思考内容折叠、工具调用卡片、`edit` 差异显示、压缩分隔标记；发送、运行中追加（steer）、排队（follow-up）、停止（排队中的消息退回输入框）；切换模型和 thinking；查看上下文用量和费用。
@@ -73,7 +73,7 @@ npm test
 npm start
 ```
 
-`npm test` 之前会运行 `npm run build`，它同时构建服务端和 `packages/web` 的前端。`npm start` 默认监听 `127.0.0.1:4319`，终端显示一次性配对地址，在 Chrome 中打开即可登录；在终端按 Enter 生成新的配对码。配置文件为 `~/.pi/pane/config.json`，可设置 `piPath`、`port`、`idleReclaimMs` 和 `webRoot`；`PI_PANE_HOME` 可覆盖数据目录。接口与测试入口见 [开发文档](docs/development.md)。
+`npm test` 之前会运行 `npm run build`，它同时构建服务端和 `packages/web` 的前端。`npm start` 默认监听 `127.0.0.1:4319`，终端显示一次性配对地址，在 Chrome 中打开即可登录；在终端按 Enter 生成新的配对码。配置文件为 `~/.pi/pane/config.json`，可设置 `piPath`、`port`、`idleReclaimMs`、`webRoot` 和 `plugins`；`PI_PANE_HOME` 可覆盖数据目录。`plugins` 只填写可信服务端插件的 npm 包名或本地目录，因为插件与服务端有相同的系统权限，不是沙箱。npm 包从 pane 安装位置查找，相对本地目录以配置目录为基准，启动 cwd 不参与解析。加载约定见 [插件接口](docs/plugin-api.md#插件的加载)，接口与测试入口见 [开发文档](docs/development.md)。
 
 界面操作：
 

@@ -118,6 +118,12 @@ test("关闭期间仅保留实例探测，其他 HTTP 入口统一返回 serverS
       ["POST", "/api/assets"], ["POST", "/api/assets/touch"], ["GET", "/api/assets/sha256-" + "a".repeat(64)],
       ["GET", "/api/assets/sha256-" + "a".repeat(64) + "/thumb"], ["GET", "/api/blobs/sha256-" + "a".repeat(64)],
       ["GET", "/api/blobs/sha256-" + "a".repeat(64) + "/thumb"], ["POST", "/bridge/launch"], ["POST", "/bridge/event"],
+      ["GET", "/api/plugins"], ["GET", "/api/forms"], ["GET", "/api/banners/removable"], ["POST", "/api/banners/remove"],
+      ["POST", "/api/tree/snapshot"], ["GET", "/api/tree/children"], ["POST", "/api/presence/test"],
+      ["GET", "/api/plugins/test/catalog"], ["POST", "/api/plugins/test/disable"], ["POST", "/api/plugins/test/tree/snapshot"],
+      ["GET", "/api/plugins/test/tree/children"], ["GET", "/api/plugins/test/panels/test"], ["GET", "/api/plugins/test/forms"],
+      ["POST", "/api/plugins/test/forms/test"], ["POST", "/api/plugins/test/actions/test/form"], ["POST", "/api/plugins/test/actions/test/invoke"],
+      ...["snapshot", "history", "send", "abort"].map(operation => [operation === "snapshot" || operation === "history" ? "GET" : "POST", "/api/plugins/test/sessions/test/" + operation]),
       ["GET", "/"], ["GET", "/unknown"], ["PUT", "/api/sessions/open"],
     ]) {
       const result = await request(server, token, route, method === "POST" ? {} : undefined, method);

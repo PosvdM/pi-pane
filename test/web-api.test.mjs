@@ -1,13 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { catalogEntry, toStoredSession } from "../packages/server/dist/session-catalog.js";
 import { toPaneSessionListItem, toPaneModel, toPaneState, toPaneQuery, toPaneOutcome, toPaneUiRequest, toPiUiAnswer, isPaneQueryType } from "../packages/server/dist/web-adapter.js";
 
 const model = { provider: "fake", id: "test", name: "测试模型", reasoning: true, input: ["text", "image"], contextWindow: 1000, api: "secret", baseUrl: "private", headers: { Authorization: "secret" } };
 test("会话列表只提取 pane 字段，标题限长、日期转 ISO", () => {
   const date = new Date("2026-01-01T00:00:00Z");
-  const row = toPaneSessionListItem({ path: "会话", id: "id", cwd: "目录", name: "名称", firstMessage: "字".repeat(300), created: date, modified: date, messageCount: 3, parentSessionPath: "父会话", allMessagesText: "禁止下发" }, true, "idle");
-  assert.equal(toPaneSessionListItem({ path: "空会话", id: "empty", cwd: "目录", firstMessage: "(no messages)", created: date, modified: date, messageCount: 0 }, false).title, "");
-  assert.deepEqual(row, { sessionFile: "会话", id: "id", cwd: "目录", name: "名称", title: "字".repeat(200), createdAt: date.toISOString(), modifiedAt: date.toISOString(), messageCount: 3, parentSessionFile: "父会话", hosted: true, status: "idle" });
+  const item = (raw, live) => { const stored = toStoredSession(raw); return toPaneSessionListItem({ ...catalogEntry(stored.id, stored, live), stored }); };
+  const raw = { path: "会话", id: "id", cwd: "目录", name: " 名称 ", firstMessage: "字".repeat(300), firstUserText: "字".repeat(300), created: date, modified: date, messageCount: 3, parentSessionPath: "父会话", allMessagesText: "禁止下发" };
+  const live = { file: "会话", cwd: "目录", entries: [], lastActive: Date.parse("2026-02-01T00:00:00Z"), hosted: true, status: "idle", holds: [] };
+  // 登记会话尚未读到名称时，名称、首条文本沿用存储目录；消息数取模型条目，修改时间仍取存储目录。
+  assert.deepEqual(item(raw, live), { sessionFile: "会话", id: "id", cwd: "目录", name: "名称", title: "字".repeat(200), createdAt: date.toISOString(), modifiedAt: date.toISOString(), messageCount: 0, parentSessionFile: "父会话", hosted: true, status: "idle" });
+  assert.deepEqual(item(raw), { sessionFile: "会话", id: "id", cwd: "目录", name: "名称", title: "字".repeat(200), createdAt: date.toISOString(), modifiedAt: date.toISOString(), messageCount: 3, parentSessionFile: "父会话", hosted: false });
+  assert.equal(item({ path: "空会话", id: "empty", cwd: "目录", firstMessage: "(no messages)", firstUserText: "", created: date, modified: date, messageCount: 0 }).title, "");
+  assert.equal(item({ ...raw, name: " \t " }).name, undefined);
 });
 test("模型和状态不暴露原始配置", () => {
   const expected = { provider: "fake", id: "test", name: "测试模型", reasoning: true, images: true, contextWindow: 1000 };

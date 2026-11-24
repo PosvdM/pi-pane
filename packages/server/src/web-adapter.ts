@@ -1,23 +1,21 @@
-import type { NodeStatus } from "@pi-pane/plugin-api";
 import { assert } from "./errors.js";
+import type { CatalogEntry, StoredSession } from "./session-catalog.js";
+import { fallbackSessionTitle } from "./session-title.js";
 import type { ControlRequest, ExtensionUiRequest } from "./pi-rpc.js";
 import type {
   PaneCommandOutcome, PaneModel, PaneQueryResults, PaneQueryType, PaneSessionListItem,
   PaneSessionState, PaneUiRequest,
 } from "./web-api.js";
 
-/** pi SessionInfo 的列表字段；消息全文不属于浏览器协议。 */
-export interface PiSessionListRow {
-  path: string; id: string; cwd: string; name?: string; firstMessage: string;
-  created: Date; modified: Date; messageCount: number; parentSessionPath?: string;
-}
-export function toPaneSessionListItem(row: PiSessionListRow, hosted: boolean, status?: NodeStatus): PaneSessionListItem {
+/** 前端会话列表的一项。标题与插件协议共用 session-title.ts 的规则，没有首条文本时为空字符串，由前端决定占位文字。 */
+export function toPaneSessionListItem(entry: CatalogEntry & { stored: StoredSession }): PaneSessionListItem {
+  const { stored } = entry;
   return {
-    sessionFile: row.path, id: row.id, cwd: row.cwd, title: (row.messageCount === 0 && row.firstMessage === "(no messages)" ? "" : row.firstMessage).slice(0, 200),
-    createdAt: row.created.toISOString(), modifiedAt: row.modified.toISOString(), messageCount: row.messageCount,
-    ...(row.name === undefined ? {} : { name: row.name }),
-    ...(row.parentSessionPath === undefined ? {} : { parentSessionFile: row.parentSessionPath }),
-    hosted, ...(status === undefined ? {} : { status }),
+    sessionFile: entry.file, id: entry.id, cwd: entry.cwd, title: fallbackSessionTitle(entry.firstText, ""),
+    createdAt: stored.created.toISOString(), modifiedAt: stored.modified.toISOString(), messageCount: entry.messageCount ?? stored.messageCount,
+    ...(entry.name === undefined ? {} : { name: entry.name }),
+    ...(stored.parentSessionFile === undefined ? {} : { parentSessionFile: stored.parentSessionFile }),
+    hosted: entry.hosted, ...(entry.registered ? { status: entry.status } : {}),
   };
 }
 export function toPaneModel(model: any): PaneModel {

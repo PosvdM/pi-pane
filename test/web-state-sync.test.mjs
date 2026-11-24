@@ -61,7 +61,7 @@ test("名称和真实 pi 思考级别刷新快照，并在缓存提交后通知�
 });
 
 function harness() {
-  const manager = Object.create(Sessions.prototype); manager.stateRefreshes = new WeakMap(); manager.sync = async () => {};
+  const manager = Object.create(Sessions.prototype); manager.stateRefreshes = new WeakMap(); manager.mainListeners = new Set(); manager.sync = async () => {};
   const model = new SessionModel({ source: "pane", id: "state-sync" }, { detach: value => structuredClone(value) });
   const state = { sessionName: "原名称", thinkingLevel: "off", model: { id: "old", input: ["text", "image"] } };
   const requests = [];

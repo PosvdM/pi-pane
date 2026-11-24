@@ -3,7 +3,7 @@ import { watchFile, unwatchFile } from "node:fs";
 import { readFile, readdir, rm, mkdir, stat, writeFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { stopByIdentity, probeSessionWriterLock, type ProcessIdentity, type StopReport } from "pi-hostkit";
-import type { DraftNode, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
+import type { DraftNode, MainSessionsApi, SessionStreamEvent, StreamCursor } from "@pi-pane/plugin-api";
 import type { ControlRequest } from "./pi-rpc.js";
 import type { PaneSessionList, PaneSessionView, PaneQueryResults, PaneQueryType, PaneUiAnswerRequest, PaneUiAnswerResult, PaneUiRequest, PaneServerMessage } from "./web-api.js";
 import { isPaneQueryType, isUiDialog, queryCommands, toPaneOutcome, toPaneQuery, toPaneSessionListItem, toPaneState, toPaneUiRequest, toPiControlCommand, toPiUiAnswer, type PaneUiDialog } from "./web-adapter.js";
@@ -18,11 +18,13 @@ import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
+import { normalizeSessionName } from "./session-title.js";
+import { catalogEntry, toMainSessionInfo, toStoredSession, type CatalogEntry, type LiveSession, type StoredSession } from "./session-catalog.js";
 import { claim, emptyMirror, reconcile, removed, restore, type QueueMirror } from "./queue-mirror.js";
 
 interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
-  state?: any; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>;
+  state?: any; name?: { value: string | undefined }; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>;
   /** pi 队列的镜像，队列项关联发送时的原草稿，见 queue-mirror.ts。随写者和模型重建清空。 */
   queued: QueueMirror; clients: number; lastActive: number;
   holds: Map<string, { source: string; reason: string }>; ui: Map<string, { request: PaneUiDialog; timer?: ReturnType<typeof setTimeout> }>; recentExternal: boolean; closed: boolean;
@@ -35,6 +37,9 @@ export class Sessions {
   private records = new Map<string, HostedSession>(); private files = new Map<string, HostedSession>();
   private driver: RpcSubprocessDriver; private timer: ReturnType<typeof setInterval>; private projects = new Set<string>();
   private state: Record<string, unknown> = {};
+  private storedById = new Map<string, StoredSession>();
+  private readonly mainListeners = new Set<() => void>();
+  private readonly pluginHolds = new Map<string, Map<string, { source: string; reason: string }>>();
   private stateQueue = new ControlQueue();
   private recoveredFiles = new Set<string>();
   private stateRefreshes = new WeakMap<HostedSession, { handle: DriverHandle; model: SessionModel; epoch: string; dirty: boolean; promise: Promise<void> }>();
@@ -121,9 +126,10 @@ export class Sessions {
     assert(!this.closing, "serverStopping", "服务端正在关闭", 503);
     const existing = this.files.get(fileKey(file)); if (existing) return this.view(existing);
     assert(!this.records.has(id), "sessionIdentityConflict", "另一个文件使用了相同的会话标识", 409);
-    const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), queued: emptyMirror(), clients: 0, lastActive: Date.now(), holds: new Map(), ui: new Map(), recentExternal, closed: false };
+    const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), queued: emptyMirror(), clients: 0, lastActive: Date.now(), holds: this.holdsFor(id), ui: new Map(), recentExternal, closed: false };
+    this.readName(session, parsed.entries);
     this.records.set(id, session); this.files.set(fileKey(file), session);
-    this.watch(file);
+    this.watch(file); this.mainChanged();
     return { ...this.view(session), diagnostics: parsed.diagnostics, ...(busy.held ? { heldBy: busy.record?.host.app } : {}), ...(recentExternal ? { warning: "recentModification" } : {}) };
   }
   private watch(file: string): void {
@@ -132,7 +138,9 @@ export class Sessions {
       if (!session || session.handle || session.closed || current.mtimeMs === previous.mtimeMs && current.size === previous.size) return;
       const model = session.model; const epoch = model.epoch; const owner = session.owner;
       void readSession(file).then((parsed) => {
-        if (!session.handle && !session.closed && session.owner === owner && this.files.get(fileKey(file)) === session && session.model === model && model.epoch === epoch) model.reset(parsed.entries, parsed.leafId);
+        if (!session.handle && !session.closed && session.owner === owner && this.files.get(fileKey(file)) === session && session.model === model && model.epoch === epoch) {
+          model.reset(parsed.entries, parsed.leafId); this.readName(session, parsed.entries); this.mainChanged();
+        }
       }).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     });
   }
@@ -142,12 +150,54 @@ export class Sessions {
   }
   snapshot(id: string): PaneSessionView { return this.view(this.record(id)); }
   history(id: string, before: string, limit?: number): any { return this.record(id).model.history(before, limit); }
+  /**
+   * 重新读取存储目录，并通知插件与主会话树。前端会话列表、主会话树和插件的 get 都由存储目录加上登记会话的实时状态投影，
+   * 投影规则见 session-catalog.ts。
+   */
+  async refreshCatalog(): Promise<StoredSession[]> {
+    const rows = (await this.store.list([...this.projects])).map(toStoredSession).filter((row): row is StoredSession => !!row);
+    this.storedById = new Map(rows.map((row) => [row.id, row]));
+    this.mainChanged(); return rows;
+  }
+  /** 前端会话列表：存储目录中的每个文件一项，登记会话按文件匹配叠加实时状态。 */
   async list(): Promise<PaneSessionList> {
-    const rows = await this.store.list([...this.projects]);
-    return { sessions: rows.map(row => {
-      const session = this.files.get(fileKey(row.path));
-      return toPaneSessionListItem(row, session?.handle?.acceptingInput === true, session?.model.status);
+    const rows = await this.refreshCatalog();
+    return { sessions: rows.map((row) => {
+      const session = this.files.get(fileKey(row.file));
+      return toPaneSessionListItem({ ...catalogEntry(row.id, row, session && this.live(session)), stored: row });
     }) };
+  }
+  /** 主会话目录：按会话 id 合并存储目录与登记会话，包含尚未写入存储的登记会话。 */
+  catalog(): CatalogEntry[] {
+    const ids = new Set([...this.storedById.keys(), ...this.records.keys()]);
+    return [...ids].map((id) => this.catalogEntry(id)!);
+  }
+  private catalogEntry(id: string): CatalogEntry | undefined {
+    const stored = this.storedById.get(id); const session = this.records.get(id);
+    return stored || session ? catalogEntry(id, stored, session && this.live(session)) : undefined;
+  }
+  private live(session: HostedSession): LiveSession {
+    return { file: session.file, cwd: session.cwd, ...(session.name ? { name: session.name } : {}), entries: session.model.entries, lastActive: session.lastActive,
+      hosted: !!session.handle, status: session.model.status, holds: [...session.holds.values()].map((hold) => ({ ...hold })) };
+  }
+  private holdsFor(id: string): Map<string, { source: string; reason: string }> {
+    let holds = this.pluginHolds.get(id); if (!holds) { holds = new Map(); this.pluginHolds.set(id, holds); } return holds;
+  }
+  private setName(session: HostedSession, value: string | undefined): void {
+    session.name = { value: normalizeSessionName(value) };
+  }
+  private readName(session: HostedSession, entries: Entry[]): void {
+    const info = entries.findLast((entry) => entry.type === "session_info");
+    this.setName(session, typeof info?.name === "string" ? info.name : undefined);
+  }
+  private mainChanged(): void { for (const listener of this.mainListeners) { try { listener(); } catch (error) { console.error("主会话状态监听失败：", error); } } }
+  mainSessions(source: string): MainSessionsApi {
+    return {
+      list: () => [...this.records.values()].filter((session) => !!session.handle).map((session) => toMainSessionInfo(this.catalogEntry(session.id)!)),
+      get: (id) => { const entry = this.catalogEntry(id); return entry && toMainSessionInfo(entry); },
+      onChange: (listener) => { this.mainListeners.add(listener); return () => { this.mainListeners.delete(listener); }; },
+      hold: (ref, reason) => { assert(ref.source === "pane", "invalidHold", "只能保活主会话"); return this.hold(ref.id, source, reason); },
+    };
   }
   subscribe(id: string, cursor: StreamCursor, listener: (event: SessionStreamEvent) => void, onUi = (request: PaneUiRequest) => this.emitUi(id, request)): () => void {
     const session = this.record(id); session.clients++; session.lastActive = Date.now();
@@ -159,9 +209,14 @@ export class Sessions {
     return () => { off(); session.clients--; session.lastActive = Date.now(); };
   }
   hold(id: string, source: string, reason: string): () => void {
-    const session = this.record(id); const key = randomUUID(); session.holds.set(key, { source, reason });
-    session.model.emit({ type: "pane_status", status: session.model.status, phase: session.model.inFlight.phase, controlRevision: session.model.controlRevision, holds: [...session.holds.values()] });
-    return () => { session.holds.delete(key); session.lastActive = Date.now(); };
+    const holds = this.holdsFor(id); const key = randomUUID(); holds.set(key, { source, reason });
+    const update = () => {
+      const session = this.records.get(id);
+      if (session) { session.lastActive = Date.now(); session.model.emit({ type: "pane_status", status: session.model.status, phase: session.model.inFlight.phase, controlRevision: session.model.controlRevision, holds: [...holds.values()] }); }
+      this.mainChanged();
+    };
+    update();
+    return () => { if (holds.delete(key)) update(); };
   }
   command(id: string, request: ControlRequest): Promise<any> {
     const priority = ["stop", "close", "restart"].includes(request.command?.type);
@@ -176,7 +231,7 @@ export class Sessions {
       if (command.type === "close") {
         assert(!session.holds.size || command.confirmHolds === true, "holdsConfirmation", "会话仍有保活原因，请确认关闭", 409);
         const preempted = session.control.preempt();
-        const result = await this.stop(session, true, preempted); session.holds.clear(); return result;
+        const result = await this.stop(session, true, preempted); session.holds.clear(); this.mainChanged(); return result;
       }
       if (command.type === "stop") return this.stop(session, false, session.control.preempt());
       assert(model.inFlight.phase !== "stopping", "stopping", "正在停止，请稍后重试", 409);
@@ -318,7 +373,7 @@ export class Sessions {
           const finished = source.exited.then(() => source.drain()); this.handles.set(source, finished);
           void finished.then(() => this.handles.delete(source), () => {});
           if (signal.aborted || this.closing || attached.owner !== owner || attached.closed) cancel();
-          else attached.handle = source;
+          else { attached.handle = source; this.mainChanged(); }
         },
         onRecord: (event) => { if (attached.owner === owner && !attached.closed) this.receive(attached, event); },
         onReady: (state, data, reason, source) => {
@@ -335,7 +390,7 @@ export class Sessions {
             session.model.readonly = true; session.model.readonlyReason = "archived"; session.model.inFlight.assistant = undefined; session.model.inFlight.tools = [];
             session.model.control("idle", "idle", reason, true);
           } else session.model.interrupt("pi", `${reason}${error ? `：${String(error)}` : ""}`);
-          session.lastActive = Date.now(); session.recentExternal = false;
+          session.lastActive = Date.now(); session.recentExternal = false; this.mainChanged();
         },
       }, signal);
       // 启动跨越取锁、spawn 和 bridge 就绪；停止抢占后，迟到的 handle 必须先结束，不能再发送输入。
@@ -372,16 +427,16 @@ export class Sessions {
         session.queued = emptyMirror(); session.drafts.clear();
         session = target;
       } else {
-        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, syncing: undefined, dirty: false, drafts: new Map(), queued: emptyMirror(), control: new ControlQueue(), holds: new Map(), ui: new Map(), recentExternal: false };
+        const previous: HostedSession = { ...session, handle: undefined, owner: undefined, syncing: undefined, dirty: false, drafts: new Map(), queued: emptyMirror(), control: new ControlQueue(), holds: this.holdsFor(session.id), ui: new Map(), recentExternal: false };
         this.records.set(session.id, previous); this.files.set(fileKey(session.file), previous);
-        session.id = state.sessionId; session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
+        session.id = state.sessionId; session.holds = this.holdsFor(session.id); session.file = state.sessionFile; session.model = new SessionModel({ source: "pane", id: state.sessionId }, this.assets);
         this.records.set(session.id, session); this.files.set(fileKey(session.file), session); this.watch(session.file);
       }
     }
-    session.state = state; session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
+    session.state = state; this.setName(session, state.sessionName); session.cwd = state.cwd ?? session.cwd; session.model.readonly = false; session.model.readonlyReason = undefined;
     session.model.reset(data.entries as Entry[], data.leafId); session.model.control("idle", "idle", undefined, true); session.recentExternal = false;
     session.queued = emptyMirror(); session.drafts.clear();
-    return session;
+    this.mainChanged(); return session;
   }
   private receive(session: HostedSession, event: any): void {
     session.lastActive = Date.now();
@@ -401,7 +456,9 @@ export class Sessions {
       for (const item of [...removed(previous.steering, session.queued.steering), ...removed(previous.followUp, session.queued.followUp)])
         if (item.claim?.key && !live.has(item.claim)) session.drafts.delete(item.claim.key);
     }
-    session.model.apply(event);
+    const previousStatus = session.model.status;
+    if (event.type === "session_info_changed" && (typeof event.name === "string" || event.name === undefined)) this.setName(session, event.name);
+    session.model.apply(event); if (session.model.status !== previousStatus || event.type === "session_info_changed") this.mainChanged();
     if (["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type)) void this.refreshState(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
     if (["message_end", "entry_appended", "compaction_end", "session_info_changed", "agent_settled"].includes(event.type)) void this.sync(session).catch((error) => session.model.emit({ type: "pane_diagnostic", message: String(error) }));
   }
@@ -440,7 +497,7 @@ export class Sessions {
         session.dirty = false; const model = session.model; const epoch = model.epoch; const since = model.entries.at(-1)?.id; const handle = session.handle;
         const response = await handle.send({ type: "get_entries", ...(since ? { since } : {}) });
         if (epoch !== model.epoch || session.model !== model || session.handle !== handle) continue;
-        const data = response.data as any; model.append(data.entries, data.leafId);
+        const data = response.data as any; model.append(data.entries, data.leafId); this.mainChanged();
       }
     })().finally(() => { session.syncing = undefined; });
     return session.syncing;
