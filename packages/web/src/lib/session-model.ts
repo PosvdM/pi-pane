@@ -44,10 +44,11 @@ export function apply(state: ModelState, record: SessionStreamEvent): ApplyResul
       const fresh = (event.entries as Entry[]).filter((e) => !known.has(e.id));
       state.entries = [...state.entries, ...fresh];
       state.view.leafId = event.leafId;
-      // 与服务端相同：按完整消息内容移除已经持久化的 completed 项。
-      for (const entry of fresh) if (entry.type === "message") {
-        const completed = inFlight.completed ?? []; const signature = JSON.stringify(entry.message);
-        const i = completed.findIndex((m) => JSON.stringify(m) === signature);
+      // 与服务端（model.ts 的 persistedSignature）相同：按消息身份移除已经持久化的 completed 项，custom_message 对应 custom 消息。
+      for (const entry of fresh) {
+        const signature = persistedSignature(entry); if (signature === undefined) continue;
+        const completed = inFlight.completed ?? [];
+        const i = completed.findIndex((m) => messageSignature(m) === signature);
         if (i >= 0) completed.splice(i, 1);
       }
       break;
@@ -111,3 +112,13 @@ function updateAssistant(inFlight: InFlightState, event: any): void {
   assistant.blocks = assistant.blocks.map((b) => b.contentIndex === i ? next : b);
 }
 
+function messageSignature(message: any): string {
+  return message?.role === "custom"
+    ? JSON.stringify(["custom", message.customType, message.content, !!message.display, message.details ?? null])
+    : JSON.stringify(message);
+}
+function persistedSignature(entry: any): string | undefined {
+  if (entry?.type === "message") return messageSignature(entry.message);
+  if (entry?.type === "custom_message") return JSON.stringify(["custom", entry.customType, entry.content, !!entry.display, entry.details ?? null]);
+  return undefined;
+}

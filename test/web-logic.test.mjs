@@ -193,3 +193,21 @@ test("会话树按修订号合并订阅、分页与删除，冷节点只在父�
   assert.equal(tree.apply({ type: "reset", epoch: "e2" }, hot), "reset");
   assert.equal(tree.revision, 11);
 });
+
+test("扩展注入的 custom 消息落盘为 custom_message 后，服务端与浏览器都从进行中列表移除，只显示一份", () => {
+  const server = new SessionModel(ref, { detach: value => value });
+  const state = fromSnapshot(server.snapshot());
+  const custom = { role: "custom", customType: "agora:notice", content: "子任务已完成", display: true, details: { task: { id: "t1" } }, timestamp: 1767225600000 };
+  const end = { type: "message_end", message: custom };
+  server.apply(end); receive(state, end);
+  assert.equal(state.view.inFlight.completed.length, 1);
+  const entry = { type: "custom_message", id: "c1", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", customType: "agora:notice", content: "子任务已完成", display: true, details: { task: { id: "t1" } } };
+  server.append([entry], "c1");
+  receive(state, { type: "pane_entries", entries: [entry], leafId: "c1" });
+  assert.deepEqual(server.snapshot().inFlight.completed ?? [], []);
+  assert.deepEqual(state.view.inFlight.completed, []);
+  // 内容不同的 custom 消息不被误删。
+  server.apply({ type: "message_end", message: { ...custom, content: "另一条" } });
+  server.append([{ ...entry, id: "c2", parentId: "c1" }], "c2");
+  assert.equal(server.snapshot().inFlight.completed.length, 1);
+});

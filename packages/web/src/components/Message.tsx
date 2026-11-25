@@ -6,7 +6,7 @@ import { renderMarkdown } from "../lib/markdown.ts";
 import { DISPLAYABLE, useBlobUrl } from "../lib/blobs.ts";
 import type { Entry } from "../lib/session-model.ts";
 import { openNodeById } from "../lib/navigate.ts";
-import { rendererFor } from "../lib/plugins.ts";
+import { plugins, rendererFor } from "../lib/plugins.ts";
 import { useStore } from "../lib/store.ts";
 import { nodeForToolCall, trees } from "../lib/tree.ts";
 import type { CustomMessageRenderer, InFlightBlock, NodeStatus, SessionRef } from "../lib/types.ts";
@@ -32,6 +32,14 @@ function ToolNodeLink({ sessionRef, toolCallId }: { sessionRef?: SessionRef; too
       <span>打开 {node.title}</span><span class="muted">{NODE_STATUS[node.status]}</span><span class="spacer" /><span>›</span>
     </button>
   );
+}
+
+/** 自定义消息单独订阅插件目录：目录在条目渲染之后才取到时，已显示的卡片也改用插件声明的渲染器。 */
+function CustomMessage({ message }: { message: any }) {
+  useStore(plugins);
+  const renderer = typeof message.customType === "string" ? rendererFor(message.customType) : undefined;
+  if (renderer) return <RenderedCustom renderer={renderer} message={message} />;
+  return <div class="msg"><Card title={message.customType ?? "自定义消息"} testid="custom-message"><CustomContent content={message.content} /></Card></div>;
 }
 
 /** 从 details 中按点分路径取值。 */
@@ -255,11 +263,7 @@ export function MessageView({ message, ctx }: { message: any; ctx: ToolContext }
       return <div class="msg"><Card title={`$ ${message.command}`}><Clipped text={message.output ?? ""} />{message.exitCode ? <div class="notice">退出码 {message.exitCode}</div> : null}</Card></div>;
     case "custom":
       if (!message.display && !ctx.showHidden) return null;
-    {
-      const renderer = typeof message.customType === "string" ? rendererFor(message.customType) : undefined;
-      if (renderer) return <RenderedCustom renderer={renderer} message={message} />;
-      return <div class="msg"><Card title={message.customType ?? "自定义消息"} testid="custom-message"><CustomContent content={message.content} /></Card></div>;
-    }
+      return <CustomMessage message={message} />;
     case "branchSummary": return <div class="msg"><Card title="分支摘要"><Markdown text={message.summary ?? ""} /></Card></div>;
     case "compactionSummary": return <div class="compaction"><span>以上内容已压缩</span></div>;
     default: return null;
