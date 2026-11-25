@@ -123,6 +123,8 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     const el = editor.current!;
     let alive = true; let timer: ReturnType<typeof setTimeout> | undefined;
     setNodes(loadDraft(localStorage, sessionId));
+    // 刚读出的草稿不必写回。另一标签页可能随后放回取回的草稿并写入草稿存储，延迟写回会用旧内容覆盖它。
+    clearTimeout(saveTimer.current); pendingSave.current = null;
     const detach = attachComposer(sessionId, {
       // 取回的草稿放在现有草稿之前，并立即保存，之后才删除待放回记录。
       deliver: (drafts, message) => {
