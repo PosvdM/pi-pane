@@ -21,5 +21,7 @@ let stopping = false;
 async function stop(): Promise<void> {
   if (stopping) return; stopping = true; input?.close();
   try { await server.close(); } catch (error) { console.error("部分进程未确认停止，保留恢复记录：", error); process.exitCode = 1; }
+  // server.close() 有界返回，但挂起的文件 I/O 或未释放的句柄仍可能让事件循环不结束；1 秒后强制退出。计时器不阻止正常退出。
+  setTimeout(() => process.exit(), 1000).unref();
 }
 process.on("SIGINT", () => { void stop(); }); process.on("SIGTERM", () => { void stop(); });

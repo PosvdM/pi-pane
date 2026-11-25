@@ -3,10 +3,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isSameProcess } from "pi-hostkit";
 import { png } from "../experiments/p0/b-bridge/images.mjs";
+import { AssetStore } from "../packages/server/dist/assets.js";
 import { DraftOutbox, SAVED_DRAFTS_RETENTION_MS } from "../packages/server/dist/draft-outbox.js";
 import { piFixture, providerPath, until, isWin } from "./fixtures/helpers.mjs";
 import { startServer, pair, open, control, snapshot, request } from "./fixtures/client.mjs";
@@ -14,6 +19,8 @@ import { startServer, pair, open, control, snapshot, request } from "./fixtures/
 const uiExtension = fileURLToPath(new URL("./fixtures/web-ui.ts", import.meta.url));
 const text = (value) => [{ type: "text", text: value }];
 const sure = (nodes) => ({ nodes, uncertain: false });
+const unsure = (nodes) => ({ nodes, uncertain: true });
+const thumbnail = Buffer.from("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA", "base64");
 
 async function files(root) {
   const found = [];
@@ -157,3 +164,126 @@ for (const kind of ["stop", "close"]) {
     } finally { await server.close(); }
   });
 }
+
+test("删除空的会话目录与保存同一会话的新记录并发时，保存不失败", async (t) => {
+  const f = await piFixture(); t.after(() => f.cleanup());
+  const outbox = new DraftOutbox(path.join(f.root, "pane"));
+  // remove() 删除空目录可能落在 save() 建目录之后、写临时文件之前；反复并发，所有保存都须成功并可读取。
+  for (let i = 0; i < 200; i++) {
+    await Promise.all([outbox.save("会话", { id: `r-${i}`, reason: "stop", drafts: [sure(text(String(i)))] }), outbox.remove("会话", [`r-${i - 1}`]), outbox.sweep()]);
+    assert.deepEqual((await outbox.list("会话")).map((record) => record.id), [`r-${i}`]);
+  }
+});
+
+test("附件清理跳过仍被服务端暂存草稿引用的图片，30 天内放回时图片仍在；记录删除后按 7 天未使用的期限清理", async (t) => {
+  const f = await piFixture(); t.after(() => f.cleanup());
+  const home = path.join(f.root, "pane"); let now = Date.parse("2026-11-25T00:00:00Z");
+  const assets = new AssetStore(home, undefined, () => now); const outbox = new DraftOutbox(home, () => now);
+  const stored = (assetId) => existsSync(path.join(home, "assets", assetId.slice(7, 9), assetId.slice(7) + ".png"));
+  const referenced = assets.upload(Buffer.from(png(0, 2, 2)), "image/png", thumbnail).assetId;
+  const loose = assets.upload(Buffer.from(png(0, 3, 3)), "image/png", thumbnail).assetId;
+  await outbox.save("会话", { id: "s1", reason: "shutdown", drafts: [sure([{ type: "text", text: "图 " }, { type: "image", assetId: referenced }])] });
+  assert.deepEqual([...await outbox.assets()], [referenced]);
+  now += 29 * 86_400_000;
+  assets.sweep(await outbox.assets());
+  assert.equal(stored(loose), false, "未被引用的图片 7 天未使用后清理");
+  assert.equal(stored(referenced), true, "仍被草稿记录引用的图片保留");
+  // 放回时浏览器 touch 图片：图片仍在，放回的草稿可以原样发送。
+  assert.deepEqual(assets.touch([referenced]), { missing: [] });
+  now += 8 * 86_400_000;
+  await outbox.remove("会话", ["s1"]);
+  assets.sweep(await outbox.assets());
+  assert.equal(stored(referenced), false, "记录删除后按普通期限清理");
+});
+
+test("服务端草稿接口：未鉴权 401，Host 或 Origin 不符 403，同一 requestId 配不同的删除内容 409", { timeout: 30_000 }, async (t) => {
+  const f = await piFixture(); t.after(() => f.cleanup());
+  const server = await startServer(f);
+  try {
+    const token = await pair(server); const route = `/api/sessions/${encodeURIComponent("会话")}/drafts`;
+    assert.equal((await request(server, "bad-token", route)).code, 401);
+    assert.equal((await request(server, "bad-token", route, { requestId: randomUUID(), remove: ["a"] })).code, 401);
+    const raw = (headers) => new Promise((resolve, reject) => {
+      const req = http.request(server.origin + route, { headers: { Authorization: "Bearer " + token, ...headers } }, (response) => { response.resume(); response.on("end", () => resolve(response.statusCode)); });
+      req.on("error", reject); req.end();
+    });
+    assert.equal(await raw({}), 200);
+    assert.equal(await raw({ Host: "evil.test:" + new URL(server.origin).port }), 403);
+    assert.equal(await raw({ Origin: "http://evil.test" }), 403);
+    const requestId = randomUUID();
+    assert.equal((await request(server, token, route, { requestId, remove: ["a"] })).code, 200);
+    const conflict = await request(server, token, route, { requestId, remove: ["b"] });
+    assert.equal(conflict.code, 409); assert.equal(conflict.value.error, "idempotencyConflict");
+  } finally { await server.close(); }
+});
+
+/** 让 pi 照常处理 clear_queue，但调用方收不到响应（等同超时后迟到）。 */
+function lateClearQueue(handle) {
+  const rpc = handle.rpc.bind(handle);
+  handle.rpc = (command, options) => command.type === "clear_queue"
+    ? rpc(command, options).then(() => { throw new Error("模拟 clear_queue 超时：pi 已清空队列，响应迟到"); })
+    : rpc(command, options);
+}
+
+test("服务端关停时 clear_queue 结果未知（超时后 pi 仍清空队列）：按队列镜像把全部草稿保存为归属不明", { timeout: 90_000 }, async (t) => {
+  const f = await piFixture(quickHang); t.after(() => f.cleanup());
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  let state; let drafts;
+  try {
+    const token = await pair(server); state = await ready(server, token, f);
+    drafts = await queueDrafts(server, token, f, state);
+    lateClearQueue(server.sessions.records.get(state.ref.id).handle);
+  } finally { await server.close(); }
+  const records = await new DraftOutbox(path.join(f.root, "pane")).list(state.ref.id);
+  assert.deepEqual(records.map(({ reason, drafts }) => ({ reason, drafts })), [{ reason: "shutdown", drafts: drafts.map(unsure) }]);
+});
+
+test("停止时 clear_queue 结果未知：结果把全部排队草稿作为归属不明交出，以 requestId 只保存一条", { timeout: 90_000 }, async (t) => {
+  const f = await piFixture(quickHang); t.after(() => f.cleanup());
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  try {
+    const token = await pair(server); const state = await ready(server, token, f);
+    const drafts = await queueDrafts(server, token, f, state);
+    lateClearQueue(server.sessions.records.get(state.ref.id).handle);
+    const view = await snapshot(server, token, state.ref.id);
+    const body = { requestId: randomUUID(), expectedEpoch: view.cursor.epoch, expectedRevision: view.controlRevision, command: { type: "stop" } };
+    const route = `/api/sessions/${encodeURIComponent(state.ref.id)}`;
+    const stopped = await request(server, token, route + "/control", body);
+    assert.deepEqual(stopped, { code: 200, value: { status: "done", clearedText: [], clearedDrafts: [], uncertainDrafts: drafts } });
+    await until(async () => !server.sessions.records.get(state.ref.id).handle);
+    const saved = (await request(server, token, route + "/drafts")).value.records;
+    assert.deepEqual(saved.map(({ id, reason, drafts }) => ({ id, reason, drafts })), [{ id: body.requestId, reason: "stop", drafts: drafts.map(unsure) }],
+      "写者停止流程不按同一镜像再保存一份");
+  } finally { await server.close(); }
+});
+
+test("保存清出草稿的文件 I/O 挂起时，关停最多等待 2 秒后继续停止 pi 进程", { timeout: 90_000 }, async (t) => {
+  const f = await piFixture(quickHang); t.after(() => f.cleanup());
+  const server = await startServer(f, { extraExtensions: [providerPath, uiExtension] });
+  let identity; let started;
+  try {
+    const token = await pair(server); const state = await ready(server, token, f);
+    await queueDrafts(server, token, f, state);
+    identity = server.sessions.records.get(state.ref.id).handle.identity;
+    server.sessions.outbox.save = () => new Promise(() => {});
+    started = Date.now();
+  } finally { await server.close(); }
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 2000 && elapsed < 8000, `关停用时 ${elapsed} 毫秒`);
+  assert.equal(await isSameProcess(identity), "gone");
+});
+
+test("CLI 收到 SIGINT 后关闭服务端并退出进程", { timeout: 60_000, skip: isWin && "Windows 上 SIGINT 无法发给子进程的处理函数" }, async (t) => {
+  const f = await piFixture(); t.after(() => f.cleanup());
+  const home = path.join(f.root, "cli-home"); await mkdir(home, { recursive: true });
+  await writeFile(path.join(home, "config.json"), JSON.stringify({ port: 0 }));
+  const cli = fileURLToPath(new URL("../packages/server/dist/cli.js", import.meta.url));
+  const child = spawn(process.execPath, [cli], { env: { ...process.env, PI_PANE_HOME: home }, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
+  let output = ""; child.stdout.on("data", (chunk) => { output += chunk; }); child.stderr.on("data", (chunk) => { output += chunk; });
+  await until(() => output.includes("配对地址"), 20_000);
+  const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+  const started = Date.now(); child.kill("SIGINT");
+  assert.deepEqual(await exited, { code: 0, signal: null }, output);
+  assert.ok(Date.now() - started < 15_000);
+});

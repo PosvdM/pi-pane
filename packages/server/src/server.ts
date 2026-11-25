@@ -119,8 +119,10 @@ export class PaneServer {
       // 驱动延迟到第一次发送才启动，监听端口确定后设置回连地址。
       server.sessions.setBridgeUrl(server.origin);
       const sweepDrafts = () => { void server.sessions.inflight.run("drafts.sweep", () => server.sessions.outbox.sweep()).catch(() => {}); };
+      // 仍被服务端暂存的清出草稿引用的附件不清理；读不出引用时放弃本次附件清理。清理故障不影响会话，下次重试。
+      const sweepAssets = () => { void server.sessions.inflight.run("assets.sweep", async () => { server.assets.sweep(await server.sessions.outbox.assets()); }).catch(() => {}); };
       sweepDrafts();
-      server.sweep = setInterval(() => { server.auth.sweep(); sweepDrafts(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
+      server.sweep = setInterval(() => { server.auth.sweep(); sweepDrafts(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); sweepAssets(); }, 60000); server.sweep.unref();
       return server;
     } catch (error) { await server.close().catch(() => {}); throw error; }
   }

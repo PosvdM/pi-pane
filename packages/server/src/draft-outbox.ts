@@ -21,7 +21,20 @@ const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "E
 
 export class DraftOutbox {
   readonly root: string;
+  /** 每个会话目录上的写入、删除和清理按调用顺序串行，见 exclusive。 */
+  private readonly queues = new Map<string, Promise<void>>();
   constructor(home: string, private readonly now = Date.now) { this.root = path.join(home, "drafts"); }
+  /**
+   * 在会话目录上串行执行。remove() 和 sweep() 会删除空的会话目录，与 save() 交错时可能落在 mkdir 之后、写临时文件之前，
+   * 写入随之失败（macOS 上为 EINVAL，其他平台为 ENOENT）。数据目录只由持有实例锁的一个服务端进程使用，进程内串行即可。
+   */
+  private exclusive<T>(directory: string, action: () => Promise<T>): Promise<T> {
+    const result = (this.queues.get(directory) ?? Promise.resolve()).then(action);
+    const tail = result.then(() => {}, () => {});
+    this.queues.set(directory, tail);
+    void tail.then(() => { if (this.queues.get(directory) === tail) this.queues.delete(directory); });
+    return result;
+  }
   private directory(sessionId: string): string { return path.join(this.root, digest(sessionId)); }
   private file(sessionId: string, id: string): string { return path.join(this.directory(sessionId), digest(id) + ".json"); }
 
@@ -29,11 +42,13 @@ export class DraftOutbox {
   async save(sessionId: string, record: Omit<SavedDrafts, "at">): Promise<void> {
     if (!record.drafts.length) return;
     const file = this.file(sessionId, record.id); const temporary = `${file}.${randomUUID()}.tmp`;
-    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-    const data = { version: 1, sessionId, id: record.id, reason: record.reason, at: new Date(this.now()).toISOString(), drafts: record.drafts };
-    await writeFile(temporary, JSON.stringify(data), { mode: 0o600 });
-    try { await rename(temporary, file); }
-    catch (error) { await rm(temporary, { force: true }).catch(() => {}); throw error; }
+    const data = JSON.stringify({ version: 1, sessionId, id: record.id, reason: record.reason, at: new Date(this.now()).toISOString(), drafts: record.drafts });
+    await this.exclusive(this.directory(sessionId), async () => {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      await writeFile(temporary, data, { mode: 0o600 });
+      try { await rename(temporary, file); }
+      catch (error) { await rm(temporary, { force: true }).catch(() => {}); throw error; }
+    });
   }
 
   /** 该会话的全部记录，按保存时间排序。无法解析或不属于该会话的文件跳过，由定期清理删除。 */
@@ -55,9 +70,31 @@ export class DraftOutbox {
 
   /** 删除记录；不存在的 id 忽略。 */
   async remove(sessionId: string, ids: readonly string[]): Promise<void> {
-    for (const id of ids) await rm(this.file(sessionId, id), { force: true });
-    // 目录为空时一并删除；仍有记录或并发写入时保留。
-    await rmdir(this.directory(sessionId)).catch(() => {});
+    await this.exclusive(this.directory(sessionId), async () => {
+      for (const id of ids) await rm(this.file(sessionId, id), { force: true });
+      // 目录为空时一并删除；仍有记录时保留。
+      await rmdir(this.directory(sessionId)).catch(() => {});
+    });
+  }
+
+  /** 全部记录中引用的图片 assetId。附件清理跳过这些图片，见 AssetStore.sweep。无法读取的目录或文件抛错，由调用方放弃本次附件清理。 */
+  async assets(): Promise<Set<string>> {
+    const found = new Set<string>(); let directories: string[];
+    try { directories = await readdir(this.root); } catch (error) { if (missing(error)) return found; throw error; }
+    for (const directory of directories) {
+      const full = path.join(this.root, directory); let names: string[];
+      try { names = await readdir(full); } catch (error) { if (missing(error)) continue; throw error; }
+      for (const name of names) {
+        if (!name.endsWith(".json")) continue;
+        let value: any;
+        try { value = JSON.parse(await readFile(path.join(full, name), "utf8")); }
+        catch (error) { if (missing(error) || error instanceof SyntaxError) continue; throw error; }
+        for (const draft of Array.isArray(value?.drafts) ? value.drafts : []) {
+          for (const node of Array.isArray(draft?.nodes) ? draft.nodes : []) if (node?.type === "image" && typeof node.assetId === "string") found.add(node.assetId);
+        }
+      }
+    }
+    return found;
   }
 
   /** 删除超过保留期限的记录和中断写入留下的临时文件。 */
@@ -65,14 +102,17 @@ export class DraftOutbox {
     let directories: string[];
     try { directories = await readdir(this.root); } catch (error) { if (missing(error)) return; throw error; }
     for (const directory of directories) {
-      const full = path.join(this.root, directory); let names: string[];
-      try { names = await readdir(full); } catch { continue; }
-      for (const name of names) {
-        const file = path.join(full, name); const limit = name.endsWith(".tmp") ? TEMP_RETENTION_MS : SAVED_DRAFTS_RETENTION_MS;
-        try { if (this.now() - (await stat(file)).mtimeMs > limit) await rm(file, { force: true }); }
-        catch (error) { if (!missing(error)) throw error; }
-      }
-      await rmdir(full).catch(() => {});
+      const full = path.join(this.root, directory);
+      await this.exclusive(full, async () => {
+        let names: string[];
+        try { names = await readdir(full); } catch { return; }
+        for (const name of names) {
+          const file = path.join(full, name); const limit = name.endsWith(".tmp") ? TEMP_RETENTION_MS : SAVED_DRAFTS_RETENTION_MS;
+          try { if (this.now() - (await stat(file)).mtimeMs > limit) await rm(file, { force: true }); }
+          catch (error) { if (!missing(error)) throw error; }
+        }
+        await rmdir(full).catch(() => {});
+      });
     }
   }
 }

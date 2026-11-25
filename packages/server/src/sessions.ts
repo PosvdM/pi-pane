@@ -12,7 +12,7 @@ import { terminalOnlyCommand } from "./pi-commands.js";
 import { AssetStore } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { ControlQueue, RequestLedger } from "./control.js";
-import { RpcSubprocessDriver, verifyStopped, type ClearedQueue, type DriverHandle, type DriverOptions } from "./driver.js";
+import { CLEARED_SAVE_TIMEOUT_MS, RpcSubprocessDriver, verifyStopped, type ClearedQueue, type DriverHandle, type DriverOptions } from "./driver.js";
 import { DraftOutbox, type SavedDraft, type SavedDrafts, type SavedDraftsReason } from "./draft-outbox.js";
 import { assert, duration, PaneError } from "./errors.js";
 import { SessionModel } from "./model.js";
@@ -61,8 +61,8 @@ export class Sessions {
     this.outbox = new DraftOutbox(options.home);
     const waits = [options.stopOptions?.abortTimeoutMs ?? 10000, options.stopOptions?.graceMs ?? 5000, options.stopOptions?.termGraceMs ?? 3000];
     assert(waits.every(ms => Number.isFinite(ms) && ms >= 0), "invalidConfig", "停止宽限必须为非负有限毫秒");
-    // 与固定 hostkit 的 StopOptions 默认值一致；clear_queue 2 秒，身份核查及清理另留 5 秒。
-    this.closeTimeoutMs = duration(Math.ceil(waits.reduce((sum, ms) => sum + ms, 7000)), 25000);
+    // 与固定 hostkit 的 StopOptions 默认值一致；clear_queue 2 秒，保存清出的草稿 2 秒（CLEARED_SAVE_TIMEOUT_MS），身份核查及清理另留 5 秒。
+    this.closeTimeoutMs = duration(Math.ceil(waits.reduce((sum, ms) => sum + ms, 7000 + CLEARED_SAVE_TIMEOUT_MS)), 25000);
     this.ledger = new RequestLedger(Date.now, duration(options.rpcTimeoutMs, 30000));
     this.driver = new RpcSubprocessDriver(broker, { ...options, onTrust: (cwd) => trust.request(cwd) });
     this.timer = setInterval(() => { void this.reclaim().catch(() => {}); }, 10000); this.timer.unref();
@@ -523,10 +523,16 @@ export class Sessions {
    * 把 clear_queue 清出的文字对应到原草稿。优先按队列镜像取回原草稿（含图片节点），steering 在前、followUp 在后，与 clear_queue 的顺序一致。
    * 镜像无法确认时依次按完整编码文字、图片标记 nonce 查找，都找不到时只放回文字。
    * 归属不明的草稿另外交出，由输入框放在确定的草稿之后并提示用户检查；其候选位置只放回实际文字，不再按文字回退查找。
+   * cleared 为 undefined 表示 clear_queue 结果未知（超时、传输失败或被拒绝）：pi 仍可能已清空队列或在退出前清空，
+   * 因此按快照中的整个队列取回，全部作为归属不明的草稿交出，宁可让用户删掉重复的内容也不丢失。
    */
   private resolveCleared(capture: QueueCapture, cleared: ClearedQueue | undefined): ClearedDrafts {
-    const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
-    const steering = restore(capture.mirror.steering, cleared?.steering ?? []); const followUp = restore(capture.mirror.followUp, cleared?.followUp ?? []);
+    if (!cleared) {
+      const all = this.resolveCleared(capture, { steering: capture.mirror.steering.map((item) => item.text), followUp: capture.mirror.followUp.map((item) => item.text) });
+      return { texts: [], drafts: [], uncertain: [...all.drafts, ...all.uncertain], keys: all.keys };
+    }
+    const texts: string[] = [...(cleared.steering ?? []), ...(cleared.followUp ?? [])];
+    const steering = restore(capture.mirror.steering, cleared.steering ?? []); const followUp = restore(capture.mirror.followUp, cleared.followUp ?? []);
     const items = [...steering.certain, ...followUp.certain];
     const uncertain = [...new Set([...steering.uncertain, ...followUp.uncertain])];
     const queuedDrafts = items.map((item) => item?.draft);
@@ -542,32 +548,42 @@ export class Sessions {
   }
   /**
    * 清出的草稿先保存到服务端（draft-outbox.ts），浏览器确认取回后删除；之后的 abort、进程退出或服务端关停都不会让它丢失。
-   * 保存失败不改变停止结果：草稿仍随结果返回，失败记入诊断。
+   * 保存失败不改变停止结果：草稿仍随结果返回，失败记入诊断。最多等待 CLEARED_SAVE_TIMEOUT_MS，文件 I/O 挂起时不拖住停止，
+   * 保存在后台继续。
    */
   private async saveCleared(session: HostedSession, sessionId: string, record: { id: string; reason: SavedDraftsReason }, cleared: ClearedDrafts): Promise<void> {
     const drafts: SavedDraft[] = [...cleared.drafts.map((nodes) => ({ nodes, uncertain: false })), ...cleared.uncertain.map((nodes) => ({ nodes, uncertain: true }))];
     if (!drafts.length) return;
-    try { await this.outbox.save(sessionId, { ...record, drafts }); }
-    catch (error) {
-      console.error("清出的草稿未能保存到服务端：", error);
-      session.model.emit({ type: "pane_diagnostic", message: `清出的草稿未能保存到服务端：${String(error)}` });
-    }
+    const report = (message: string, error?: unknown) => {
+      console.error(message, error ?? "");
+      session.model.emit({ type: "pane_diagnostic", message: error === undefined ? message : `${message}${String(error)}` });
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const saving = this.outbox.save(sessionId, { ...record, drafts }).then(() => true, (error) => { report("清出的草稿未能保存到服务端：", error); return true; });
+    const done = await Promise.race([saving, new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), CLEARED_SAVE_TIMEOUT_MS); })]);
+    clearTimeout(timer);
+    if (!done) report("清出的草稿保存超时，停止继续进行，保存在后台完成");
   }
   /** 浏览器取回服务端保存的清出草稿；不要求会话已登记，服务端重启后也能按会话 id 读取。 */
   savedDrafts(sessionId: string): Promise<SavedDrafts[]> { return this.inflight.run("drafts.list", () => this.outbox.list(sessionId)); }
   removeSavedDrafts(sessionId: string, ids: string[]): Promise<void> { return this.inflight.run("drafts.remove", () => this.outbox.remove(sessionId, ids)); }
   private async stop(session: HostedSession, close: boolean, preempted = false, record: { id: string; reason: SavedDraftsReason } = { id: randomUUID(), reason: "exit" }): Promise<any> {
     if (!session.handle) return { status: "nothingToStop" };
-    const handle = session.handle;
+    // 进程内切换会原地改写 session.id（rebind），草稿按发起停止时的会话保存。
+    const handle = session.handle; const sessionId = session.id;
     session.model.control("running", "stopping", undefined, true);
     // 编码草稿记录会在队列项清出时释放，回退查找使用停止开始时的副本。
     const capture = this.captureQueue(session);
     let cleared: ClearedQueue | undefined; let queueFailed = false;
-    try { cleared = (await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 })).data as ClearedQueue; }
+    try { cleared = ((await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 })).data ?? {}) as ClearedQueue; }
     catch { queueFailed = true; }
     const result = this.resolveCleared(capture, cleared);
-    if (!session.handle || session.handle === handle) for (const key of result.keys) session.drafts.delete(key);
-    await this.saveCleared(session, session.id, record, result);
+    if (!session.handle || session.handle === handle) {
+      for (const key of result.keys) session.drafts.delete(key);
+      // 结果未知时整个队列已作为归属不明的草稿交出；清空镜像，写者停止流程不再按同一镜像保存第二份。
+      if (queueFailed) session.queued = emptyMirror();
+    }
+    await this.saveCleared(session, sessionId, record, result);
     try {
       if (queueFailed || close) await handle.stop();
       else {

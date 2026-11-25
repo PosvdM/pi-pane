@@ -34,9 +34,9 @@ for (const failure of ["reject", "leftovers", "healthy"]) test(`真实挂起控�
     let released = false; const release = server.lock.release.bind(server.lock);
     server.lock.release = async () => { released = true; await release(); };
     closing = server.close();
-    if (failure === "healthy") await within(closing, 9000);
+    if (failure === "healthy") await within(closing, 11000);
     else {
-      const error = await within(closing.then(() => assert.fail("关闭不能成功"), error => error), 9000);
+      const error = await within(closing.then(() => assert.fail("关闭不能成功"), error => error), 11000);
       assert.ok(error instanceof AggregateError);
       assert.equal(server.close(), closing, "重复 close 复用同一失败 Promise");
       await assert.rejects(server.close(), e => e === error);
@@ -74,7 +74,7 @@ test("停止失败终结本地 RPC 等待后仍保存 hostkit 迟到清理事实
     };
     sending = handle.send({ type: "get_state" }, { trackResult: true }).catch(error => error); await entered;
     handle.proc.stop = async () => { throw new Error("停止拒绝"); };
-    await within(assert.rejects(server.close(), AggregateError), 9000);
+    await within(assert.rejects(server.close(), AggregateError), 11000);
     assert.equal((await sending).code, "rpcResultUnknown"); assert.equal(server.sessions.inflight.pending.size, 0);
     assert.equal(server.sessions.cleanupErrors.includes(failure), false);
     resume(); await until(() => server.sessions.cleanupErrors.includes(failure));
@@ -98,10 +98,10 @@ test("永久在途登记超过关闭上限时列出 kind 和来源，保留锁�
     let released = false; const release = server.lock.release.bind(server.lock);
     server.lock.release = async () => { released = true; await release(); };
     const started = Date.now(); const closing = server.close();
-    const error = await within(closing.then(() => assert.fail("超时不能当作排空成功"), error => error), 9000);
+    const error = await within(closing.then(() => assert.fail("超时不能当作排空成功"), error => error), 11000);
     assert.ok(error instanceof AggregateError);
     const timeout = error.errors.find(e => e.code === "shutdownTimeout"); assert.ok(timeout, String(error));
-    assert.ok(Date.now() - started >= 7500, "停止宽限 500ms + 7000ms 收尾预算");
+    assert.ok(Date.now() - started >= 9500, "停止宽限 500ms + 9000ms 收尾预算");
     assert.match(timeout.message, /test\.never-finishes/); assert.match(timeout.message, /shutdown-bounded\.test\.mjs/);
     assert.ok(timeout.detail.pending.some(item => item.kind === "test.never-finishes" && item.source.includes("shutdown-bounded.test.mjs")));
     assert.equal(released, false); assert.equal(server.http.listening, false);
@@ -146,7 +146,7 @@ test("停止结束后的永久登记也受同一关闭上限约束", { timeout: 
     let released = false; const release = server.lock.release.bind(server.lock);
     server.lock.release = async () => { released = true; await release(); };
     const closing = server.close();
-    const error = await within(closing.then(() => assert.fail(), error => error), 9000);
+    const error = await within(closing.then(() => assert.fail(), error => error), 11000);
     assert.ok(error instanceof AggregateError);
     assert.match(error.errors.find(e => e.code === "shutdownTimeout").message, /test.post-stop-never/);
     assert.equal(server.http.listening, false); assert.equal(released, false);
