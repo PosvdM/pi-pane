@@ -5,12 +5,57 @@ import { useState } from "preact/hooks";
 import { renderMarkdown } from "../lib/markdown.ts";
 import { DISPLAYABLE, useBlobUrl } from "../lib/blobs.ts";
 import type { Entry } from "../lib/session-model.ts";
-import type { InFlightBlock } from "../lib/types.ts";
+import { openNodeById } from "../lib/navigate.ts";
+import { rendererFor } from "../lib/plugins.ts";
+import { useStore } from "../lib/store.ts";
+import { nodeForToolCall, trees } from "../lib/tree.ts";
+import type { CustomMessageRenderer, InFlightBlock, NodeStatus, SessionRef } from "../lib/types.ts";
 
 export interface ToolContext {
   results: Map<string, any>;                       // toolCallId → toolResult 消息
   running: Map<string, { partialResult?: unknown }>; // 执行中的工具
   showHidden: boolean;                             // 设置“显示隐藏消息”
+  sessionRef?: SessionRef;                         // 所在会话；用于工具卡片链接到插件节点
+}
+
+const NODE_STATUS: Record<NodeStatus, string> = {
+  idle: "空闲", running: "运行中", waiting: "等待中", paused: "已暂停", done: "已完成", failed: "失败", stopped: "已停止", interrupted: "已中断",
+};
+
+/** 插件节点的 originToolCall 指向这个工具调用时，在卡片下方显示“打开 <节点标题>”（plugin-api.md“工具卡片链接”）。 */
+function ToolNodeLink({ sessionRef, toolCallId }: { sessionRef?: SessionRef; toolCallId: string }) {
+  useStore(trees);
+  const node = sessionRef && toolCallId ? nodeForToolCall(sessionRef.source, sessionRef.id, toolCallId) : undefined;
+  if (!node) return null;
+  return (
+    <button class="tool-node-link" data-testid="tool-node-link" data-node-id={node.id} onClick={() => openNodeById(node.id)}>
+      <span>打开 {node.title}</span><span class="muted">{NODE_STATUS[node.status]}</span><span class="spacer" /><span>›</span>
+    </button>
+  );
+}
+
+/** 从 details 中按点分路径取值。 */
+function pick(details: unknown, path: string): unknown {
+  let value: any = details;
+  for (const key of path.split(".")) { if (value === null || typeof value !== "object") return undefined; value = value[key]; }
+  return value;
+}
+
+/** 按插件声明的 CustomMessageRenderer 显示自定义消息（plugin-api.md“自定义消息”）。 */
+function RenderedCustom({ renderer, message }: { renderer: CustomMessageRenderer; message: any }) {
+  const [open, setOpen] = useState(renderer.collapsed === false);
+  const nodeId = renderer.nodeIdPath ? pick(message.details, renderer.nodeIdPath) : undefined;
+  const rows = (renderer.fields ?? []).map((f) => ({ label: f.label, value: pick(message.details, f.path) })).filter((r) => r.value !== undefined && r.value !== null);
+  return (
+    <div class="msg"><div class="card custom-card" data-testid="custom-message" data-custom-type={message.customType}>
+      <button class="card-head" onClick={() => setOpen(!open)}>{open ? "▾" : "▸"} {renderer.label}</button>
+      {open && <div class="card-body">
+        {renderer.body !== "none" && <CustomContent content={message.content} />}
+        {rows.length > 0 && <table class="kv"><tbody>{rows.map((r) => <tr key={r.label}><th>{r.label}</th><td>{typeof r.value === "string" ? r.value : JSON.stringify(r.value)}</td></tr>)}</tbody></table>}
+        {typeof nodeId === "string" && <button class="link small" data-testid="custom-node-link" onClick={() => openNodeById(nodeId)}>打开节点 ›</button>}
+      </div>}
+    </div></div>
+  );
 }
 
 export function Markdown({ text }: { text: string }) {
@@ -157,7 +202,7 @@ function AssistantContent({ message, ctx }: { message: any; ctx: ToolContext }) 
         if (block.type === "thinking") return <Thinking key={i} text={block.redacted ? "（思考内容已加密）" : block.thinking ?? ""} />;
         if (block.type === "toolCall") {
           const running = ctx.running.get(block.id);
-          return <ToolCard key={i} id={block.id} name={block.name} args={block.arguments} result={ctx.results.get(block.id)} running={!!running} partial={running?.partialResult} />;
+          return <div key={i} class="tool-linked"><ToolCard id={block.id} name={block.name} args={block.arguments} result={ctx.results.get(block.id)} running={!!running} partial={running?.partialResult} /><ToolNodeLink sessionRef={ctx.sessionRef} toolCallId={block.id} /></div>;
         }
         return null;
       })}
@@ -210,7 +255,11 @@ export function MessageView({ message, ctx }: { message: any; ctx: ToolContext }
       return <div class="msg"><Card title={`$ ${message.command}`}><Clipped text={message.output ?? ""} />{message.exitCode ? <div class="notice">退出码 {message.exitCode}</div> : null}</Card></div>;
     case "custom":
       if (!message.display && !ctx.showHidden) return null;
+    {
+      const renderer = typeof message.customType === "string" ? rendererFor(message.customType) : undefined;
+      if (renderer) return <RenderedCustom renderer={renderer} message={message} />;
       return <div class="msg"><Card title={message.customType ?? "自定义消息"} testid="custom-message"><CustomContent content={message.content} /></Card></div>;
+    }
     case "branchSummary": return <div class="msg"><Card title="分支摘要"><Markdown text={message.summary ?? ""} /></Card></div>;
     case "compactionSummary": return <div class="compaction"><span>以上内容已压缩</span></div>;
     default: return null;

@@ -4,6 +4,7 @@ import { useStore } from "../lib/store.ts";
 import { closeSession, current, loadOlder, open, openFile, restart } from "../lib/session.ts";
 import { extensionUi, emptyUi, overlay } from "../lib/ui-state.ts";
 import { settings } from "../lib/settings.ts";
+import { formKey, forms, openForm, sortedForms } from "../lib/plugin-ui.ts";
 import { Composer } from "./Composer.tsx";
 import { EntryView, MessageView, StreamingBlocks, toolKey, type ToolContext } from "./Message.tsx";
 
@@ -60,6 +61,7 @@ function Header() {
 
 function Banners() {
   const state = useStore(current)!;
+  const formMap = useStore(forms);
   const model = state.model!; const view = model.view;
   const banners: any[] = [];
   if (model.replaced) banners.push(
@@ -77,6 +79,10 @@ function Banners() {
   if (view.inFlight?.retry) banners.push(<div class="banner">第 {view.inFlight.retry.attempt}/{view.inFlight.retry.maxAttempts} 次重试：{view.inFlight.retry.errorMessage}</div>);
   if (view.projectTrusted === false) banners.push(<div class="banner muted-banner">项目资源未加载（项目未被信任）。AGENTS.md 等上下文文件不受信任设置影响，始终加载。</div>);
   if (view.holds.length) banners.push(<div class="banner muted-banner">保活：{view.holds.map((h) => h.reason).join("；")}</div>);
+  // 插件的持久表单指向本会话时，在顶部列出并提供“处理”入口（plugin-api.md“持久表单”的节点标记）。
+  for (const form of sortedForms(formMap.values())) if (form.nodeId === "pane:session:" + state.id) banners.push(
+    <div class="banner warn" data-testid="node-pending-banner">待处理：{form.title}<button class="btn small" onClick={() => openForm.set({ key: formKey(form.source, form.id), persistent: true, form })}>处理</button></div>,
+  );
   return <>{banners}</>;
 }
 
@@ -111,8 +117,8 @@ export function ChatView() {
     for (const entry of model.entries) if (entry.type === "message" && entry.message?.role === "toolResult") results.set(entry.message.toolCallId, entry.message);
     for (const message of completed as any[]) if (message?.role === "toolResult") results.set(message.toolCallId, message);
     const running = new Map((inFlight?.tools ?? []).map((t) => [t.toolCallId, { partialResult: t.partialResult }]));
-    return { results, running, showHidden: prefs.showHidden };
-  }, [model.version, prefs.showHidden]);
+    return { results, running, showHidden: prefs.showHidden, sessionRef: { source: "pane", id: state.id } };
+  }, [model.version, prefs.showHidden, state.id]);
   const called = useMemo(() => {
     const ids = new Set<string>();
     const scan = (message: any) => { if (message?.role === "assistant" && Array.isArray(message.content)) for (const b of message.content) if (b.type === "toolCall") ids.add(b.id); };

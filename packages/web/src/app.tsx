@@ -11,9 +11,17 @@ import { overlay } from "./lib/ui-state.ts";
 import { ChatView } from "./components/Chat.tsx";
 import { ChoiceView, ExtensionDialog, Toasts, TrustDialog } from "./components/Dialogs.tsx";
 import { Overlays } from "./components/Overlays.tsx";
+import { BannerStack, FormDialog, PluginToasts, PresenceDialog } from "./components/PluginDialogs.tsx";
+import { PluginSessionView } from "./components/PluginSession.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
+import { pluginView } from "./lib/plugin-session.ts";
+import { installPluginHandlers } from "./lib/plugin-ui.ts";
+import { refreshPlugins } from "./lib/plugins.ts";
+import { syncSources } from "./lib/tree.ts";
 
 installEventHandlers();
+// 每次 WebSocket 建立：重读插件列表和目录，再为 pane 和各活动插件取树快照（已有快照的来源由 ws.ts 按游标续订）。
+installPluginHandlers(() => { void refreshPlugins().then(syncSources); });
 
 function PairPage() {
   const state = useStore(auth);
@@ -36,6 +44,7 @@ function Main() {
   const state = useStore(current);
   const net = useStore(link);
   const sidebar = useStore(sidebarOpen);
+  const plugin = useStore(pluginView);
   useEffect(() => {
     start();
     // 登录后即建立设备密钥（plugin-api.md“设备密钥”）；不支持时在设置页显示原因。
@@ -45,12 +54,15 @@ function Main() {
     return () => { detach(); stop(); };
   }, []);
   return (
+    <div class="shell">
+    <BannerStack />
     <div class={"layout" + (sidebar ? "" : " no-sidebar")}>
       <Sidebar />
       <main class="main">
         <button class="icon-btn sidebar-toggle" title="会话列表" onClick={() => sidebarOpen.set(!sidebar)}>☰</button>
         {net.state !== "open" && <div class="net-banner" data-testid="net-banner">{net.state === "connecting" ? "正在连接…" : "连接已断开，正在重连…"}</div>}
-        {state?.model ? <ChatView /> : (
+        <PluginToasts />
+        {plugin ? <PluginSessionView /> : state?.model ? <ChatView /> : (
           <div class="placeholder">
             {state?.loading ? "加载中…" : state?.error ? <span class="error-text">{state.error}</span> : (
               <div>
@@ -65,6 +77,9 @@ function Main() {
       <TrustDialog />
       <Overlays />
       <ChoiceView />
+      <FormDialog />
+      <PresenceDialog />
+    </div>
     </div>
   );
 }

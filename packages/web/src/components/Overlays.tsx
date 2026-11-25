@@ -3,7 +3,11 @@ import { useEffect, useState } from "preact/hooks";
 import { api } from "../lib/api.ts";
 import { logout } from "../lib/auth.ts";
 import { detectSupport, getOrCreateDevice, resetDevice, setDeviceLabel, type DeviceInfo } from "../lib/device-key.ts";
-import { control, current, openFile, query, sessionList } from "../lib/session.ts";
+import { control, current, openFile, query } from "../lib/session.ts";
+import { trees } from "../lib/tree.ts";
+import { registerDevice, removableBanners, removeBanner } from "../lib/plugin-ui.ts";
+import { plugins } from "../lib/plugins.ts";
+import type { BannerState } from "../lib/types.ts";
 import { settings, updateSettings } from "../lib/settings.ts";
 import { useStore } from "../lib/store.ts";
 import { ask, overlay, toast } from "../lib/ui-state.ts";
@@ -108,8 +112,8 @@ function ForkPicker() {
 }
 
 function NewSession() {
-  const list = useStore(sessionList);
-  const projects = [...new Set(list.items.map((i) => i.cwd))];
+  const pane = useStore(trees).get("pane");
+  const projects = pane ? pane.children(null).filter((n) => n.id.startsWith("pane:project:")).map((n) => n.title) : [];
   const [cwd, setCwd] = useState(current.get()?.model?.view.cwd ?? projects[0] ?? "");
   return (
     <Modal title="新建会话" onClose={close} testid="new-session-dialog">
@@ -124,6 +128,40 @@ function NewSession() {
         </div>
       </form>
     </Modal>
+  );
+}
+
+/** 插件状态，以及来源插件已从配置中移除后留下的 persistent 横幅（plugin-api.md“横幅”）。 */
+function PluginSettings() {
+  const state = useStore(plugins);
+  const [leftover, setLeftover] = useState<BannerState[] | null>(null);
+  const load = () => removableBanners().then(setLeftover, () => setLeftover([]));
+  useEffect(() => { void load(); }, []);
+  if (!state.list.length && !leftover?.length) return null;
+  return (
+    <section>
+      <h3>插件</h3>
+      {state.list.length > 0 && <table class="kv" data-testid="plugin-list"><tbody>{state.list.map((p) => (
+        <tr key={p.locator}><th>{p.displayName ?? p.source ?? p.locator}</th>
+          <td>{p.state === "active" ? "运行中" : p.state === "disabled" ? "已停用" : "加载失败"}{p.error ? `：${p.error}` : ""}</td></tr>
+      ))}</tbody></table>}
+      {leftover && leftover.length > 0 && (
+        <>
+          <p class="muted small">以下横幅的来源插件已从配置中移除，不会再有人清除。确认不再需要后可以手动移除，服务端会记录这次操作。</p>
+          {leftover.map((b) => (
+            <div key={b.source + b.id} class="row" data-testid="leftover-banner">
+              <span class="session-label">{b.title}<span class="src-tag">{b.source}</span></span>
+              <button class="btn danger small-btn" data-testid="remove-banner" onClick={async () => {
+                const answer = await ask("移除横幅", `确定移除“${b.title}”？来源插件 ${b.source} 已不在配置中，移除后无法恢复。`, [{ label: "取消", value: "no" }, { label: "移除", value: "yes", danger: true }]);
+                if (answer !== "yes") return;
+                try { await removeBanner(b.source, b.id); toast("已移除横幅"); } catch (e) { toast((e as Error).message, "error"); }
+                void load();
+              }}>移除</button>
+            </div>
+          ))}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -155,7 +193,7 @@ function Settings() {
               <button class="btn" onClick={() => { setDeviceLabel(label); toast("已保存设备名称"); }}>保存名称</button>
               <button class="btn danger" onClick={async () => {
                 const answer = await ask("重置设备密钥", "重置后会生成新的密钥，插件后台服务会把本浏览器当作新设备，需要重新批准。", [{ label: "取消", value: "no" }, { label: "重置", value: "yes", danger: true }]);
-                if (answer === "yes") { const d = await resetDevice(); setDevice(d); toast("已重置设备密钥"); }
+                if (answer === "yes") { const d = await resetDevice(); setDevice(d); void registerDevice(); toast("已重置设备密钥"); }
               }}>重置设备密钥</button>
             </div>
             <p class="muted small">私钥不可导出，只用于用户在场确认的签名。清除浏览器数据、换端口或换浏览器都等于一台新设备。</p>
@@ -166,6 +204,7 @@ function Settings() {
         <h3>显示</h3>
         <label class="check"><input type="checkbox" checked={prefs.showHidden} onChange={(e) => updateSettings({ showHidden: e.currentTarget.checked })} /> 显示隐藏消息（扩展设置为不显示的自定义消息）</label>
       </section>
+      <PluginSettings />
       <section>
         <h3>浏览器</h3>
         <div class="row">

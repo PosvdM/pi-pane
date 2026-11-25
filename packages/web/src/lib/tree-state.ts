@@ -25,7 +25,8 @@ export class SourceTree {
   /** 已分页加载过的父节点；done 表示全部子节点都已加载，之后新出现的子节点直接显示。 */
   listed = new Map<string, { cursor?: string; done: boolean }>();
   version = 0;
-  constructor(readonly source: string) {}
+  readonly source: string;
+  constructor(source: string) { this.source = source; }
 
   load(snapshot: TreeSnapshot): void {
     this.epoch = snapshot.epoch; this.revision = snapshot.revision;
