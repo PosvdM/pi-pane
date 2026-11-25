@@ -37,7 +37,7 @@ export class PluginHost {
       home: options.home, plugins: options.plugins, timeoutMs: options.timeoutMs,
       createContext: (source, protocol, dataDir, current) => this.context(source, protocol, dataDir, current),
       onUnavailable: (source) => this.unavailable(source),
-      onActive: (source) => this.banners.availability(source, true),
+      onActive: (source) => { this.banners.availability(source, true); options.emit({ type: "plugins", source, active: true }); },
     });
     this.operations = new PluginOperations({
       get: (source) => this.runtime.get(source),
@@ -108,6 +108,7 @@ export class PluginHost {
     this.presence.cancelSource(source);
     this.operations.unavailable(source);
     this.banners.availability(source, false);
+    this.options.emit({ type: "plugins", source, active: false });
     for (const release of this.resources.get(source)?.releases ?? []) { try { release(); } catch (error) { console.error(`插件 ${source} 的资源清理失败：`, error); } }
     this.resources.delete(source);
     for (const [type, owner] of this.rendererOwners) if (owner === source) this.rendererOwners.delete(type);

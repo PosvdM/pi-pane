@@ -183,6 +183,7 @@ export type PaneServerMessage =
   | { type: "panel"; source: string; update: PanelUpdate }
   | { type: "form"; form: FormSpec }
   | { type: "formsAligned" }
+  | { type: "plugins"; source: string; active: boolean }   // 插件启用（含重新启用）或变为不可用
   | { type: "formRemoved"; source: string; formId: string; reason: FormRemovedReason }
   | { type: "presence"; request: PanePresenceRequest }
   | { type: "presenceClosed"; id: string; reason: "confirmed" | "cancelled" | "timeout" }
