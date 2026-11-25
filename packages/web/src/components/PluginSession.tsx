@@ -9,7 +9,7 @@ import { settings } from "../lib/settings.ts";
 import { Store, useStore } from "../lib/store.ts";
 import { findNode, trees } from "../lib/tree.ts";
 import { toast } from "../lib/ui-state.ts";
-import type { ActionSpec, TreeNode } from "../lib/types.ts";
+import type { ActionSpec, NodeStatus, TreeNode } from "../lib/types.ts";
 import { EntryView, MessageView, StreamingBlocks, toolKey, type ToolContext } from "./Message.tsx";
 import { DetailsButton, NodePanels, useDetails, useNodePanels } from "./Panels.tsx";
 import { nodeActions, STATUS_TEXT, StatusIcon } from "./Sidebar.tsx";
@@ -67,7 +67,10 @@ function HeadActions({ node, actions }: { node: TreeNode; actions: ActionSpec[] 
 const drafts = new Store<Record<string, string>>({});
 const setDraft = (nodeId: string, update: (value: string) => string) => drafts.set((all) => ({ ...all, [nodeId]: update(all[nodeId] ?? "") }));
 
-function PluginComposer({ node, running }: { node: TreeNode; running: boolean }) {
+/** 已结束的会话没有可停止的运行。 */
+const ENDED = new Set<NodeStatus>(["done", "failed", "stopped", "interrupted"]);
+
+function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: boolean; canAbort: boolean }) {
   const text = useStore(drafts)[node.id] ?? "";
   const [busy, setBusy] = useState(false);
   const [delivery, setDelivery] = useState<"steer" | "followUp">("steer");
@@ -112,8 +115,7 @@ function PluginComposer({ node, running }: { node: TreeNode; running: boolean })
             </select>
           )}
           <span class="spacer" />
-          {/* 节点声明了 abort 就提供停止（如排队等名额、还没有运行进程的任务）；没有可停止的运行时插件返回 nothingToStop。 */}
-          {node.capabilities.includes("abort") && <button class="btn danger" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stop()}>停止</button>}
+          {canAbort && <button class="btn danger" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stop()}>停止</button>}
           <button class="btn primary" data-testid="plugin-send" disabled={!text.trim() || busy} onClick={() => void submit()}>发送</button>
         </div>
       </div>
@@ -153,7 +155,9 @@ export function PluginSessionView() {
   const actions = nodeActions(node);
   const readonly = model ? model.view.readonly : !node.capabilities.includes("send");
   const canSend = node.capabilities.includes("send") && !readonly && !view.closed;
-  const canAbort = node.capabilities.includes("abort");
+  // 节点声明了 abort 就提供停止，包括排队等名额、还没有运行进程的任务；没有可停止的运行时插件返回 nothingToStop。
+  // 显示的状态取自会话视图，可能先于节点能力更新：会话已结束时不再提供。
+  const canAbort = node.capabilities.includes("abort") && !ENDED.has(status);
   const stop = async () => { const cleared = await abortPlugin(); if (cleared?.length) toast("已停止，清出的待发消息：" + cleared.join(" / ")); };  // 只读视图没有输入框
   const pendingBanner = pending.map((f) => (
     <div key={f.id} class="banner warn" data-testid="node-pending-banner">待处理：{f.title}<button class="btn small" onClick={() => openForm.set({ key: formKey(f.source, f.id), persistent: true, form: f })}>处理</button></div>
@@ -199,7 +203,7 @@ export function PluginSessionView() {
           ))}
           {model && !model.entries.length && !inFlight?.assistant && <div class="empty-chat">还没有消息。</div>}
         </div>
-        {canSend ? <PluginComposer key={node.id} node={node} running={running} /> : (
+        {canSend ? <PluginComposer key={node.id} node={node} running={running} canAbort={canAbort} /> : (
           <div class="readonly-bar" data-testid="plugin-readonly">
             <span data-testid="plugin-readonly-reason">只读：{readonlyText}</span>
             {canAbort && !view.closed && <button class="btn danger small-btn" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stop()}>停止</button>}

@@ -90,6 +90,11 @@ test("插件输入框：提交即清空、被拒或放弃后放回、等待期�
   await byId(page, "action-pending").filter({ hasText: "结果未知" }).locator('[data-testid="action-query"]').click();
   await until(async () => (await byId(page, "action-pending").count()) === 0);
   assert.equal(await editor(page).inputValue(), "", "查到已执行，文字不放回");
+
+  // 会话视图先报告已结束、树节点的 abort 能力还没撤下时，不再提供停止。
+  plugin().emit("d", { type: "pane_status", status: "stopped", phase: "idle" });
+  await byId(page, "plugin-status").filter({ hasText: "已停止" }).waitFor();
+  await byId(page, "plugin-stop").waitFor({ state: "detached" });
 });
 
 test("跨来源的树、历史数与“未归属”；同名侧栏面板按来源区分；主会话的节点面板；切换面板不显示旧行；“详情”记忆、窄屏抽屉与侧栏宽度", { timeout: 120_000 }, async (t) => {

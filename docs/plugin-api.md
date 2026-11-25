@@ -521,7 +521,7 @@ export interface SessionAbortRequest { clearQueue: boolean; origin: RequestOrigi
 ```
 
 - 节点有 `send` 能力时，输入框提交调用 `sessions.send`；节点同时有 `composer` 时改为调用 `composer.actionId` 指定的动作，`target` 为该节点，文字放在 `input.fields.message`。例如 pi-agora 把“对子代理发消息”映射到自己的 steer 动作。`composer.images` 不为 `true` 时输入框禁用图片。
-- 节点有 `abort` 能力时显示“停止”按钮。“停止”的语义是取消，`clearQueue: true`：插件先清空队列再中止，把清出的文本放进 `clearedText`，pi-pane 放回输入框。语义与主会话一致，见 [architecture.md](architecture.md#停止与控制队列)。
+- 节点有 `abort` 能力时显示“停止”按钮，包括排队中、还没有运行进程的会话；会话视图显示的状态已是 `done`、`failed`、`stopped` 或 `interrupted` 时不显示（会话事件可能先于节点能力的更新到达）。“停止”的语义是取消，`clearQueue: true`：插件先清空队列再中止，把清出的文本放进 `clearedText`，pi-pane 放回输入框。语义与主会话一致，见 [architecture.md](architecture.md#停止与控制队列)。
 
 ### 自定义消息
 
