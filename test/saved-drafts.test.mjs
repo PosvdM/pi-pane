@@ -12,7 +12,7 @@ const realFetch = globalThis.fetch;
 function fakeFetch(t, handler) {
   const calls = [];
   globalThis.fetch = async (path, init = {}) => {
-    const call = { path: String(path), method: init.method ?? "GET", body: init.body ? JSON.parse(init.body) : undefined };
+    const call = { path: String(path), method: init.method ?? "GET", body: init.body ? JSON.parse(init.body) : undefined, signal: init.signal };
     calls.push(call);
     return handler(call, calls);
   };
@@ -38,7 +38,7 @@ test("领取：网络中断时用同一 requestId 重试，退避到 5 秒为止
     return json({ status: "claimed", record: record("r", "甲") });
   });
   savedDrafts.set(new Map([["S", [record("r"), record("q")]]]));
-  const claimed = await claimSaved("S", "r", clock.sleep);
+  const claimed = await claimSaved("S", "r", { sleep: clock.sleep });
   assert.deepEqual(claimed, record("r", "甲"));
   const posts = claims(calls);
   assert.equal(posts.length, 5);
@@ -50,26 +50,50 @@ test("领取：网络中断时用同一 requestId 重试，退避到 5 秒为止
   assert.equal(claiming.get().size, 0);
 });
 
-test("领取：网络中断超过期限时抛出网络错误；服务端返回 pending 时每秒轮询，超过期限抛出 claimTimeout", async (t) => {
+test("领取：网络中断超过期限时抛出 claimTimeout，期限外不再发请求；服务端返回 pending 时每秒轮询，同样不超过期限", async (t) => {
   const clock = fakeClock(t);
-  let calls = fakeFetch(t, (call) => { if (call.method === "GET") return json({ records: [] }); throw new TypeError("Failed to fetch"); });
-  const start = clock.now;
-  await assert.rejects(claimSaved("S", "r", clock.sleep), (error) => error.code === "network");
-  assert.ok(clock.now - start > CLAIM_RETRY_MS && clock.now - start <= CLAIM_RETRY_MS + 5000, "重试到期限为止");
+  const start = clock.now; const sent = [];
+  let calls = fakeFetch(t, (call) => { if (call.method === "GET") return json({ records: [] }); sent.push(clock.now); throw new TypeError("Failed to fetch"); });
+  await assert.rejects(claimSaved("S", "r", { sleep: clock.sleep }), (error) => error.code === "claimTimeout");
+  assert.equal(clock.now - start, CLAIM_RETRY_MS, "最后一次退避截在期限处");
+  assert.ok(sent.every((at) => at < start + CLAIM_RETRY_MS), "期限外不再发出请求");
   assert.ok(Math.max(...clock.slept) <= 5000);
 
   clock.slept.length = 0;
   calls = fakeFetch(t, (call) => call.method === "GET" ? json({ records: [] }) : json({ status: "pending" }));
-  await assert.rejects(claimSaved("S", "r", clock.sleep), (error) => error.code === "claimTimeout");
+  await assert.rejects(claimSaved("S", "r", { sleep: clock.sleep }), (error) => error.code === "claimTimeout");
   assert.ok(clock.slept.every((ms) => ms === 1000), "pending 时每秒轮询");
-  assert.ok(clock.slept.length >= CLAIM_RETRY_MS / 1000 && clock.slept.length <= CLAIM_RETRY_MS / 1000 + 1, "轮询不超过期限");
+  assert.equal(clock.slept.length, CLAIM_RETRY_MS / 1000, "轮询不超过期限");
   assert.equal(new Set(claims(calls).map((call) => call.body.requestId)).size, 1);
   assert.equal(claiming.get().size, 0, "失败后同样解除忙碌状态");
 
   // 其他错误（如 403）不重试，直接抛出。
   calls = fakeFetch(t, (call) => call.method === "GET" ? json({ records: [] }) : new Response(JSON.stringify({ error: "forbidden", message: "拒绝" }), { status: 403 }));
-  await assert.rejects(claimSaved("S", "r", clock.sleep), (error) => error.status === 403);
+  await assert.rejects(claimSaved("S", "r", { sleep: clock.sleep }), (error) => error.status === 403);
   assert.equal(claims(calls).length, 1);
+});
+
+test("领取：挂住的请求在总期限到时中止并抛出 claimTimeout；再次领取同一记录沿用原 requestId，领到或 gone 之后才换新的", async (t) => {
+  const bodies = []; let hang = true;
+  fakeFetch(t, (call) => {
+    if (call.method === "GET") return json({ records: [] });
+    bodies.push(call.body.requestId);
+    if (!hang) return json({ status: "claimed", record: record("r", "迟到的领取") });
+    // 服务端没有响应：只能由期限中止。
+    return new Promise((resolve, reject) => call.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+  });
+  const started = Date.now();
+  await assert.rejects(claimSaved("H", "r", { limit: 80 }), (error) => error.code === "claimTimeout");
+  assert.ok(Date.now() - started < 1000, "挂住的请求按总期限结束");
+  assert.equal(claiming.get().size, 0);
+  // 客户端放弃后服务端才完成领取：再次领取用原 requestId，取回同一份结果。
+  hang = false;
+  assert.deepEqual(await claimSaved("H", "r"), record("r", "迟到的领取"));
+  assert.equal(bodies.length, 2); assert.equal(bodies[0], bodies[1], "沿用原 requestId");
+  await claimSaved("H", "r");
+  assert.notEqual(bodies[2], bodies[0], "领到之后的新领取换新的 requestId");
+  await claimSaved("H", "q");
+  assert.equal(new Set(bodies.slice(2)).size, 2, "不同记录用不同的 requestId");
 });
 
 test("领取期间只有该记录处于忙碌状态，同一会话的其他记录和其他会话不受影响", async (t) => {

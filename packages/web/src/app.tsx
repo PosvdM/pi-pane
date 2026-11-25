@@ -6,6 +6,7 @@ import { getOrCreateDevice } from "./lib/device-key.ts";
 import { current, detach, lastSessionId, open } from "./lib/session.ts";
 import { useStore } from "./lib/store.ts";
 import { link, start, stop } from "./lib/ws.ts";
+import { installTab, tabReady } from "./lib/tab.ts";
 import { sidebarOpen } from "./lib/actions.ts";
 import { overlay } from "./lib/ui-state.ts";
 import { ChatView } from "./components/Chat.tsx";
@@ -71,11 +72,13 @@ function Main() {
 
 export function App() {
   const state = useStore(auth);
-  useEffect(() => { void boot(); }, []);
+  // 输入框草稿按标签页保存：标签页标识确定之前不进入主界面。
+  const tab = useStore(tabReady);
+  useEffect(() => { void boot(); void installTab(); }, []);
   return (
     <>
-      {state.phase === "ready" ? <Main /> : state.phase === "pairing" ? <PairPage /> : (
-        <div class="pair-page"><div class="pair-card">{state.phase === "loading" ? "正在连接 pi-pane…" : <>
+      {state.phase === "ready" && tab ? <Main /> : state.phase === "pairing" ? <PairPage /> : (
+        <div class="pair-page"><div class="pair-card">{state.phase === "loading" || state.phase === "ready" ? "正在连接 pi-pane…" : <>
           <p class="error-text">{state.message}</p><button class="btn" onClick={() => void boot()}>重试</button></>}</div></div>
       )}
       <Toasts />

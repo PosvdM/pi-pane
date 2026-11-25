@@ -16,8 +16,13 @@ export const claiming = new Store<ReadonlySet<string>>(new Set());
 export const claimKey = (sessionId: string, recordId: string) => JSON.stringify([sessionId, recordId]);
 /** 每个会话的读取代次：只采用最后一次发起的读取，乱序到达的旧列表丢弃。 */
 const reads = new Map<string, number>();
-/** 领取的总期限：网络中断时的重试和服务端仍在执行（pending）时的轮询都在此期限内，与控制命令的网络重试期限相同。 */
+/** 领取的总期限：包括进行中的请求、网络中断时的重试和服务端仍在执行（pending）时的轮询，与控制命令的网络重试期限相同。 */
 export const CLAIM_RETRY_MS = 120_000;
+/**
+ * 本页面对各记录领取用的 requestId，键为 claimKey。领取超过期限放弃后，服务端可能随后才完成领取，结果只能用原 requestId 取到，
+ * 因此同一记录的再次领取沿用原 requestId，直到领到内容或得到 gone。
+ */
+const claimIds = new Map<string, string>();
 
 const draftsPath = (sessionId: string) => `/api/sessions/${encodeURIComponent(sessionId)}/drafts`;
 
@@ -40,33 +45,55 @@ export function recordDrafts(record: PaneSavedDrafts): RestoredDraft[] {
   return record.drafts.map((draft) => ({ nodes: normalize(draft.nodes), uncertain: draft.uncertain === true }));
 }
 
+/** claimSaved 的计时，测试可替换。 */
+export interface ClaimClock { sleep: (ms: number, signal: AbortSignal) => Promise<void>; limit: number }
+const realClock: ClaimClock = {
+  limit: CLAIM_RETRY_MS,
+  sleep: (ms, signal) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true }); }),
+};
+
 /**
  * 领取一条记录，返回其内容；记录已被其他页面领取、已过期或不存在时返回 null。
- * 领取会删除服务端记录：网络中断或服务端仍在执行（pending）时，在 CLAIM_RETRY_MS 内用同一 requestId 重试，
- * 由服务端幂等记录返回同一份内容；超过期限抛出 ApiError（claimTimeout），其他失败抛出原 ApiError。
+ * 领取会删除服务端记录：网络中断或服务端仍在执行（pending）时用同一 requestId 重试，由服务端幂等记录返回同一份内容。
+ * 整个领取有一个总期限（clock.limit），到期时中止进行中的请求，不再发出新请求，抛出 ApiError（claimTimeout）；其他失败抛出原 ApiError。
  * 领取期间该记录登记在 claiming 中。结束后重新读取该会话的列表。
  */
-export async function claimSaved(sessionId: string, recordId: string, sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))): Promise<PaneSavedDrafts | null> {
-  const body = { requestId: newId() }; const giveUp = Date.now() + CLAIM_RETRY_MS; let delay = 500;
+export async function claimSaved(sessionId: string, recordId: string, clock: Partial<ClaimClock> = {}): Promise<PaneSavedDrafts | null> {
+  const { sleep, limit } = { ...realClock, ...clock };
   const key = claimKey(sessionId, recordId);
-  claiming.set((set) => new Set(set).add(key));
+  const requestId = claimIds.get(key) ?? newId(); claimIds.set(key, requestId);
+  const body = { requestId };
+  const deadline = new AbortController(); const timer = setTimeout(() => deadline.abort(), limit);
+  const giveUp = Date.now() + limit; let delay = 500;
   const expired = () => new ApiError(0, "claimTimeout", "领取没有在期限内完成，请稍后在待取回列表中重试");
+  /** 剩余时间内等待 ms 毫秒；返回是否仍在期限内。 */
+  const wait = async (ms: number) => {
+    const left = giveUp - Date.now();
+    if (left <= 0 || deadline.signal.aborted) return false;
+    await sleep(Math.min(ms, left), deadline.signal);
+    return Date.now() < giveUp && !deadline.signal.aborted;
+  };
+  claiming.set((set) => new Set(set).add(key));
   try {
     for (;;) {
+      if (Date.now() >= giveUp || deadline.signal.aborted) throw expired();
       let result: PaneClaimResult | { status: "pending" };
-      try { result = await api<PaneClaimResult | { status: "pending" }>(`${draftsPath(sessionId)}/${encodeURIComponent(recordId)}/claim`, body); }
+      try { result = await api<PaneClaimResult | { status: "pending" }>(`${draftsPath(sessionId)}/${encodeURIComponent(recordId)}/claim`, body, deadline.signal); }
       catch (error) {
+        if (deadline.signal.aborted) throw expired();
         if (!(error instanceof ApiError && (error.code === "network" || error.code === "invalidResponse"))) throw error;
-        if (Date.now() > giveUp) throw error;
-        await sleep(delay); delay = Math.min(5000, delay * 2);
+        if (!await wait(delay)) throw expired();
+        delay = Math.min(5000, delay * 2);
         continue;
       }
-      if (result.status === "pending") { if (Date.now() > giveUp) throw expired(); await sleep(1000); continue; }
+      if (result.status === "pending") { if (!await wait(1000)) throw expired(); continue; }
+      claimIds.delete(key);
       // 记录已不在服务端：立即从本页列表中去掉，不等重新读取。
       savedDrafts.set((all) => new Map(all).set(sessionId, (all.get(sessionId) ?? []).filter((record) => record.id !== recordId)));
       return result.status === "claimed" ? result.record : null;
     }
   } finally {
+    clearTimeout(timer);
     claiming.set((set) => { const next = new Set(set); next.delete(key); return next; });
     void refreshSaved(sessionId);
   }

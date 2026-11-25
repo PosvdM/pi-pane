@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mergeDrafts, prependDrafts } from "../packages/web/src/lib/draft.ts";
+import { prependDrafts } from "../packages/web/src/lib/draft.ts";
 import {
-  FLIGHT_GRACE_MS, FLIGHT_STALE_MS, addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, commitDraft, deliverRestored, draftKey, encodeId,
-  finishSubmit, flightPrefix, FLIGHT_HELD_RECHECK_MS, loadDraft, loadNotice, noticeKey, readDraft, recoverFlights, saveDraft, takePending, unsavedSessions,
+  FLIGHT_GRACE_MS, FLIGHT_STALE_MS, addNotice, adoptDrafts, attachComposer, batchPrefix, beginSubmit, clearNotice, deliverRestored, draftKey, draftPrefix, encodeId,
+  finishSubmit, flightPrefix, FLIGHT_HELD_RECHECK_MS, legacyDraftKey, legacyLock, loadDraft, loadNotice, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions,
 } from "../packages/web/src/lib/restored.ts";
+import { tabLock } from "../packages/web/src/lib/tab.ts";
 
 class MemoryStorage {
   items = new Map();
@@ -19,6 +20,10 @@ class MemoryStorage {
   }
   removeItem(key) { this.items.delete(key); }
 }
+const T1 = "11111111-1111-4111-8111-111111111111";
+const T2 = "22222222-2222-4222-8222-222222222222";
+const T3 = "33333333-3333-4333-8333-333333333333";
+const T4 = "44444444-4444-4444-8444-444444444444";
 const text = (value) => [{ type: "text", text: value }];
 const image = (id) => [{ type: "text", text: "图 " }, { type: "image", assetId: id }];
 const sure = (nodes) => ({ nodes, uncertain: false });
@@ -149,17 +154,17 @@ test("R9-1 取回草稿：localStorage 超出配额时草稿保存在内存并�
   assert.equal(unsavedSessions.get().has("其他"), false);
   // 输入框挂载时仍能从内存取走，草稿保存同样失败时留在内存。
   const full = composer((drafts) => {
-    assert.equal(saveDraft(storage, "满", drafts.flatMap((draft) => draft.nodes)), false);
+    assert.equal(saveDraft(storage, "满", T1, drafts.flatMap((draft) => draft.nodes)), false);
   });
   const detach = attachComposer("满", full.handle);
   assert.equal(takePending(storage, "满"), true);
   detach();
   assert.equal(full.received[0].length, 2);
-  assert.deepEqual(loadDraft(storage, "满"), [{ type: "text", text: "很长的排队消息".repeat(10) + "图 " }, { type: "image", assetId: "q" }], "读取时内存记录优先");
+  assert.deepEqual(loadDraft(storage, "满", T1), [{ type: "text", text: "很长的排队消息".repeat(10) + "图 " }, { type: "image", assetId: "q" }], "读取时内存记录优先");
   assert.ok(unsavedSessions.get().has("满"), "草稿仍只在内存中");
   storage.quota = Infinity;
-  assert.equal(saveDraft(storage, "满", text("已发送一部分")), true);
-  assert.equal(storage.getItem(draftKey("满")), JSON.stringify(text("已发送一部分")));
+  assert.equal(saveDraft(storage, "满", T1, text("已发送一部分")), true);
+  assert.equal(storage.getItem(draftKey("满", T1)), JSON.stringify(text("已发送一部分")));
   assert.equal(unsavedSessions.get().has("满"), false, "写回后清除标记");
   // 提示记录写入失败时同样留在内存。
   storage.quota = 10;
@@ -305,59 +310,118 @@ test("#17 在途提交：刷新时旧页面尚未释放锁的过期记录稍后�
   detach();
 });
 
+/** 模拟输入框的收养：收养的内容在前、本页内容在后，写入本页的键。 */
+function adopter(storage, sessionId, tabId, initial = []) {
+  const box = { content: initial, adopted: [], attached: true };
+  box.absorb = (nodes, legacy) => {
+    if (!box.attached) return undefined;
+    box.adopted.push({ nodes, legacy });
+    box.content = prependDrafts([nodes], box.content);
+    return saveDraft(storage, sessionId, tabId, box.content);
+  };
+  return box;
+}
 
-test("草稿合并：一方只在开头或末尾增加时接到另一方的同一端；其余两份都保留，存储内容在前；相同内容不重复", () => {
-  const nodes = (...parts) => prependDrafts([], []).concat(...parts.map((part) => typeof part === "string" ? [{ type: "text", text: part }] : [{ type: "image", assetId: part.image }])).reduce((list, node) => {
-    const last = list.at(-1); if (node.type === "text" && last?.type === "text") list[list.length - 1] = { type: "text", text: last.text + node.text }; else list.push(node); return list;
-  }, []);
-  const base = nodes("原稿");
-  assert.deepEqual(mergeDrafts(base, nodes("原稿"), nodes("原稿，另一页")), nodes("原稿，另一页"), "本页没有改动时取存储");
-  assert.deepEqual(mergeDrafts(base, nodes("原稿，本页"), nodes("原稿")), nodes("原稿，本页"), "存储没有改动时取本页");
-  assert.deepEqual(mergeDrafts(base, nodes("相同"), nodes("相同")), nodes("相同"), "两边相同时不重复");
-  // 本页在末尾打字，另一页把取回的草稿放在开头（P0 的情形）：两份修改都在。
-  assert.deepEqual(mergeDrafts(base, nodes("原稿", "，本页打字"), nodes("取回", { image: "a" }, "\n\n原稿")), nodes("取回", { image: "a" }, "\n\n原稿，本页打字"));
-  // 本页放回（加在开头），另一页在末尾打字。
-  assert.deepEqual(mergeDrafts(base, nodes("取回\n\n原稿"), nodes("原稿，另一页打字")), nodes("取回\n\n原稿，另一页打字"));
-  // 本页提交（清空），另一页在末尾补充：保留另一页补充的部分，不重复已提交的原稿。
-  assert.deepEqual(mergeDrafts(base, [], nodes("原稿，另一页补充")), nodes("，另一页补充"));
-  // 另一页提交（清空），本页在末尾补充：只保留本页补充的部分。
-  assert.deepEqual(mergeDrafts(base, nodes("原稿，本页补充"), []), nodes("，本页补充"));
-  // 两页各放回一批（同一浏览器两页几乎同时领取不同记录）：两批都在。
-  assert.deepEqual(mergeDrafts(base, nodes("甲批\n\n原稿"), nodes("乙批\n\n原稿")), nodes("甲批\n\n乙批\n\n原稿"));
-  // 两边都改了中间：都保留，存储在前，空行分隔；原稿出现两次，宁可重复不丢失。
-  assert.deepEqual(mergeDrafts(nodes("一二三"), nodes("一本页三"), nodes("一另一页三")), nodes("一另一页三\n\n一本页三"));
-  assert.deepEqual(mergeDrafts([], nodes("本页"), nodes("另一页")), nodes("另一页\n\n本页"), "基准为空时两份都保留");
-  assert.deepEqual(mergeDrafts([], nodes("本页"), []), nodes("本页"));
+test("草稿按标签页分键：每页只读写自己的键，保存直接写入、空草稿删除；会话 id 编码后作前缀", () => {
+  const storage = new MemoryStorage();
+  assert.equal(draftKey("S", T1), `pi-pane.draft.S.${T1}`);
+  assert.equal(draftPrefix("a.b"), "pi-pane.draft.a%002eb.", "会话 id 中的“.”编码，前缀不会与其他会话混淆");
+  assert.equal(saveDraft(storage, "S", T1, text("甲页")), true);
+  assert.equal(saveDraft(storage, "S", T2, text("乙页")), true);
+  assert.deepEqual(loadDraft(storage, "S", T1), text("甲页"));
+  assert.deepEqual(loadDraft(storage, "S", T2), text("乙页"), "两页各写各的，互不覆盖");
+  saveDraft(storage, "S", T1, [{ type: "text", text: "  " }]);
+  assert.equal(storage.getItem(draftKey("S", T1)), null);
+  assert.deepEqual(loadDraft(storage, "S", T2), text("乙页"));
+  assert.deepEqual(loadDraft(storage, "S", T3), []);
 });
 
-test("草稿比较后写入：版本未变时直接写入；另一页写过时合并而不覆盖；只在内容含两页修改时标记已合并", () => {
+test("收养：锁被持有（标签页仍打开）时跳过；取得锁时把它的草稿放在本页内容之前，先写入本页的键再删除原键", async () => {
+  const storage = new MemoryStorage(); const locks = fakeLocks();
+  saveDraft(storage, "S", T2, text("仍打开的乙页"));
+  saveDraft(storage, "S", T3, [...text("已关闭的丙页 "), ...image("c").slice(1)]);
+  saveDraft(storage, "其他", T3, text("其他会话"));
+  saveDraft(storage, "S", T1, text("本页"));
+  locks.held.add(tabLock(T2));
+  const box = adopter(storage, "S", T1, text("本页"));
+  // 写入本页的键时原键必须仍在：先写后删。
+  const absorb = box.absorb;
+  box.absorb = (nodes, legacy) => { assert.notEqual(storage.getItem(draftKey("S", T3)), null, "写入本页之前不删除原键"); return absorb(nodes, legacy); };
+  await adoptDrafts(storage, "S", T1, box.absorb, locks);
+  assert.deepEqual(box.adopted, [{ nodes: [{ type: "text", text: "已关闭的丙页 " }, { type: "image", assetId: "c" }], legacy: false }]);
+  assert.deepEqual(loadDraft(storage, "S", T1), prependDrafts([[{ type: "text", text: "已关闭的丙页 " }, { type: "image", assetId: "c" }]], text("本页")));
+  assert.equal(storage.getItem(draftKey("S", T3)), null, "收养后删除原键");
+  assert.deepEqual(loadDraft(storage, "S", T2), text("仍打开的乙页"), "仍打开的标签页不收养");
+  assert.deepEqual(loadDraft(storage, "其他", T3), text("其他会话"), "只收养本会话的键");
+  assert.ok(!locks.requested.includes(tabLock(T1)), "不收养本页自己的键");
+});
+
+test("收养：锁内重新读取，已被其他标签页收养走的不再收养；输入框已切换会话时不收养、不删除", async () => {
+  const storage = new MemoryStorage(); const locks = fakeLocks();
+  saveDraft(storage, "S", T3, text("丙页"));
+  // 取得锁之前另一个标签页已收养并删除。
+  const request = locks.request;
+  locks.request = async (name, options, callback) => { storage.removeItem(draftKey("S", T3)); return request(name, options, callback); };
+  const box = adopter(storage, "S", T1);
+  await adoptDrafts(storage, "S", T1, box.absorb, locks);
+  assert.deepEqual(box.adopted, []);
+  locks.request = request;
+  saveDraft(storage, "S", T3, text("丙页"));
+  box.attached = false;
+  await adoptDrafts(storage, "S", T1, box.absorb, locks);
+  assert.deepEqual(loadDraft(storage, "S", T3), text("丙页"), "没有收养时原键保留");
+});
+
+test("收养：本页写入失败时不删除原键，内容留在本页内存；再次扫描不重复收养，之后本页写入成功时删除原键", async () => {
+  const storage = new MemoryStorage(); const locks = fakeLocks();
+  saveDraft(storage, "Q", T3, text("丙页的长草稿".repeat(5)));
+  storage.quota = storage.items.size ? [...storage.items].reduce((n, [k, v]) => n + k.length + v.length, 0) : 0;
+  const box = adopter(storage, "Q", T1);
+  await adoptDrafts(storage, "Q", T1, box.absorb, locks);
+  assert.equal(box.adopted.length, 1);
+  assert.notEqual(storage.getItem(draftKey("Q", T3)), null, "写入失败时保留原键");
+  assert.deepEqual(loadDraft(storage, "Q", T1), text("丙页的长草稿".repeat(5)), "内容在本页内存中");
+  assert.ok(unsavedSessions.get().has("Q"), "照写入失败处理：提示并在离开页面前确认");
+  await adoptDrafts(storage, "Q", T1, box.absorb, locks);
+  assert.equal(box.adopted.length, 1, "同一内容不重复收养");
+  storage.quota = Infinity;
+  assert.equal(saveDraft(storage, "Q", T1, box.content), true);
+  assert.equal(storage.getItem(draftKey("Q", T3)), null, "本页写入成功后删除原键");
+  assert.equal(unsavedSessions.get().has("Q"), false);
+  saveDraft(storage, "Q", T1, []);
+});
+
+test("收养：旧版没有 tabId 的共用键当作没有主人的键，在锁内收养；其他会话的旧键和不像 tabId 的键不动", async () => {
+  const storage = new MemoryStorage(); const locks = fakeLocks();
+  storage.setItem(legacyDraftKey("S"), JSON.stringify(text("升级前的草稿")));
+  storage.setItem(legacyDraftKey("S.x"), JSON.stringify(text("另一会话的旧草稿")));
+  const box = adopter(storage, "S", T1, text("本页"));
+  await adoptDrafts(storage, "S", T1, box.absorb, locks);
+  assert.deepEqual(box.adopted, [{ nodes: text("升级前的草稿"), legacy: true }]);
+  assert.ok(locks.requested.includes(legacyLock("S")));
+  assert.deepEqual(loadDraft(storage, "S", T1), text("升级前的草稿\n\n本页"));
+  assert.equal(storage.getItem(legacyDraftKey("S")), null);
+  assert.notEqual(storage.getItem(legacyDraftKey("S.x")), null);
+  // 损坏或空的键直接删除，不放进输入框。
+  storage.setItem(draftKey("S", T2), "{坏");
+  await adoptDrafts(storage, "S", T1, box.absorb, locks);
+  assert.equal(box.adopted.length, 1);
+  assert.equal(storage.getItem(draftKey("S", T2)), null);
+});
+
+test("收养：没有 Web Locks 时按存活记录判断，仍存活的跳过；不加锁，两页交错收养同一份时重复而不丢失", async () => {
   const storage = new MemoryStorage();
-  saveDraft(storage, "S", text("原稿"));
-  const a = readDraft(storage, "S"); const b = readDraft(storage, "S");
-  assert.deepEqual(a.nodes, text("原稿")); assert.equal(a.version, storage.getItem(draftKey("S")));
-  // A 放回取回的草稿：版本未变，直接写入。
-  const restored = commitDraft(storage, "S", prependDrafts([text("取回")], a.nodes), a.version);
-  assert.equal(restored.merged, false); assert.deepEqual(loadDraft(storage, "S"), text("取回\n\n原稿"));
-  // B 一直在打字（没有收到或忽略了 storage 事件），保存时基准仍是旧版本：合并，A 放回的草稿保留。
-  const typed = commitDraft(storage, "S", text("原稿，B 打字"), b.version);
-  assert.equal(typed.merged, true);
-  assert.deepEqual(typed.nodes, text("取回\n\n原稿，B 打字"));
-  assert.deepEqual(loadDraft(storage, "S"), typed.nodes); assert.equal(typed.version, storage.getItem(draftKey("S")));
-  // A 随后以自己写入的版本为基准再保存：版本又变了，B 的内容同样不会丢。
-  const again = commitDraft(storage, "S", text("取回\n\n原稿！"), restored.version);
-  assert.equal(again.merged, true);
-  assert.match(again.nodes[0].text, /取回/); assert.match(again.nodes.map((n) => n.text).join(""), /B 打字/);
-  // 以最新版本为基准时直接写入，清空时删除键。
-  const cleared = commitDraft(storage, "S", [], again.version);
-  assert.equal(cleared.merged, false); assert.equal(cleared.version, null); assert.equal(storage.getItem(draftKey("S")), null);
-  // 本页没有实际修改、另一页写过：取存储内容，不标记合并（调用方静默刷新输入框）。
-  saveDraft(storage, "S", text("另一页"));
-  const adopted = commitDraft(storage, "S", [], null);
-  assert.deepEqual(adopted.nodes, text("另一页")); assert.equal(adopted.merged, false);
-  // 写入失败时暂存在内存，版本取内存中的值，之后照常比较。
-  storage.quota = 0;
-  const memo = commitDraft(storage, "S", text("另一页，配额已满"), adopted.version);
-  assert.equal(memo.merged, false); assert.deepEqual(loadDraft(storage, "S"), text("另一页，配额已满"));
-  assert.equal(readDraft(storage, "S").version, memo.version);
-  storage.quota = Infinity; saveDraft(storage, "S", []);
+  saveDraft(storage, "S", T2, text("乙页"));
+  saveDraft(storage, "S", T3, text("丙页"));
+  const alive = (tabId) => tabId === T2;
+  const one = adopter(storage, "S", T1); const other = adopter(storage, "S", T4);
+  // 第一页读出原键、写入自己的键之前，第二页完成整个收养。
+  const absorb = one.absorb; let interleaved = false;
+  one.absorb = (nodes, legacy) => { if (!interleaved) { interleaved = true; void adoptDrafts(storage, "S", T4, other.absorb, null, alive); } return absorb(nodes, legacy); };
+  await adoptDrafts(storage, "S", T1, one.absorb, null, alive);
+  assert.ok(interleaved);
+  assert.deepEqual(loadDraft(storage, "S", T2), text("乙页"), "仍存活的标签页不收养");
+  assert.equal(storage.getItem(draftKey("S", T3)), null);
+  assert.deepEqual(loadDraft(storage, "S", T1), text("丙页"));
+  assert.deepEqual(loadDraft(storage, "S", T4), text("丙页"), "两页都有一份，重复而不丢失");
 });

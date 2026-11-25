@@ -1,6 +1,6 @@
 // 服务端保存的清出草稿在 Chrome 中的取回（#10、#11）：服务端记录是唯一的权威副本。发起停止的页面收到结果后领取并直接放回；
 // 结果没有交到页面、服务端关停等异步路径上，记录显示在该会话所有标签页的待取回条中，由用户点“放回输入框”领取，只有一个领取者拿到。
-// 另一标签页没有未保存的编辑时，从草稿存储重新读取并显示，不写回，不会用旧内容覆盖放回的草稿。
+// 输入框草稿按标签页分键，每页只写自己的键；已关闭标签页的草稿由打开同一会话的其他标签页收养。
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -9,7 +9,7 @@ import { png } from "../experiments/p0/b-bridge/images.mjs";
 import { prependDrafts } from "../packages/web/src/lib/draft.ts";
 import { providerPath, until } from "./fixtures/helpers.mjs";
 import { openPaired, startWebServer } from "./fixtures/browser.mjs";
-import { setup, byId, newSession, idle, sessionView, records, replyScript, sessionItem, observePage } from "./fixtures/web-e2e.mjs";
+import { setup, byId, newSession, idle, sessionView, records, replyScript, sessionItem, observePage, draftKey } from "./fixtures/web-e2e.mjs";
 
 const webUi = fileURLToPath(new URL("./fixtures/web-ui.ts", import.meta.url));
 const serverOptions = () => ({ extraExtensions: [providerPath, webUi] });
@@ -58,7 +58,10 @@ async function draftNodes(page) {
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const toasts = async page => (await byId(page, "toast").allTextContents()).join("\n");
 const saved = (s, id) => s.server.sessions.outbox.list(id);
-const stored = (page, id) => page.evaluate(key => JSON.parse(localStorage.getItem(key) ?? "[]"), `pi-pane.draft.${id}`);
+const stored = async (page, id) => page.evaluate(key => JSON.parse(localStorage.getItem(key) ?? "[]"), await draftKey(page, id));
+const tabOf = page => page.evaluate(() => sessionStorage.getItem("pi-pane.tab"));
+/** 模拟页面回到前台。无头 Chrome 中页面始终可见，直接派发 visibilitychange。 */
+const foreground = page => page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
 const rows = page => byId(page, "saved-draft");
 async function typeAtEnd(page, value) {
   await byId(page, "composer").evaluate(el => { el.focus(); const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection().removeAllRanges(); getSelection().addRange(range); });
@@ -119,13 +122,13 @@ async function holdFirst(page, id, kind) {
   return state;
 }
 
-test("#10 Chrome 服务端关停时排队的草稿（含图片）保存，重启后两个标签页都显示待取回条；一页放回后另一页的条消失、草稿同步显示且不被覆盖，刷新不重复", { timeout: 150_000 }, async t => {
+test("#10 Chrome 服务端关停时排队的草稿（含图片）保存，重启后两个标签页都显示待取回条；一页放回后另一页的条消失、输入框不变；关闭原页后另一页回到前台时收养它的草稿，刷新不重复", { timeout: 150_000 }, async t => {
   const s = await setup(t, replyScript("预热完成"), { serverOptions, allowedErrors: restartErrors }); if (!s) return;
   const b = await create(s, "关停乙");
   const a = await create(s, "关停甲");
   const drafts = await queueDrafts(s);
   await byId(s.page, "composer").fill("关停前的输入");
-  await s.page.waitForFunction(key => localStorage.getItem(key) !== null, `pi-pane.draft.${a.ref.id}`);
+  await s.page.waitForFunction(key => localStorage.getItem(key) !== null, await draftKey(s.page, a.ref.id));
   const before = (await records(s.fixture.env.FAKE_REQUEST_LOG)).filter(row => row.kind === "request").length;
 
   const paired = await restart(s);
@@ -141,32 +144,40 @@ test("#10 Chrome 服务端关停时排队的草稿（含图片）保存，重启
     const row = rows(page).first();
     assert.equal(await row.getAttribute("data-record-id"), record.id);
     assert.match(await row.textContent(), /服务端关闭前排队.*图片之前 \[Image #1\] 图片之后 \/ 排队的纯文字（1 张图片）/);
-    assert.deepEqual(await draftNodes(page), text("关停前的输入"), "异步路径不自动放回");
+    assert.deepEqual(await draftNodes(page), [], "异步路径不自动放回；原页仍开着，不收养它的草稿");
   }
   await rows(paired).first().getByTestId("saved-draft-restore").click();
-  const want = prependDrafts(drafts, text("关停前的输入"));
+  const want = prependDrafts(drafts, []);
   await until(async () => same(await draftNodes(paired), want));
   assert.match(await toasts(paired), /排队中的消息已放回输入框/);
   await until(async () => (await saved(s, a.ref.id)).length === 0);
-  // 另一页：收到变更通知后条消失；没有未保存的编辑，从草稿存储重新读取并显示，不写回。
+  await until(async () => same(await stored(paired, a.ref.id), want));
+  // 另一页：收到变更通知后条消失，输入框不变。
   await until(async () => await rows(other).count() === 0 && await rows(paired).count() === 0);
-  await until(async () => same(await draftNodes(other), want));
-  await other.waitForTimeout(800);
-  assert.deepEqual(await stored(paired, a.ref.id), want, "另一页没有用放回前的旧内容覆盖草稿存储");
+  assert.deepEqual(await draftNodes(other), []);
   assert.doesNotMatch(await toasts(other), /已放回输入框/, "提示只出现在放回的一页");
 
-  // 另一页随后编辑：编辑基于同步后的内容，放回的草稿保留，并同步回放回的一页。
-  await typeAtEnd(other, "，另一页补充");
-  const edited = prependDrafts(drafts, text("关停前的输入，另一页补充"));
-  await until(async () => same(await stored(paired, a.ref.id), edited));
-  await until(async () => same(await draftNodes(paired), edited));
+  // 关闭原页（它的键里是“关停前的输入”）：另一页回到前台时收养，接在本页内容之前。
+  await typeAtEnd(other, "另一页的输入");
+  await until(async () => same(await stored(other, a.ref.id), text("另一页的输入")));
+  const originalKey = await draftKey(s.page, a.ref.id);
+  await s.page.close();
+  const adopted = prependDrafts([text("关停前的输入")], text("另一页的输入"));
+  // 页面关闭后浏览器才释放它的锁：每次检查前都派发一次，锁释放后的第一次即收养。
+  await until(async () => { await foreground(other); return same(await draftNodes(other), adopted); });
+  assert.match(await toasts(other), /已关闭的标签页中这个会话的草稿已放入输入框/);
+  await until(async () => same(await stored(other, a.ref.id), adopted));
+  assert.equal(await other.evaluate(key => localStorage.getItem(key), originalKey), null, "收养后删除原页的键");
+  await foreground(paired);
+  await paired.waitForTimeout(300);
+  assert.deepEqual(await draftNodes(paired), want, "已被收养的草稿不再出现在其他页");
 
-  // 刷新、切换会话：草稿保留，没有待取回条，也不会再放回一次。
+  // 刷新、切换会话：各页的草稿保留，没有待取回条，也不会再放回一次。
   for (const page of [paired, other]) { await page.reload(); await choose(page, a); }
-  await until(async () => same(await draftNodes(paired), edited));
-  assert.deepEqual(await draftNodes(other), edited);
+  await until(async () => same(await draftNodes(paired), want));
+  await until(async () => same(await draftNodes(other), adopted));
   await choose(paired, b); await choose(paired, a);
-  assert.deepEqual(await draftNodes(paired), edited);
+  assert.deepEqual(await draftNodes(paired), want);
   assert.equal(await rows(paired).count(), 0);
 });
 
@@ -220,46 +231,88 @@ test("#11 Chrome 停止已执行、结果返回前刷新发起页面：记录显
   assert.equal(await rows(winner).count(), 0);
 });
 
-test("Chrome 停止成功时发起页领取并直接放回，同一会话的另一页同步显示；普通草稿在未编辑的另一页同步且不被旧内容覆盖", { timeout: 120_000 }, async t => {
+test("Chrome 两页同一会话各写各的草稿，互不覆盖，刷新后仍在；停止成功时发起页领取并直接放回，另一页不变；复制的标签页换新 tabId；关闭一页后另一页重新打开会话时收养；换行写入输入框再读出不变", { timeout: 150_000 }, async t => {
   const s = await setup(t, replyScript("预热完成"), { serverOptions }); if (!s) return;
   const { page } = s;
-  const a = await create(s, "同步甲");
+  const b = await create(s, "分页乙");
+  const a = await create(s, "分页甲");
   const other = await tab(s);
   await choose(other, a);
-
-  // 普通草稿：一页编辑后，另一页（没有未保存的编辑）重新读取并显示，不写回。
-  await byId(page, "composer").fill("第一页的草稿");
-  await until(async () => same(await draftNodes(other), text("第一页的草稿")));
-  await typeAtEnd(other, "，第二页补充");
-  await until(async () => same(await draftNodes(page), text("第一页的草稿，第二页补充")));
-  await page.waitForTimeout(800);
-  assert.deepEqual(await stored(page, a.ref.id), text("第一页的草稿，第二页补充"));
-  await byId(page, "composer").fill("");
-  await until(async () => same(await draftNodes(other), []));
+  assert.notEqual(await tabOf(page), await tabOf(other));
 
   const drafts = await queueDrafts(s);
-  await byId(other, "composer").fill("另一页的输入");
-  await until(async () => same(await draftNodes(page), text("另一页的输入")));
-  let shown = false;
-  const watch = setInterval(() => { void rows(other).count().then(n => { if (n) shown = true; }, () => {}); }, 20);
+  await byId(page, "composer").fill("第一页的草稿");
+  await byId(other, "composer").fill("第二页的草稿");
+  await until(async () => same(await stored(page, a.ref.id), text("第一页的草稿")) && same(await stored(other, a.ref.id), text("第二页的草稿")));
+  await page.waitForTimeout(800);
+  assert.deepEqual(await draftNodes(page), text("第一页的草稿"), "另一页的保存不影响本页");
+  assert.deepEqual(await draftNodes(other), text("第二页的草稿"));
+  const tabId = await tabOf(page);
+  await page.reload(); await choose(page, a);
+  assert.equal(await tabOf(page), tabId, "刷新沿用 tabId");
+  await until(async () => same(await draftNodes(page), text("第一页的草稿")));
+
+  // 停止：发起页领取并放回到自己的输入框之前；另一页的输入框和草稿不变。
   await byId(page, "stop").click();
-  const want = prependDrafts(drafts, text("另一页的输入"));
+  const want = prependDrafts(drafts, text("第一页的草稿"));
   await until(async () => same(await draftNodes(page), want));
   assert.match(await toasts(page), /排队中的消息已放回输入框/);
   assert.equal(await rows(page).count(), 0, "发起页直接放回，不显示待取回条");
-  await until(async () => same(await draftNodes(other), want));
   await until(async () => (await saved(s, a.ref.id)).length === 0);
   await until(async () => await rows(other).count() === 0);
-  clearInterval(watch);
-  t.diagnostic(`另一页短暂显示过待取回条：${shown}`);
-  await other.waitForTimeout(800);
-  assert.deepEqual(await stored(page, a.ref.id), want, "另一页没有写回旧内容");
+  await until(async () => same(await stored(page, a.ref.id), want));
+  await other.waitForTimeout(500);
+  assert.deepEqual(await draftNodes(other), text("第二页的草稿"));
+  assert.deepEqual(await stored(other, a.ref.id), text("第二页的草稿"));
+
+  // 复制标签页：sessionStorage 中的 tabId 与原页相同，原页仍开着，新页换一个 tabId，看不到也不覆盖原页的草稿。
+  const copy = observePage(await s.context.newPage()); s.pages.push(copy); copy.setDefaultTimeout(15_000);
+  await copy.addInitScript(id => { if (!sessionStorage.getItem("pi-pane.copied")) { sessionStorage.setItem("pi-pane.copied", "1"); sessionStorage.setItem("pi-pane.tab", id); } }, tabId);
+  await copy.goto(s.server.origin); await byId(copy, "sidebar").waitFor();
+  await choose(copy, a);
+  assert.notEqual(await tabOf(copy), tabId);
+  assert.deepEqual(await draftNodes(copy), []);
+  await byId(copy, "composer").fill("复制页的草稿");
+  await until(async () => same(await stored(copy, a.ref.id), text("复制页的草稿")));
+  assert.deepEqual(await stored(page, a.ref.id), want);
+  await copy.close();
+
+  // 关闭另一页：本页重新打开该会话时收养它的草稿（复制页的也在），接在本页内容之前。
+  await other.close();
+  // 页面关闭后浏览器才释放它的锁：没收养到时重新打开一次。
+  const has = (nodes, value) => nodes.some(node => node.type === "text" && node.text.includes(value));
+  await until(async () => { await choose(page, b); await choose(page, a); await page.waitForTimeout(200); const nodes = await draftNodes(page); return has(nodes, "第二页的草稿") && has(nodes, "复制页的草稿"); });
+  const all = await draftNodes(page);
+  assert.ok(same(all, prependDrafts([text("第二页的草稿"), text("复制页的草稿")], want)) || same(all, prependDrafts([text("复制页的草稿"), text("第二页的草稿")], want)), "收养的草稿在前，本页内容在后");
+  await until(async () => same(await stored(page, a.ref.id), all));
+  assert.deepEqual(await page.evaluate(prefix => Object.keys(localStorage).filter(key => key.startsWith(prefix)), `pi-pane.draft.${a.ref.id}.`), [await draftKey(page, a.ref.id)], "被收养的键已删除");
+
+  // 末尾换行、连续换行、图片前后的换行：写进输入框再读出来完全一样。
+  const newlines = [{ type: "text", text: "\n开头换行\n\n中间\n" }, { type: "image", assetId: "sha256-" + "b".repeat(64) }, { type: "text", text: "\n图片后\n\n" }];
+  await page.evaluate(({ key, value }) => localStorage.setItem(key, value), { key: await draftKey(page, b.ref.id), value: JSON.stringify(newlines) });
+  await choose(page, b);
+  await byId(page, "composer").locator(".chip").waitFor();
+  assert.deepEqual(await draftNodes(page), newlines);
+  // 不改内容，只触发一次读取和保存：保存的内容与写入前相同。
+  await page.evaluate(key => localStorage.removeItem(key), await draftKey(page, b.ref.id));
+  await byId(page, "composer").dispatchEvent("input");
+  await until(async () => (await stored(page, b.ref.id)).length > 0);
+  assert.deepEqual(await stored(page, b.ref.id), newlines);
+  for (const value of [[{ type: "text", text: "末尾一个换行\n" }], [{ type: "text", text: "连续三个换行\n\n\n" }], [{ type: "image", assetId: "sha256-" + "b".repeat(64) }, { type: "text", text: "\n" }]]) {
+    await page.evaluate(({ key, value }) => localStorage.setItem(key, value), { key: await draftKey(page, a.ref.id), value: JSON.stringify(value) });
+    await choose(page, a);
+    await page.evaluate(key => localStorage.removeItem(key), await draftKey(page, a.ref.id));
+    await byId(page, "composer").dispatchEvent("input");
+    await until(async () => (await stored(page, a.ref.id)).length > 0);
+    assert.deepEqual(await stored(page, a.ref.id), value);
+    await choose(page, b);
+  }
 });
 
-test("Chrome 一页停止、结果返回期间另一页连续打字：保存时发现另一页已放回，两边的内容合并保留并提示；待取回条的放弃先确认，放弃后各页的条消失、输入框不变", { timeout: 150_000 }, async t => {
+test("Chrome 一页停止、结果返回期间另一页连续打字：两页的内容都在、各自保存，互不覆盖；待取回条的放弃先确认，放弃后各页的条消失、输入框不变", { timeout: 150_000 }, async t => {
   const s = await setup(t, replyScript("预热完成"), { serverOptions }); if (!s) return;
   const { page } = s;
-  const a = await create(s, "合并甲");
+  const a = await create(s, "并行甲");
   const other = await tab(s);
   await choose(other, a);
   const drafts = await queueDrafts(s);
@@ -277,7 +330,7 @@ test("Chrome 一页停止、结果返回期间另一页连续打字：保存时�
   await until(() => held.result);
   assert.equal(held.result.status, "done");
 
-  // 另一页开始打字，防抖期间一直有未保存的编辑；此时放行，发起页领取后把草稿写入共享的草稿存储。
+  // 另一页开始打字，防抖期间一直有未保存的编辑；此时放行，发起页领取后写入它自己的键。
   let typed = "乙";
   await typeAtEnd(other, typed);
   release();
@@ -288,23 +341,20 @@ test("Chrome 一页停止、结果返回期间另一页连续打字：保存时�
     written = same(await stored(page, a.ref.id), restored);
     if (!written) await other.waitForTimeout(60);
   }
-  assert.ok(written, "发起页已领取并写入草稿存储");
-  assert.deepEqual(await draftNodes(other), text(typed), "另一页有未保存的编辑，不因 storage 事件重新读取");
+  assert.ok(written, "发起页已领取并写入自己的草稿键");
   await other.keyboard.insertText("完"); typed += "完";
-
-  // 另一页保存时版本已变：与存储中的内容合并，不覆盖发起页放回的草稿；发起页随后同步显示合并结果。
-  const want = prependDrafts(drafts, text(typed));
-  await until(async () => same(await stored(page, a.ref.id), want));
-  await until(async () => same(await draftNodes(other), want));
-  await until(async () => same(await draftNodes(page), want));
-  assert.match(await toasts(other), /另一页面修改了草稿，已合并/);
-  assert.match(await toasts(page), /排队中的消息已放回输入框/);
+  await until(async () => same(await stored(other, a.ref.id), text(typed)));
+  await other.waitForTimeout(800);
+  assert.deepEqual(await draftNodes(page), restored, "放回的草稿留在发起页");
+  assert.deepEqual(await stored(page, a.ref.id), restored);
+  assert.deepEqual(await draftNodes(other), text(typed), "另一页的输入不受影响");
+  assert.deepEqual(await stored(other, a.ref.id), text(typed));
+  assert.doesNotMatch(await toasts(other), /合并/);
   assert.deepEqual(await saved(s, a.ref.id), []);
   await page.unrouteAll({ behavior: "ignoreErrors" });
 
   // 放弃：再排两条，停止的结果没有交到发起页（刷新），记录留在待取回条中。
   await byId(page, "composer").fill("");
-  await until(async () => same(await draftNodes(other), []));
   await queueDrafts(s);
   const stop = await holdFirst(page, a.ref.id, "stop");
   await byId(page, "stop").click();
@@ -314,7 +364,6 @@ test("Chrome 一页停止、结果返回期间另一页连续打字：保存时�
   await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
   await byId(other, "composer").fill("放弃时的输入");
   for (const p of [page, other]) await until(async () => await rows(p).count() === 1);
-  await until(async () => same(await draftNodes(page), text("放弃时的输入")));
 
   // 先确认：取消时什么都不做。
   await rows(other).first().getByTestId("saved-draft-discard").click();
@@ -328,6 +377,7 @@ test("Chrome 一页停止、结果返回期间另一页连续打字：保存时�
   await until(async () => /已放弃/.test(await toasts(other)));
   for (const p of [page, other]) await until(async () => await rows(p).count() === 0);
   assert.deepEqual(await saved(s, a.ref.id), []);
-  for (const p of [page, other]) assert.deepEqual(await draftNodes(p), text("放弃时的输入"));
+  assert.deepEqual(await draftNodes(other), text("放弃时的输入"));
+  assert.deepEqual(await draftNodes(page), []);
   assert.doesNotMatch(await toasts(page), /已放弃/, "提示只出现在放弃的一页");
 });

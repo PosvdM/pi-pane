@@ -31,9 +31,10 @@ export async function request(path: string, init: RequestInit = {}): Promise<Res
   return response;
 }
 
-export async function api<T>(path: string, body?: unknown): Promise<T> {
-  const response = await request(path, body === undefined ? {} : {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+/** signal 中止时请求以 ApiError（network）结束，与网络中断相同：服务端是否已执行未知。 */
+export async function api<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  const response = await request(path, body === undefined ? { signal } : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
   });
   // 响应头已到而响应体读取中断时，结果同样未知，按网络错误处理；完整但无法解析的响应单独标出。
   let text: string;

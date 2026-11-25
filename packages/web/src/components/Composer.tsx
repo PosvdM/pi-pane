@@ -6,7 +6,8 @@ import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
 import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, commitDraft, draftKey, finishSubmit, loadNotice, noticeChanged, noticeKey, readDraft, recoverFlights, takePending, unsavedSessions, type DraftVersion } from "../lib/restored.ts";
+import { addNotice, adoptDrafts, attachComposer, batchPrefix, beginSubmit, clearNotice, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions } from "../lib/restored.ts";
+import { ownTab, tabAlive } from "../lib/tab.ts";
 import { closeSession, control, current, editorText, navigation, outcomeUnknown, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
@@ -40,6 +41,14 @@ function chipHtml(assetId: string, expired = false): string {
 }
 function nodesHtml(nodes: DraftNode[], expired: Set<string> = new Set()): string {
   return nodes.map((n) => n.type === "image" ? chipHtml(n.assetId, expired.has(n.assetId)) : escapeHtml(n.text).replace(/\n/g, "<br>")).join("");
+}
+/**
+ * 整个输入框的 HTML，与 readNodes 互逆。contenteditable 末尾的 <br> 不占一行，Chrome 在末尾换行后另加一个占位 <br>，
+ * readNodes 读取时去掉它；这里同样在以换行结尾的内容后加上占位 <br>，否则末尾的换行写入后读不回来。
+ */
+export function editorHtml(nodes: DraftNode[]): string {
+  const last = nodes.at(-1);
+  return nodesHtml(nodes) + (last?.type === "text" && last.text.endsWith("\n") ? "<br>" : "");
 }
 
 /** 从 DOM 读出草稿节点。Chrome 可能把换行写成 <br> 或块元素，两种都按换行处理。 */
@@ -86,21 +95,12 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   const blocked = view.readonlyReason === "externalWriter" ? "该会话正由其他程序托管，只能查看" : model.replaced ? "此会话的进程已切换到其他会话" : current.get()?.warning === "recentModification" ? "该会话可能正在别处运行，只能查看" : null;
 
   // 待写入 localStorage 的草稿：编辑时立即捕获内容，延迟写入；切换会话或卸载时同步写入。
+  // 草稿存储按标签页分键，只由本页写入（architecture.md“取回草稿的交付”）。
   const pendingSave = useRef<{ sessionId: string; nodes: DraftNode[] } | null>(null);
-  // 本页最后读到或写入的草稿版本（当前会话）。保存时与存储中的版本比较，另一页面写过时合并而不覆盖。
-  const version = useRef<DraftVersion>(null);
-  // 输入框当前所属的会话；切换会话或卸载时先置空，此时保存只写存储，不再改动输入框。
-  const active = useRef<string | null>(null);
   const flush = () => {
     clearTimeout(saveTimer.current);
     const pending = pendingSave.current; pendingSave.current = null;
-    if (!pending) return;
-    const saved = commitDraft(localStorage, pending.sessionId, pending.nodes, version.current);
-    version.current = saved.version;
-    // 合并后的内容与本页不同：更新输入框。切换会话或卸载时只写存储。
-    if (pending.sessionId !== active.current || JSON.stringify(saved.nodes) === JSON.stringify(normalize(pending.nodes))) return;
-    show(saved.nodes);
-    if (saved.merged) toast("另一页面修改了草稿，已合并", "warning");
+    if (pending) saveDraft(localStorage, pending.sessionId, ownTab(), pending.nodes);
   };
   /** 读取输入框内容并安排保存。byUser：由用户编辑引起，此时清空输入框即移除归属不明提示。 */
   const refresh = (byUser = true) => {
@@ -117,7 +117,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   /** 同步替换输入框内容；之后异步核对图片是否仍在服务端，只给已过期的图片节点加标记，不覆盖期间的编辑。 */
   const setNodes = (nodes: DraftNode[]) => {
     const el = editor.current; if (!el) return;
-    el.innerHTML = nodesHtml(nodes);
+    el.innerHTML = editorHtml(normalize(nodes));
     refresh(false);
     const ids = imageIds(nodes);
     if (!ids.length) return;
@@ -127,7 +127,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     }, () => { /* 无法核对时按存在处理，发送时由服务端校验。 */ });
   };
 
-  /** 显示与存储一致的内容，不安排保存。焦点在输入框中时光标移到末尾。 */
+  /** 显示与本页草稿存储一致的内容，不安排保存。焦点在输入框中时光标移到末尾。 */
   const show = (nodes: DraftNode[]) => {
     const el = editor.current; if (!el) return;
     const focused = document.activeElement === el;
@@ -141,17 +141,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   useLayoutEffect(() => {
     const el = editor.current!;
     let alive = true; let timer: ReturnType<typeof setTimeout> | undefined;
-    active.current = sessionId;
-    /**
-     * 读出草稿存储中的内容，不写回：刚读出的内容与存储一致。另一标签页可能随后放回草稿或编辑并写入同一个键，
-     * 延迟写回会用旧内容覆盖它。焦点在输入框中时光标移到末尾。
-     */
-    const reload = () => {
-      const draft = readDraft(localStorage, sessionId);
-      version.current = draft.version;
-      show(draft.nodes);
-    };
-    reload();
+    show(loadDraft(localStorage, sessionId, ownTab()));
     const detach = attachComposer(sessionId, {
       // 取回的草稿放在现有草稿之前，并立即保存，之后才删除待放回记录。
       deliver: (drafts, message) => {
@@ -171,17 +161,26 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     const recover = () => {
       void recoverFlights(localStorage, sessionId).then((wait) => { if (alive && wait !== null) timer = setTimeout(recover, wait + 50); });
     };
-    take(); recover();
-    // 其他标签页存入的待放回草稿、对该会话草稿的修改，以及对提示的修改。
+    // 收养本会话中已关闭标签页的草稿：放在本页现有内容之前，先写入本页的键，之后才删除原键。
+    const adopt = () => {
+      void adoptDrafts(localStorage, sessionId, ownTab(), (nodes, legacy) => {
+        if (!alive || !el.isConnected) return undefined;
+        const merged = prependDrafts([nodes], readNodes(el));
+        show(merged);
+        if (!legacy) toast("已关闭的标签页中这个会话的草稿已放入输入框");
+        return saveDraft(localStorage, sessionId, ownTab(), merged);
+      }, navigator.locks ?? null, tabAlive);
+    };
+    take(); recover(); adopt();
+    const onVisible = () => { if (document.visibilityState === "visible") adopt(); };
+    document.addEventListener("visibilitychange", onVisible);
+    // 其他标签页存入的待放回草稿，以及对提示的修改。另一标签页的草稿保存在它自己的键中，本页不读取、不同步。
     const onStorage = (event: StorageEvent) => {
       if (event.key?.startsWith(batchPrefix(sessionId)) && event.newValue) take();
-      // 另一标签页保存了该会话的草稿（编辑、放回或提交时清空）：本页没有未保存的编辑时重新读取并显示，不写回；
-      // 有未保存的编辑时不动，保存时发现版本已变，与存储中的内容合并。
-      if (event.key === draftKey(sessionId) && !pendingSave.current) reload();
       if (event.key === noticeKey(sessionId)) noticeChanged.set((n) => n + 1);
     };
     addEventListener("storage", onStorage);
-    return () => { alive = false; active.current = null; clearTimeout(timer); removeEventListener("storage", onStorage); detach(); flush(); };
+    return () => { alive = false; clearTimeout(timer); removeEventListener("storage", onStorage); document.removeEventListener("visibilitychange", onVisible); detach(); flush(); };
   }, [sessionId]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;

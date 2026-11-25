@@ -3,8 +3,9 @@
 // 未挂载时每批存成一条独立的待放回记录，输入框挂载时取走。
 // localStorage 写入失败（如超出配额）时记录暂存在内存，只保留到页面关闭前，由输入框显示错误提示。
 // 纯逻辑，Storage 和 Web Locks 由调用方传入，可在 Node.js 中测试。
-import { isEmpty, mergeDrafts, normalize } from "./draft.ts";
+import { isEmpty, normalize } from "./draft.ts";
 import { Store } from "./store.ts";
+import { TAB_ID, tabLock } from "./tab.ts";
 import type { DraftNode } from "./types.ts";
 
 /** uncertain：无法确认是否已经发送的草稿。 */
@@ -24,7 +25,6 @@ type Locks = Pick<LockManager, "request">;
  * 一个会话的前缀不会是另一个会话键的前缀（例如 a 与 a.b）。
  */
 export const encodeId = (sessionId: string) => sessionId.replace(/[^A-Za-z0-9_-]/g, (c) => "%" + c.charCodeAt(0).toString(16).padStart(4, "0"));
-export const draftKey = (sessionId: string) => `pi-pane.draft.${sessionId}`;
 export const noticeKey = (sessionId: string) => `pi-pane.notice.${sessionId}`;
 export const batchPrefix = (sessionId: string) => `pi-pane.restored.${encodeId(sessionId)}.`;
 export const flightPrefix = (sessionId: string) => `pi-pane.inflight.${encodeId(sessionId)}.`;
@@ -84,41 +84,77 @@ function nextAt(storage: Storage, prefix: string): number {
 const suffix = (at: number) => `${at}-${Math.random().toString(36).slice(2, 10)}`;
 
 /**
- * 草稿存储的版本：存储中的原始值，null 表示没有草稿。每个页面记住自己最后读到或写入的版本，
- * 写入前比较：存储中的值与基准不同，说明另一页面写过，写入前先合并（commitDraft）。
+ * 输入框草稿按标签页分键：pi-pane.draft.<编码后的会话 id>.<tabId>（tab.ts），只由该标签页写入，保存就是直接写入，不比较、不合并。
+ * 已关闭标签页的草稿由打开同一会话的其他标签页收养（adoptDrafts）。旧版没有 tabId 的共用键 pi-pane.draft.<会话 id> 当作没有主人的键收养。
  */
-export type DraftVersion = string | null;
-const parseNodes = (raw: DraftVersion): DraftNode[] => { try { const nodes = JSON.parse(raw ?? "null"); return Array.isArray(nodes) ? normalize(nodes) : []; } catch { return []; } };
+export const draftPrefix = (sessionId: string) => `pi-pane.draft.${encodeId(sessionId)}.`;
+export const draftKey = (sessionId: string, tabId: string) => draftPrefix(sessionId) + tabId;
+export const legacyDraftKey = (sessionId: string) => `pi-pane.draft.${sessionId}`;
+/** 收养旧版共用键时在标签页之间串行用的锁。 */
+export const legacyLock = (sessionId: string) => `pi-pane.adopt.${encodeId(sessionId)}`;
+const parseNodes = (raw: string | null): DraftNode[] => { try { const nodes = JSON.parse(raw ?? "null"); return Array.isArray(nodes) ? normalize(nodes) : []; } catch { return []; } };
 
-export function loadDraft(storage: Storage, sessionId: string): DraftNode[] {
-  return readDraft(storage, sessionId).nodes;
+export function loadDraft(storage: Storage, sessionId: string, tabId: string): DraftNode[] {
+  return parseNodes(read(storage, draftKey(sessionId, tabId)));
 }
-/** 读出草稿和它的版本。 */
-export function readDraft(storage: Storage, sessionId: string): { nodes: DraftNode[]; version: DraftVersion } {
-  const version = read(storage, draftKey(sessionId));
-  return { nodes: parseNodes(version), version };
+/** 保存本标签页的输入框草稿，空草稿删除记录。返回是否已写入 localStorage；写入成功时删除此前收养、因写入失败留下的原键。 */
+export function saveDraft(storage: Storage, sessionId: string, tabId: string, nodes: DraftNode[]): boolean {
+  const saved = persist(storage, sessionId, draftKey(sessionId, tabId), isEmpty(nodes) ? null : JSON.stringify(normalize(nodes)));
+  if (saved) releaseAdopted(storage, sessionId);
+  return saved;
 }
-/** 保存输入框草稿，空草稿删除记录，不比较版本。返回是否已写入 localStorage。 */
-export function saveDraft(storage: Storage, sessionId: string, nodes: DraftNode[]): boolean {
-  return persist(storage, sessionId, draftKey(sessionId), encodeDraft(nodes));
-}
-const encodeDraft = (nodes: DraftNode[]): DraftVersion => isEmpty(nodes) ? null : JSON.stringify(normalize(nodes));
 
 /**
- * 比较后写入：存储中的版本仍是 base 时写入 nodes；否则另一页面写过，把存储中的内容与 nodes 按 mergeDrafts 合并后写入，
- * 不覆盖另一页面的内容。返回写入后的内容和版本；merged 表示结果同时包含了两个页面的修改，调用方应更新输入框并提示用户。
+ * 已收养、但本页写入失败而保留的原键：键 → 所属会话与收养时读到的值。再次扫描时跳过同一内容，
+ * 本页之后写入该会话的草稿成功时，原键的值仍未变就删除。
  */
-export function commitDraft(storage: Storage, sessionId: string, nodes: DraftNode[], base: DraftVersion): { nodes: DraftNode[]; version: DraftVersion; merged: boolean } {
-  const key = draftKey(sessionId); const current = read(storage, key);
-  let result = normalize(nodes); let merged = false;
-  if (current !== base) {
-    const stored = parseNodes(current);
-    result = mergeDrafts(parseNodes(base), result, stored);
-    merged = encodeDraft(result) !== encodeDraft(normalize(nodes)) && encodeDraft(result) !== current;
+const adopted = new Map<string, { sessionId: string; value: string }>();
+function releaseAdopted(storage: Storage, sessionId: string): void {
+  for (const [key, entry] of adopted) {
+    if (entry.sessionId !== sessionId) continue;
+    adopted.delete(key);
+    try { if (storage.getItem(key) === entry.value) storage.removeItem(key); } catch { /* 下次收养时重试。 */ }
   }
-  const version = encodeDraft(result);
-  if (version !== current) persist(storage, sessionId, key, version);
-  return { nodes: result, version, merged };
+}
+
+/**
+ * 把收养的草稿接进本页输入框：收养的内容在前、本页原有内容在后，用空行分隔，并立即写入本页的键。
+ * 返回是否已写入 localStorage；undefined 表示输入框已不属于该会话（切换了会话或已卸载），不收养。
+ * legacy：来自旧版共用键。
+ */
+export type Absorb = (nodes: DraftNode[], legacy: boolean) => boolean | undefined;
+
+/**
+ * 收养本会话中已关闭标签页的草稿，在打开会话和页面回到前台时调用。
+ * 有 Web Locks 时，对每个其他 tabId 的键试取 pi-pane.tab.<tabId>（不等待）：取不到说明那个标签页还开着，跳过；
+ * 取得说明它已关闭，在锁内重新读取（可能已被其他标签页收养），先由 absorb 写入本页的键，成功后才删除原键；写入失败时保留原键。
+ * 旧版共用键用 legacyLock 串行，直接收养。没有 Web Locks 时以 alive 判断（tab.ts 的存活记录），不加锁：
+ * 两个标签页可能同时收养同一份草稿，结果是重复而不是丢失。
+ */
+export async function adoptDrafts(storage: Storage, sessionId: string, tabId: string, absorb: Absorb, locks: Locks | null = defaultLocks(), alive: (tabId: string) => boolean = () => true): Promise<void> {
+  const prefix = draftPrefix(sessionId);
+  const found: { key: string; owner: string | null }[] = [];
+  for (let i = 0; i < storage.length; i++) {
+    const key = storage.key(i); const owner = key?.startsWith(prefix) ? key.slice(prefix.length) : null;
+    if (key && owner && owner !== tabId && TAB_ID.test(owner)) found.push({ key, owner });
+  }
+  if (storage.getItem(legacyDraftKey(sessionId)) !== null) found.push({ key: legacyDraftKey(sessionId), owner: null });
+  for (const { key, owner } of found) {
+    const take = () => {
+      const value = storage.getItem(key);
+      if (value === null || adopted.get(key)?.value === value) return;
+      const nodes = parseNodes(value);
+      if (!isEmpty(nodes)) {
+        const saved = absorb(nodes, owner === null);
+        if (saved === undefined) return;
+        if (!saved) { adopted.set(key, { sessionId, value }); return; }
+      }
+      adopted.delete(key);
+      try { storage.removeItem(key); } catch { /* 下次收养时重试。 */ }
+    };
+    if (locks) await locks.request(owner ? tabLock(owner) : legacyLock(sessionId), { ifAvailable: true }, (lock) => { if (lock) take(); });
+    else if (!owner || !alive(owner)) take();
+  }
 }
 
 export function loadNotice(storage: Storage, sessionId: string): Notice | null {

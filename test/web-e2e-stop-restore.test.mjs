@@ -8,7 +8,7 @@ import { png } from "../experiments/p0/b-bridge/images.mjs";
 import { prependDrafts } from "../packages/web/src/lib/draft.ts";
 import { providerPath, until } from "./fixtures/helpers.mjs";
 import { startWebServer } from "./fixtures/browser.mjs";
-import { setup, byId, newSession, idle, sessionView, records, replyScript, sessionItem, observePage } from "./fixtures/web-e2e.mjs";
+import { setup, byId, newSession, idle, sessionView, records, replyScript, sessionItem, observePage, draftKey } from "./fixtures/web-e2e.mjs";
 
 const webUi = fileURLToPath(new URL("./fixtures/web-ui.ts", import.meta.url));
 const serverOptions = () => ({ extraExtensions: [providerPath, webUi] });
@@ -129,7 +129,7 @@ test("取回草稿 Chrome 停止后确定与归属不明的草稿都放回输入
   await byId(page, "composer").locator(".chip[data-asset-id]").waitFor();
   const want = expected(draft, text("现有草稿"));
   assert.deepEqual(await draftNodes(page), want, "清出的草稿按原顺序放在现有草稿之前，归属不明的排在确定的之后");
-  assert.deepEqual(await stored(page, `pi-pane.draft.${a.ref.id}`), want, "放回后立即写入该会话的草稿");
+  assert.deepEqual(await stored(page, await draftKey(page, a.ref.id)), want, "放回后立即写入该会话的草稿");
   assert.deepEqual(await pending(page, a.ref.id), []);
   await settled(page);
   assert.equal(await byId(page, "choice-dialog").count(), 0, "放回草稿不经确认框");
@@ -160,7 +160,7 @@ test("取回草稿 Chrome 停止后确定与归属不明的草稿都放回输入
 
   // 明确放弃：用户在输入框中删除，与其他编辑相同；之后切换会话不会再出现。
   await byId(page, "composer").fill("");
-  await page.waitForFunction(key => localStorage.getItem(key) === null, `pi-pane.draft.${a.ref.id}`);
+  await page.waitForFunction(key => localStorage.getItem(key) === null, await draftKey(page, a.ref.id));
   await noticeShown(page, false);
   assert.equal(await stored(page, `pi-pane.notice.${a.ref.id}`), null, "清空输入框后移除提示");
   await choose(page, b);
@@ -219,7 +219,7 @@ for (const kind of ["stop", "close"]) {
       await byId(page, "composer").locator(".chip[data-asset-id]").waitFor();
       const want = expected(draft);
       assert.deepEqual(await draftNodes(page), want);
-      assert.deepEqual(await stored(page, `pi-pane.draft.${a.ref.id}`), want);
+      assert.deepEqual(await stored(page, await draftKey(page, a.ref.id)), want);
       assert.deepEqual(await pending(page, a.ref.id), [], "放回后删除待放回记录");
       await noticeShown(page);
       assert.equal(await byId(page, "choice-dialog").count(), 0);
@@ -298,7 +298,7 @@ test("R9-3 取回草稿 Chrome 有排队消息时在输入框执行 /quit，关�
   const want = expected(draft);
   assert.deepEqual(await draftNodes(page), want, "已执行的 /quit 不得留在输入框");
   assert.doesNotMatch(await byId(page, "composer").innerText(), /\/quit/);
-  await page.waitForFunction(({ key, value }) => localStorage.getItem(key) === value, { key: `pi-pane.draft.${a.ref.id}`, value: JSON.stringify(want) });
+  await page.waitForFunction(({ key, value }) => localStorage.getItem(key) === value, { key: await draftKey(page, a.ref.id), value: JSON.stringify(want) });
   await noticeShown(page);
 });
 
@@ -340,7 +340,7 @@ test("R9-1 取回草稿 Chrome 浏览器存储写入失败时草稿留在内存�
   await byId(page, "unsaved-notice").waitFor();
   assert.match(await byId(page, "unsaved-notice").textContent(), /只保存到页面关闭前/);
   await noticeShown(page);
-  assert.equal(await stored(page, `pi-pane.draft.${a.ref.id}`), null);
+  assert.equal(await stored(page, await draftKey(page, a.ref.id)), null);
   // 切换会话后草稿仍在内存中。
   await choose(page, b);
   assert.equal(await byId(page, "unsaved-notice").count(), 0);
@@ -388,7 +388,7 @@ for (const [back, newline] of [[false, false], [true, false], [true, true]]) {
       assert.equal(inFlight.length, 1, "提交内容存为在途提交");
       assert.match(inFlight[0].map(node => node.text).join(""), newline ? /^\/quit\n+$/ : /^\/quit$/);
       await choose(page, b);
-      assert.equal(await stored(page, `pi-pane.draft.${a.ref.id}`), null, "原会话的草稿存储同步清空");
+      assert.equal(await stored(page, await draftKey(page, a.ref.id)), null, "原会话的草稿存储同步清空");
       if (back) {
         await choose(page, a);
         assert.equal(await editor.innerText(), "", "响应前切回，输入框为空");
@@ -399,7 +399,7 @@ for (const [back, newline] of [[false, false], [true, false], [true, true]]) {
     const want = expected(draft);
     assert.deepEqual(await flights(page, a.ref.id), [], "送达后丢弃在途提交");
     if (!back) {
-      assert.equal(await stored(page, `pi-pane.draft.${a.ref.id}`), null);
+      assert.equal(await stored(page, await draftKey(page, a.ref.id)), null);
       assert.deepEqual(await pending(page, a.ref.id), [batch(draft)]);
       assert.equal(await byId(page, "composer").innerText(), "", "B 的输入框不受影响");
       await choose(page, a);
@@ -407,7 +407,7 @@ for (const [back, newline] of [[false, false], [true, false], [true, true]]) {
     await byId(page, "composer").locator(".chip[data-asset-id]").waitFor();
     await settled(page);
     assert.deepEqual(await draftNodes(page), want, "已执行的 /quit 不得留在输入框");
-    await page.waitForFunction(({ key, value }) => localStorage.getItem(key) === value, { key: `pi-pane.draft.${a.ref.id}`, value: JSON.stringify(want) });
+    await page.waitForFunction(({ key, value }) => localStorage.getItem(key) === value, { key: await draftKey(page, a.ref.id), value: JSON.stringify(want) });
     await noticeShown(page);
     await choose(page, b);
     await choose(page, a);
@@ -440,8 +440,8 @@ test("提交即清空 Chrome 消息送达前重新输入同样的文字，迟到
     deliver.release(); await (await delivered).finished(); await settled(page);
   } finally { deliver.release(); await page.unrouteAll({ behavior: "wait" }); }
   assert.equal(await byId(page, "composer").innerText(), "同样的文字", "新起草的同文草稿保留");
-  await page.waitForFunction(key => localStorage.getItem(key) !== null, `pi-pane.draft.${a.ref.id}`);
-  assert.deepEqual(await stored(page, `pi-pane.draft.${a.ref.id}`), text("同样的文字"));
+  await page.waitForFunction(key => localStorage.getItem(key) !== null, await draftKey(page, a.ref.id));
+  assert.deepEqual(await stored(page, await draftKey(page, a.ref.id)), text("同样的文字"));
   assert.deepEqual(await flights(page, a.ref.id), []);
   await noticeShown(page, false);
 });
@@ -526,5 +526,5 @@ test("提交即清空 Chrome 提交后、结果返回前刷新页面，内容回
   await page.waitForFunction(() => document.querySelector('[data-testid="composer"]')?.innerText === "刷新前的在途消息", null, { timeout: 10_000 });
   await noticeShown(page);
   assert.deepEqual(await flights(page, a.ref.id), []);
-  assert.deepEqual(await stored(page, `pi-pane.draft.${a.ref.id}`), text("刷新前的在途消息"));
+  assert.deepEqual(await stored(page, await draftKey(page, a.ref.id)), text("刷新前的在途消息"));
 });
