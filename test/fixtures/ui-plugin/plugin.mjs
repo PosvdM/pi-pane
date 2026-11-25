@@ -24,10 +24,12 @@ export default function createPlugin() {
     hasChildren: false, sortKey: id, revision, capabilities: ["open", "subscribe"], ...extra });
   const push = (change) => { changes.push(change); for (const emit of treeListeners) emit(structuredClone(change)); };
   const upsert = (value) => { const n = { ...value, revision: ++revision }; nodes.set(n.id, n); push({ type: "upsert", revision: n.revision, node: structuredClone(n) }); return n; };
-  const session = (id) => { let s = sessions.get(id); if (!s) { s = { entries: [], seq: 0, status: "idle", readonly: false, listeners: new Set() }; sessions.set(id, s); } return s; };
+  const session = (id) => { let s = sessions.get(id); if (!s) { s = { entries: [], seq: 0, log: [], status: "idle", readonly: false, listeners: new Set() }; sessions.set(id, s); } return s; };
   const emitSession = (id, event) => {
     const s = session(id); s.seq++;
-    for (const emit of s.listeners) emit({ ref: { source: "uitest", id }, cursor: { epoch: STREAM, seq: s.seq }, event: structuredClone(event) });
+    const record = { ref: { source: "uitest", id }, cursor: { epoch: STREAM, seq: s.seq }, event: structuredClone(event) };
+    s.log.push(record);
+    for (const emit of s.listeners) emit(structuredClone(record));
   };
 
   // 初始树：根分组下一个运行中的会话，另有两个冷历史节点。
@@ -138,8 +140,10 @@ export default function createPlugin() {
       },
       async history() { return { entries: [], historyBefore: null }; },
       subscribe(ref, after, emit) {
+        // 按游标重放之后的事件；游标不属于本流或超前时要求重取快照。
         const s = session(ref.id);
-        if (after.epoch !== STREAM || after.seq !== s.seq) emit({ ref, cursor: { epoch: STREAM, seq: s.seq + 1 }, event: { type: "resync" } });
+        if (after.epoch !== STREAM || after.seq > s.seq) emit({ ref, cursor: { epoch: STREAM, seq: s.seq + 1 }, event: { type: "resync" } });
+        else for (const record of s.log) if (record.cursor.seq > after.seq) emit(structuredClone(record));
         s.listeners.add(emit); return () => s.listeners.delete(emit);
       },
       async send(ref, input, req) {

@@ -114,7 +114,7 @@ function refresh(o: Opened): Promise<void> {
       o.again = false;
       let snapshot: SessionSnapshot;
       try { snapshot = await api<SessionSnapshot>(sessionPath(ref, "snapshot")); }
-      catch (error) { if (isCurrent(o) && o.open) retry(o, error); return; }
+      catch (error) { o.again = false; if (isCurrent(o) && o.open) retry(o, error); return; }
       if (!isCurrent(o) || !o.open) return;
       pluginView.set((v) => v && { ...v, model: fromSnapshot(toView(snapshot)), partials: snapshot.unfinishedPartials ?? [], loading: false, error: undefined });
       o.retries = 0;
@@ -122,7 +122,11 @@ function refresh(o: Opened): Promise<void> {
     if (!o.live) return;
     if (o.unsubscribe) ws.resubscribe(ref);
     else o.unsubscribe = ws.subscribe(ref, () => pluginView.get()?.model?.view.cursor ?? { epoch: "", seq: 0 }, (record) => onEvent(o, record));
-  })().finally(() => { o.reloading = null; });
+  })().finally(() => {
+    // 循环结束到这里之间（含订阅阶段）到达的重取请求只设了标记，在这里补取。
+    o.reloading = null;
+    if (o.again && isCurrent(o) && o.open) void refresh(o);
+  });
   o.reloading = run;
   return run;
 }

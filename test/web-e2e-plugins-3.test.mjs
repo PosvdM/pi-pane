@@ -26,16 +26,17 @@ test("节点点击打开适用的面板；只改树节点能力也开放输入�
   await node(page, "uitest2:resource:doc").click();
   await byId(page, "node-panel").filter({ hasText: "资源文档内容" }).waitFor();
 
-  // 插件只通过树节点去掉、再加回 send 能力，会话流没有 pane_status：输入框随之消失、出现。
+  // pane_status 的 detail 显示在底部状态栏。快照不带 detail，所以在会话内容加载完、没有重取快照时发出。
   await node(page, "uitest:session:a").click();
+  await page.getByText("开始任务甲").waitFor();
+  plugin().emit("a", { type: "pane_status", status: "running", phase: "idle", detail: "正在整理结果" });
+  await byId(page, "plugin-statusbar").filter({ hasText: "正在整理结果" }).waitFor();
+  // 插件只通过树节点去掉、再加回 send 能力，会话流没有 pane_status：输入框随之消失、出现。
   await byId(page, "plugin-editor").waitFor();
   plugin().setSend("uitest:session:a", "a", false);
   await byId(page, "plugin-readonly").waitFor();
   plugin().setSend("uitest:session:a", "a", true);
   await byId(page, "plugin-editor").waitFor();
-  // pane_status 的 detail 显示在底部状态栏。
-  plugin().emit("a", { type: "pane_status", status: "running", phase: "idle", detail: "正在整理结果" });
-  await byId(page, "plugin-statusbar").filter({ hasText: "正在整理结果" }).waitFor();
   // composer 提示不带具体插件的语义（如“不中断当前运行”）。
   await node(page, "uitest:session:d").click();
   await page.locator(".composer-hint").filter({ hasText: "提交给 测试插件" }).waitFor();
