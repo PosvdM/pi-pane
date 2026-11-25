@@ -1,6 +1,6 @@
 // 侧栏：待处理区、主会话与插件节点合并的会话树、侧栏面板（architecture.md“会话列表”，plugin-api.md“会话树”“持久表单”“面板”）。
 // 列表由服务端推送的会话树驱动：主会话树（source = "pane"）的变更经 WebSocket 推来，不依赖当前会话的事件。
-import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { sidebarOpen } from "../lib/actions.ts";
 import { openNode, openNodeById } from "../lib/navigate.ts";
 import { closePluginView, pluginView } from "../lib/plugin-session.ts";
@@ -262,11 +262,9 @@ export function Sidebar() {
   const [menu, setMenu] = useState<Menu | null>(null);
   const [adding, setAdding] = useState(false);
   const activeId = view ? view.nodeId : state?.id ? "pane:session:" + state.id : null;
-  const pending = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const form of formMap.values()) if (form.nodeId) map.set(form.nodeId, (map.get(form.nodeId) ?? 0) + 1);
-    return map;
-  }, [formMap, formMap.size]);
+  // 表单 Map 原地修改，每次渲染重新统计。
+  const pending = new Map<string, number>();
+  for (const form of formMap.values()) if (form.nodeId) pending.set(form.nodeId, (pending.get(form.nodeId) ?? 0) + 1);
   const ctx: Ctx = { activeId, pending, allTrees, setMenu };
   const pane = allTrees.get("pane");
   const projects = pane ? pane.children(null).filter((n) => n.id.startsWith("pane:project:")).sort((a, b) => {
