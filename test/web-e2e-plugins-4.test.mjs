@@ -14,6 +14,7 @@ test("普通发送处理中可查询、查到被拒时放回文字；处理中�
   const s = await setup(t, say, { serverOptions: () => ({ plugins: [pluginDir] }) }); if (!s) return;
   const { page } = s;
   s.allowedErrors.push(/Failed to load resource: net::ERR_FAILED/); // 下面模拟发送请求断网。
+  s.allowedErrors.push(/Failed to load resource: net::ERR_INTERNET_DISCONNECTED/); // 下面断网时可能有请求在途（如 /new 之后的列表刷新）。
 
   // 普通发送（sessions.send）返回处理中：输入框清空，留下“查询结果”；同一个键查到被拒时文字放回。
   await node(page, "uitest:session:a").click();
