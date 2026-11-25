@@ -10,6 +10,7 @@ import { duration, PaneError } from "../errors.js";
 export interface PluginState {
   locator: string;
   source?: string;
+  displayName?: string;            // 插件声明的显示名称；无效时省略，界面显示 source
   state: "active" | "failed" | "disabled";
   error?: string;
   paneProtocol?: number;
@@ -217,6 +218,9 @@ export class PluginRuntime {
         const plugin = instance as PanePlugin;
         if (!validSource(plugin.id)) throw new Error("插件 id 无效或属于保留名称");
         entry.view.source = plugin.id;
+        const name = plugin.displayName;
+        if (typeof name === "string" && name.trim().length >= 1 && name.length <= 64) entry.view.displayName = name.trim();
+        else if (name !== undefined) this.report("warn", `插件 ${plugin.id} 的 displayName 无效，界面改为显示 id`);
         this.sources.set(entry.view.locator, plugin.id);
         if (this.owners.has(this.key(plugin.id))) throw new Error(`插件 id 重复：${plugin.id}`);
         this.owners.set(this.key(plugin.id), entry);

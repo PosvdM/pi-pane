@@ -179,8 +179,22 @@ export class PluginHost {
       assert(plugin.tree, "unsupportedCapability", "插件不提供会话树", 404);
       const value = await plugin.tree.snapshot(request);
       assert(value.source === source && typeof value.epoch === "string" && Number.isSafeInteger(value.revision) && value.revision >= 0, "invalidPluginResult", "插件树快照无效", 502);
-      return { ...value, nodes: this.nodes(source, value.nodes, plugin) };
+      const { foreignChildCounts, ...rest } = value;
+      const counts = this.foreignCounts(source, foreignChildCounts);
+      return { ...rest, nodes: this.nodes(source, value.nodes, plugin), ...(counts ? { foreignChildCounts: counts } : {}) };
     });
+  }
+  /** 只保留指向其他来源节点、数目为非负安全整数的项；字段整体无效时忽略并记录警告，不使快照失败。 */
+  private foreignCounts(source: string, value: unknown): Record<string, number> | undefined {
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== "object" || Array.isArray(value)) { console.warn(`插件 ${source} 的 foreignChildCounts 无效，已忽略`); return undefined; }
+    const result: Record<string, number> = {}; let dropped = 0;
+    for (const [parentId, count] of Object.entries(value).slice(0, 10000)) {
+      if (parentId.startsWith(source + ":") || !/^[^:]+:/.test(parentId) || !Number.isSafeInteger(count) || (count as number) < 0) { dropped++; continue; }
+      result[parentId] = count as number;
+    }
+    if (dropped) console.warn(`插件 ${source} 的 foreignChildCounts 有 ${dropped} 项无效，已忽略`);
+    return result;
   }
   async treeChildren(source: string, parentId: string, page: { epoch: string; cursor?: string; limit: number }): Promise<TreeChildrenPage> {
     assert(typeof parentId === "string" && typeof page.epoch === "string" && Number.isSafeInteger(page.limit) && page.limit > 0 && page.limit <= 200, "invalidTreeRequest", "树分页请求无效");

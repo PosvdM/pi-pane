@@ -43,6 +43,7 @@ pi-pane 是否把每个插件放进独立的 worker 线程隔离，**待定**（
 // 草案，P0 后冻结
 export interface PanePlugin {
   id: string;                         // 即 TreeNode.source，如 "agora"；须符合“插件的加载”中的小写目录名规则
+  displayName?: string;               // 界面中显示的插件名称，1–64 个字符；省略时显示 id
   paneProtocol: [number, number];
   activate(ctx: PaneHostContext): Promise<void>;
   deactivate?(): Promise<void>;
@@ -81,6 +82,7 @@ export default function createPlugin(): PanePlugin;
 ```
 
 - `subscribe` 返回的函数用于取消订阅；浏览器全部断开后 pi-pane 会取消订阅。
+- `displayName` 显示在待处理区的分组标题、横幅、面板、通知和会话视图的来源标签上；不是字符串或长度不在 1–64 个字符之间时，pi-pane 忽略它并记录警告，改为显示 `id`。
 - 各方法的类型见下文对应章节。
 
 ## pi-pane 提供给插件的上下文
@@ -297,6 +299,7 @@ export interface TreeNode {
 - `tree.snapshot(req)` 只返回“热节点”及其全部祖先。热节点是：`req.openNodeIds` 中的节点（浏览器里打开着的）、`status` 为 `running`、`waiting`、`paused` 的节点、`lastActivityAt` 晚于 `req.recentSince` 的节点。
 - 其余节点按需加载：用户展开某个节点时，pi-pane 调 `tree.children(parentId, page)` 分页取子节点。
 - 每个父节点下，已加载的子节点正常显示，没有加载的折叠为一行“历史（N）”（N 取自父节点的 `childCount`，未知时不显示数字），展开后分页加载。
+- 插件不能为其他来源的节点填写 `childCount` 和 `hasChildren`（例如 pi-pane 的主会话节点），因此在快照的 `foreignChildCounts` 中报告：键为其他来源的父节点 id，值为该插件挂在它下面的子节点总数，没有子节点的父节点不列出。pi-pane 把各来源的数目相加，决定主会话是否显示展开箭头和“历史（N）”，展开时对报告了数目的来源调用 `tree.children(parentId, page)`。数目以最近一次快照为准，订阅推来的新节点照常显示，总数在下一次快照（含 `reset` 之后的快照）时更新。不提供该字段的插件，其挂在其他来源节点下的冷节点只能在变为热节点后显示。
 
 ```ts
 // pane 协议 v1，草案，P0 后冻结
@@ -310,6 +313,7 @@ export interface TreeSnapshot {
   epoch: string;               // 修订号序列的标识；插件重建修订号序列时更换
   revision: number;            // 快照对应的来源级修订号
   nodes: TreeNode[];
+  foreignChildCounts?: Record<string, number>;  // 挂在其他来源节点下的子节点总数，键为父节点 id
 }
 
 export interface TreeCursor {
@@ -753,6 +757,7 @@ export type FormRemovedReason = "handled" | "cancelled" | "expired" | "withdrawn
 - **待处理区**：侧栏只有一个“待处理”区，列出所有插件的持久表单，按插件分组，标题带总数角标。插件不另做“待处理”面板。
 - **排序**：组内按 `(createdAt 升序, id 升序)` 排列，这是一个稳定的全序。`forms.pending()` 按同一顺序返回；待处理区不按到达顺序排列，`formAdded` 推来的新表单按 `createdAt`、`id` 插入对应位置，同一 `id` 的更新保持原位置。
 - **新增和更新**：插件调用 `ctx.formAdded(form)`；同一 `id` 的更高 `revision` 替换旧版本，较低或相同的 `revision` 忽略，正在填写的用户看到“表单已更新”提示。
+- **节点上的标记**：表单的 `nodeId` 指向会话树中已显示的节点时，pi-pane 在该节点上显示待处理事项数，打开该节点的会话视图时在顶部列出这些事项和“处理”入口。标记由 pi-pane 根据待处理区的内容推导，插件不需要另外提供。
 - **对齐**：pi-pane 在启动、收到该插件的树 `reset`、每次浏览器连接或重连时调用 `forms.pending()`，以它的结果为准重建该插件的列表：结果里没有的表单移除，`revision` 更高的替换。插件在后台重连后应发树 `reset`，宿主据此对齐表单；没有浏览器订阅时，列表在下次浏览器连接时对齐。同一插件的并发对齐合并为一次查询，某个插件的异常不阻塞其他插件或主会话。对齐期间收到的 `formAdded`/`formRemoved` 在对齐完成后按 `revision` 规则再应用一遍。
 - **关闭显示（dismiss）**：弹窗右上角的“稍后处理”只关闭弹窗，表单留在待处理区，不通知插件，也不是提交结果。
 - **取消（cancel）**：表单带 `cancel` 时显示该按钮，点击后提交 `{ status: "cancelled" }`，这是一个业务结果（如拒绝请求），插件不得当作同意。
