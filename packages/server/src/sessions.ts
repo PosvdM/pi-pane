@@ -52,6 +52,8 @@ export class Sessions {
   private recovering = true; private closing = false; readonly reports: StopReport[] = [];
   private starts = new Map<AbortController, Promise<void>>(); private closePromise?: Promise<void>;
   private handles = new Map<DriverHandle, Promise<void>>(); private cleanupErrors: unknown[] = [];
+  /** 浏览器停止时 clear_queue 结果未知、已按整个队列镜像保存草稿的写者：其停止流程再次清出的内容不另存记录，见 stop。 */
+  private queueSaved = new WeakSet<DriverHandle>();
   private readonly closeTimeoutMs: number;
   readonly recoveryDiagnostics: string[] = [];
   constructor(readonly assets: AssetStore, readonly store: PiStore, readonly trust: TrustDecisions, private readonly broker: BridgeBroker, private readonly options: SessionManagerOptions,
@@ -62,7 +64,7 @@ export class Sessions {
     const waits = [options.stopOptions?.abortTimeoutMs ?? 10000, options.stopOptions?.graceMs ?? 5000, options.stopOptions?.termGraceMs ?? 3000];
     assert(waits.every(ms => Number.isFinite(ms) && ms >= 0), "invalidConfig", "停止宽限必须为非负有限毫秒");
     // 与固定 hostkit 的 StopOptions 默认值一致；clear_queue 2 秒，保存清出的草稿 2 秒（CLEARED_SAVE_TIMEOUT_MS），身份核查及清理另留 5 秒。
-    this.closeTimeoutMs = duration(Math.ceil(waits.reduce((sum, ms) => sum + ms, 7000 + CLEARED_SAVE_TIMEOUT_MS)), 25000);
+    this.closeTimeoutMs = duration(Math.ceil(waits.reduce((sum, ms) => sum + ms, 7000 + CLEARED_SAVE_TIMEOUT_MS)), 27000);
     this.ledger = new RequestLedger(Date.now, duration(options.rpcTimeoutMs, 30000));
     this.driver = new RpcSubprocessDriver(broker, { ...options, onTrust: (cwd) => trust.request(cwd) });
     this.timer = setInterval(() => { void this.reclaim().catch(() => {}); }, 10000); this.timer.unref();
@@ -383,10 +385,10 @@ export class Sessions {
           else { attached.handle = source; this.mainChanged(); }
         },
         onRecord: (event) => { if (attached.owner === owner && !attached.closed) this.receive(attached, event); },
-        // 写者停止（服务端关停、bridge 故障、关闭会话后的兜底等）时清出的草稿：保存后由浏览器打开该会话时取回。
+        // 写者停止（服务端关停、bridge 故障、关闭会话后的兜底等）时清出的草稿：保存为服务端记录，由用户在待取回条中领取。
         beforeClearQueue: () => {
           const session = attached;
-          if (session.owner !== owner) return undefined;
+          if (session.owner !== owner || handle && this.queueSaved.has(handle)) return undefined;
           const id = session.id; const capture = this.captureQueue(session); const reason = this.closing ? "shutdown" : "exit";
           return async (cleared) => { await this.saveCleared(session, id, { id: randomUUID(), reason }, this.resolveCleared(capture, cleared)); };
         },
@@ -547,26 +549,30 @@ export class Sessions {
     return { texts, drafts, uncertain: uncertain.map((claim) => claim.draft), keys: [...keys, ...grouped].filter((key): key is string => !!key) };
   }
   /**
-   * 清出的草稿先保存到服务端（draft-outbox.ts），浏览器确认取回后删除；之后的 abort、进程退出或服务端关停都不会让它丢失。
-   * 保存失败不改变停止结果：草稿仍随结果返回，失败记入诊断。最多等待 CLEARED_SAVE_TIMEOUT_MS，文件 I/O 挂起时不拖住停止，
-   * 保存在后台继续。
+   * 清出的草稿先保存到服务端（draft-outbox.ts），由浏览器领取；之后的 abort、进程退出或服务端关停都不会让它丢失。
+   * 返回是否已保存。保存失败不改变停止结果：草稿仍随结果返回，失败记入诊断。最多等待 CLEARED_SAVE_TIMEOUT_MS，
+   * 文件 I/O 挂起时不拖住停止，保存在后台继续。
    */
-  private async saveCleared(session: HostedSession, sessionId: string, record: { id: string; reason: SavedDraftsReason }, cleared: ClearedDrafts): Promise<void> {
+  private async saveCleared(session: HostedSession, sessionId: string, record: { id: string; reason: SavedDraftsReason }, cleared: ClearedDrafts): Promise<boolean> {
     const drafts: SavedDraft[] = [...cleared.drafts.map((nodes) => ({ nodes, uncertain: false })), ...cleared.uncertain.map((nodes) => ({ nodes, uncertain: true }))];
-    if (!drafts.length) return;
+    if (!drafts.length) return false;
     const report = (message: string, error?: unknown) => {
       console.error(message, error ?? "");
       session.model.emit({ type: "pane_diagnostic", message: error === undefined ? message : `${message}${String(error)}` });
     };
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const saving = this.outbox.save(sessionId, { ...record, drafts }).then(() => true, (error) => { report("清出的草稿未能保存到服务端：", error); return true; });
-    const done = await Promise.race([saving, new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), CLEARED_SAVE_TIMEOUT_MS); })]);
+    const saving = this.outbox.save(sessionId, { ...record, drafts }).then(() => "saved" as const, (error) => { report("清出的草稿未能保存到服务端：", error); return "failed" as const; });
+    const outcome = await Promise.race([saving, new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), CLEARED_SAVE_TIMEOUT_MS); })]);
     clearTimeout(timer);
-    if (!done) report("清出的草稿保存超时，停止继续进行，保存在后台完成");
+    if (outcome === "timeout") report("清出的草稿保存超时，停止继续进行，保存在后台完成");
+    return outcome === "saved";
   }
-  /** 浏览器取回服务端保存的清出草稿；不要求会话已登记，服务端重启后也能按会话 id 读取。 */
+  /** 该会话未领取的清出草稿；不要求会话已登记，服务端重启后也能按会话 id 读取。 */
   savedDrafts(sessionId: string): Promise<SavedDrafts[]> { return this.inflight.run("drafts.list", () => this.outbox.list(sessionId)); }
-  removeSavedDrafts(sessionId: string, ids: string[]): Promise<void> { return this.inflight.run("drafts.remove", () => this.outbox.remove(sessionId, ids)); }
+  /** 领取一条记录（DraftOutbox.claim），同时刷新其中图片的使用时间。已被领取或不存在时为 undefined。 */
+  claimSavedDrafts(sessionId: string, id: string): Promise<SavedDrafts | undefined> {
+    return this.inflight.run("drafts.claim", () => this.outbox.claim(sessionId, id, (assetIds) => { this.assets.touch(assetIds); }));
+  }
   private async stop(session: HostedSession, close: boolean, preempted = false, record: { id: string; reason: SavedDraftsReason } = { id: randomUUID(), reason: "exit" }): Promise<any> {
     if (!session.handle) return { status: "nothingToStop" };
     // 进程内切换会原地改写 session.id（rebind），草稿按发起停止时的会话保存。
@@ -580,10 +586,13 @@ export class Sessions {
     const result = this.resolveCleared(capture, cleared);
     if (!session.handle || session.handle === handle) {
       for (const key of result.keys) session.drafts.delete(key);
-      // 结果未知时整个队列已作为归属不明的草稿交出；清空镜像，写者停止流程不再按同一镜像保存第二份。
+      // 结果未知时整个队列已作为归属不明的草稿交出；清空镜像。
       if (queueFailed) session.queued = emptyMirror();
     }
-    await this.saveCleared(session, sessionId, record, result);
+    // 结果未知时写者停止流程会再发一次 clear_queue。此时镜像已清空，再次清出的文字无法对应回原草稿（含图草稿只剩编码标记），
+    // 而且这些草稿已在本条记录中，因此不再另存一份。
+    if (queueFailed) this.queueSaved.add(handle);
+    const saved = await this.saveCleared(session, sessionId, record, result);
     try {
       if (queueFailed || close) await handle.stop();
       else {
@@ -597,7 +606,7 @@ export class Sessions {
       }
     } catch { await handle.stop(); }
     if (!session.handle || session.handle === handle) session.queued = emptyMirror();
-    return { status: "done", clearedText: result.texts, clearedDrafts: result.drafts, ...(result.uncertain.length ? { uncertainDrafts: result.uncertain } : {}) };
+    return { status: "done", clearedText: result.texts, clearedDrafts: result.drafts, ...(result.uncertain.length ? { uncertainDrafts: result.uncertain } : {}), ...(saved ? { draftsRecord: record.id } : {}) };
   }
   private reclaim(): Promise<void> { return this.inflight.run("sessions.reclaim", () => this.performReclaim()); }
   private async performReclaim(): Promise<void> {

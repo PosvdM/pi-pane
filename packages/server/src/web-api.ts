@@ -110,8 +110,11 @@ export interface PaneControlRequest {
 /** 控制命令的结果。HTTP 等待到期为 pending，用同一 requestId 重新提交查询当前状态。 */
 export type PaneControlResult =
   | { status: "accepted"; snapshot: PaneSessionView; result?: PaneCommandOutcome }
-  // uncertainDrafts：扩展改写或追加队列导致归属不明、可能已经发送的原草稿；浏览器放在 clearedDrafts 之后放回输入框并提示用户检查。
-  | { status: "done"; clearedText: string[]; clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }
+  // uncertainDrafts：归属不明、可能已经发送的原草稿，来自扩展改写或追加队列，或 clear_queue 结果未知时按队列镜像取回的全部草稿；
+  // 浏览器放在 clearedDrafts 之后放回输入框并提示用户检查。
+  // draftsRecord：清出的草稿已保存为该会话的服务端记录（id 为请求的 requestId），浏览器领取后放回，不直接使用 clearedDrafts；
+  // 没有草稿或保存失败时省略，浏览器直接放回结果中的草稿。
+  | { status: "done"; clearedText: string[]; clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][]; draftsRecord?: string }
   | { status: "nothingToStop" }
   | { status: "pending" };
 /** 输入类命令的处理方式与其他命令的附加结果。 */
@@ -122,8 +125,8 @@ export interface PaneCommandOutcome {
 }
 
 /**
- * 服务端保存的清出草稿（GET /api/sessions/:id/drafts）。停止、关闭或服务端关停时从 pi 队列清出、尚未确认交到浏览器的草稿，
- * 浏览器放回输入框后用 POST /api/sessions/:id/drafts 的 {requestId, remove: id[]} 删除。
+ * 服务端保存的清出草稿（GET /api/sessions/:id/drafts）：停止、关闭、服务端关停或写者停止时从 pi 队列清出、尚未被领取的草稿。
+ * 浏览器用 POST /api/sessions/:id/drafts/:recordId/claim 的 {requestId} 领取，领取原子地删除记录并返回内容。
  * reason 为 stop、close 时 id 是发起请求的 requestId；shutdown 为服务端关停，exit 为写者因其他原因停止。
  */
 export interface PaneSavedDrafts {
@@ -133,6 +136,8 @@ export interface PaneSavedDrafts {
   drafts: { nodes: DraftNode[]; uncertain: boolean }[];
 }
 export interface PaneSavedDraftsList { records: PaneSavedDrafts[] }
+/** 领取的结果：claimed 时记录已删除、内容交给本次请求；gone 表示记录已被领取、已过期或不存在。 */
+export type PaneClaimResult = { status: "claimed"; record: PaneSavedDrafts } | { status: "gone" };
 
 /** 错误响应体；HTTP 状态码见 architecture.md。 */
 export interface PaneErrorBody { error: string; message: string; instanceId: string }
@@ -168,4 +173,6 @@ export type PaneServerMessage =
   | { type: "ui_resolved"; ref: SessionRef; id: string; reason: "answered" | "cancelled" | "expired" | "closed" }
   | { type: "project_trust"; request: PaneTrustRequest }
   | { type: "project_trust_resolved"; id: string }
+  // 已订阅会话的清出草稿记录有增删，浏览器重新读取 GET /api/sessions/:id/drafts。
+  | { type: "drafts_changed"; ref: SessionRef }
   | { type: "pong" };

@@ -13,7 +13,7 @@ import { AssetStore, MAX_IMAGE_BYTES } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { assert, PaneError } from "./errors.js";
 import { Sessions, type SessionManagerOptions } from "./sessions.js";
-import type { PaneSavedDraftsList } from "./web-api.js";
+import type { PaneClaimResult, PaneSavedDraftsList } from "./web-api.js";
 import { PiStore } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
@@ -185,12 +185,17 @@ export class PaneServer {
         if (req.method === "POST" && operation === "control") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.command(id, body)); return; }
         if (req.method === "POST" && operation === "query") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.query(id, body.type)); return; }
         if (req.method === "GET" && operation === "drafts") { sendJson(res, 200, { records: await this.sessions.savedDrafts(id) } satisfies PaneSavedDraftsList); return; }
-        if (req.method === "POST" && operation === "drafts") {
-          const body = await jsonBody(req); this.assertAccepting();
-          assert(Array.isArray(body.remove) && body.remove.length <= 256 && body.remove.every((item: unknown) => typeof item === "string" && item.length >= 1 && item.length <= 256), "invalidDraftIds", "要删除的草稿记录标识无效");
-          sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); await this.sessions.removeSavedDrafts(id, body.remove); return { status: "done" }; })); return;
-        }
         if (req.method === "POST" && operation === "ui") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); return this.sessions.respondUi(id, body); })); return; }
+      }
+      const claim = pathname.match(/^\/api\/sessions\/([^/]+)\/drafts\/([^/]+)\/claim$/);
+      if (req.method === "POST" && claim) {
+        const id = decodeURIComponent(claim[1]); const recordId = decodeURIComponent(claim[2]);
+        const body = await jsonBody(req); this.assertAccepting();
+        // 领取会删除记录：响应丢失时浏览器用同一 requestId 重试，由幂等记录返回同一份内容。
+        sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async (): Promise<PaneClaimResult> => {
+          this.assertAccepting(); const record = await this.sessions.claimSavedDrafts(id, recordId);
+          return record ? { status: "claimed", record } : { status: "gone" };
+        })); return;
       }
       if (req.method === "POST" && pathname === "/api/assets") {
         const parts = await upload(req); this.assertAccepting(); const id = req.headers["x-request-id"];
@@ -264,7 +269,12 @@ export class PaneServer {
           const emit = (event: any) => this.push(client, { type: "session", ...event });
           const ref = { source: message.ref.source, id: message.ref.id };
           // 重新订阅时，待回答的询问只补发给本连接，不广播给已订阅的其他标签页。
-          if (ref.source === "pane") client.subscriptions.set(key, this.sessions.subscribe(ref.id, message.after as StreamCursor, emit, (request) => this.push(client, { type: "ui_request", ref, request })));
+          if (ref.source === "pane") {
+            const off = this.sessions.subscribe(ref.id, message.after as StreamCursor, emit, (request) => this.push(client, { type: "ui_request", ref, request }));
+            // 该会话的清出草稿记录增删时通知，浏览器重新读取待取回列表。
+            const offDrafts = this.sessions.outbox.onChange((sessionId) => { if (sessionId === ref.id) this.push(client, { type: "drafts_changed", ref }); });
+            client.subscriptions.set(key, () => { offDrafts(); off(); });
+          }
           else this.pluginSubscription(client, ref.source, key, () => this.plugins.subscribe(message.ref, message.after, emit));
         } else if (message.type === "unsubscribe") { const key = subscriptionKey("session", message.ref?.source, message.ref?.id); client.subscriptions.get(key)?.(); client.subscriptions.delete(key); }
         else if (message.type === "treeSubscribe") {
