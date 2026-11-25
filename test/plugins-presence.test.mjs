@@ -107,6 +107,9 @@ test('proof 结构、算法和设备必须匹配连接，签名内容保持不�
     { proof: { ...proof('device-a'), publicKey: 'other-key' } },
     { proof: proof('device-a'), error: 'rejected' }, { error: 'arbitrary' },
   ]) broker.respond('a', id, response);
+  // 设备不符的回应不结束确认：浏览器收到“确认未生效”，并再次收到同一确认，可以重新确认。
+  assert.ok(a.some(message => message.type === 'notification' && message.notification.title === '确认未生效'));
+  assert.deepEqual(a.at(-1), a[0]);
   const valid = proof('device-a');
   broker.respond('a', id, { proof: valid });
   valid.signature = 'mutated';
