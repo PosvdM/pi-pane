@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { fromSnapshot, apply, prependHistory } from "../packages/web/src/lib/session-model.ts";
 import { normalize, plainText, prependDrafts, displayQueued, parseSlash, isEmpty, imageIds } from "../packages/web/src/lib/draft.ts";
 import { canonicalize, JcsError } from "../packages/web/src/lib/jcs.ts";
-import { SourceTree, isHot, childrenAcross, hiddenChildren, unassigned } from "../packages/web/src/lib/tree-state.ts";
+import { SourceTree, TreePins, MAX_OPEN_NODE_IDS, isHot, childrenAcross, hiddenChildren, unassigned } from "../packages/web/src/lib/tree-state.ts";
 import { addNotificationTo, clampSidebar, restoreText, sortBanners, splitActions, visibleBanners } from "../packages/web/src/lib/plugin-state.ts";
 import { SessionModel } from "../packages/server/dist/model.js";
 import { NUMBER_VECTORS, hexToDouble, SAMPLE_INPUT, SAMPLE_OUTPUT, SORT_INPUT, SORT_EXPECTED_OUTPUT } from "./fixtures/jcs-vectors.mjs";
@@ -255,6 +255,37 @@ test("跨来源的子节点与历史数：各来源分别扣除自己的节点�
   // 同一来源的父节点按 childCount（随推送更新）扣除全部已加载子节点。
   const own = forest([["x", { nodes: [treeNode("x", "x:root", null, { kind: "group", hasChildren: true, childCount: 2 }), treeNode("x", "x:c1", "x:root")] }]]);
   assert.equal(hiddenChildren(own, own.get("x").nodes.get("x:root")).count, 1);
+});
+
+test("跨来源的同级节点统一按 sortKey 排序，相同时按 id", () => {
+  const trees = forest([
+    ["pane", { nodes: [treeNode("pane", "pane:project:p", null, { kind: "group" }), treeNode("pane", "pane:session:1", "pane:project:p", { sortKey: "5" })] }],
+    ["a", { nodes: [treeNode("a", "a:x", "pane:project:p", { sortKey: "9" }), treeNode("a", "a:y", "pane:project:p", { sortKey: "1" })] }],
+    ["b", { nodes: [treeNode("b", "b:z", "pane:project:p", { sortKey: "5" })] }],
+  ]);
+  assert.deepEqual(childrenAcross(trees, "pane:project:p").map((n) => n.id), ["a:y", "b:z", "pane:session:1", "a:x"]);
+});
+
+test("快照的打开列表：最近打开的节点有上限；补取的父节点给不出时不再请求，不再被引用时移除，合计不超过服务端上限", () => {
+  const pins = new TreePins(3, 4);
+  for (const id of ["o1", "o2", "o3", "o1", "o4"]) pins.open(id);
+  assert.deepEqual([...pins.opened], ["o3", "o1", "o4"], "按最近使用保留");
+  assert.equal(pins.wantParent("p1"), true); assert.equal(pins.wantParent("p1"), false, "已在请求中");
+  assert.equal(pins.wantParent("p2"), true);
+  // 快照只给出 p1：p2 移入 notFound，不再请求。
+  pins.loaded(pins.request(), (id) => id === "p1");
+  assert.deepEqual([...pins.parents], ["p1"]); assert.equal(pins.wantParent("p2"), false);
+  // 不再被引用的父节点（含 notFound）移除；来源 reset 后给不出的可以再请求一次。
+  pins.prune(new Set(["p2"]));
+  assert.deepEqual([...pins.parents], []); assert.deepEqual([...pins.notFound], ["p2"]);
+  pins.retryMissing(); assert.equal(pins.wantParent("p2"), true);
+  // 达到上限后不再加入。
+  for (const id of ["p3", "p4", "p5"]) pins.wantParent(id);
+  assert.equal(pins.wantParent("p6"), false); assert.equal(pins.parents.size, 4);
+  // 默认上限下请求永远不超过服务端的 1000 个。
+  const big = new TreePins();
+  for (let i = 0; i < 1500; i++) { big.open("o" + i); big.wantParent("p" + i); }
+  assert.ok(big.request().length <= MAX_OPEN_NODE_IDS);
 });
 
 test("“未归属”：父节点所在来源已加载却没有它、来源不存在、指向未归属分组或形成循环", () => {

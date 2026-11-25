@@ -16,7 +16,7 @@ export default function createPlugin() {
   const operations = new Map();    // 幂等键 → { digest, result | promise }
   const handled = new Map();       // formId → revision
   const forms = new Map();
-  const calls = { invoke: [], submit: [], send: [], abort: 0, resolveForm: 0 };
+  const calls = { invoke: [], submit: [], send: [], abort: 0, resolveForm: 0, presence: [] };
   let slowRelease;
   let noteRelease;
 
@@ -85,6 +85,8 @@ export default function createPlugin() {
     releaseSlow() { slowRelease?.(); },
     /** 下一次取快照失败的次数（模拟后台离线）。 */
     failSnapshots: 0,
+    /** 普通发送（sessions.send）的结果：ok 受理并回显；pending 已受理仍在处理，之后由 finishPending 给出最终结果。 */
+    sendMode: "ok",
     /** 输入框动作 uitest.note 的结果：ok、reject、pending、slow（超过动作超时）、hold（等 releaseNote）、needsInput。 */
     composerMode: "ok",
     releaseNote() { noteRelease?.(); },
@@ -142,7 +144,10 @@ export default function createPlugin() {
       },
       async send(ref, input, req) {
         calls.send.push({ ref, input, key: req.idempotencyKey });
-        return respond(req.idempotencyKey, JSON.stringify([ref, input]), async () => { control.append(ref.id, "收到：" + input.text); return { status: "accepted" }; });
+        return respond(req.idempotencyKey, JSON.stringify([ref, input]), async () => {
+          if (control.sendMode === "pending") return { status: "pending" };
+          control.append(ref.id, "收到：" + input.text); return { status: "accepted" };
+        });
       },
       async abort(ref) {
         calls.abort++; const s = session(ref.id); s.status = "stopped";
@@ -227,7 +232,8 @@ export default function createPlugin() {
           if (form.pending) return { status: "pending", message: "等待处理" };
           if (form.presence) {
             try {
-              await ctx.userPresence.confirm({ title: "确认答复", summary: "答复 **" + form.title + "**", payload: { formId: form.id, outcome: req.outcome }, origin, timeoutMs: form.presence });
+              const proof = await ctx.userPresence.confirm({ title: "确认答复", summary: "答复 **" + form.title + "**", payload: { formId: form.id, outcome: req.outcome }, origin, timeoutMs: form.presence });
+              calls.presence.push({ formId: form.id, deviceId: proof.deviceId });
             } catch (error) {
               handled.delete(req.formId);
               return { status: "failed", message: "确认失败：" + (error?.code ?? error?.message) };
