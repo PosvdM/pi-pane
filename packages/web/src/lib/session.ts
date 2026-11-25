@@ -3,6 +3,7 @@ import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
 import { deliverRestored } from "./restored.ts";
 import { closePluginView } from "./plugin-session.ts";
+import { awaitSaved, claimSaved, recordDrafts } from "./saved-drafts.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
@@ -217,12 +218,16 @@ export function outcomeUnknown(error: ApiError): boolean {
   return ["network", "invalidResponse", "rpcResultUnknown", "unknown", "navigated"].includes(cause.code) || cause.status >= 500;
 }
 
-/** 发送一条控制命令。等待到期返回 pending 时，用同一 requestId 和同一内容重复提交，直到得到最终结果。 */
-export async function control(command: PaneControlCommand, draft?: DraftNode[]): Promise<ControlOutcome> {
+/**
+ * 发送一条控制命令。等待到期返回 pending 时，用同一 requestId 和同一内容重复提交，直到得到最终结果。
+ * onBody 在第一次提交之前收到完整请求体。
+ */
+export async function control(command: PaneControlCommand, draft?: DraftNode[], onBody?: (body: { requestId: string }) => void): Promise<ControlOutcome> {
   const state = current.get(); const model = state?.model;
   if (!state || !model) return { ok: false, error: new ApiError(0, "noSession", "没有打开的会话") };
   const id = state.id; const mine = nav;
   const body = { requestId: newId(), expectedEpoch: model.view.cursor.epoch, expectedRevision: model.view.controlRevision ?? 0, command, ...(draft ? { draft } : {}) };
+  onBody?.(body);
   const switching = ["new_session", "fork", "clone"].includes(command.type) || (!model.view.hosted && ["prompt", "steer", "follow_up"].includes(command.type));
   if (switching) { followUntil = Number.MAX_SAFE_INTEGER; followNav = mine; }
   const giveUp = Date.now() + NETWORK_RETRY_MS; let warned = false; let delay = 500;
@@ -275,26 +280,47 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[]):
 /** 停止：clear_queue + abort，清出的消息回到输入框。 */
 export async function stopRun(): Promise<void> {
   const state = current.get(); if (!state?.model) return;
-  const outcome = await control({ type: "stop" });
+  const outcome = await clearing(state.id, { type: "stop" });
   if (!outcome.ok) {
     if (outcome.error.code === "revisionChanged") {
       const phase = current.get()?.model?.view.inFlight?.phase;
       toast(phase === "idle" ? "这次运行已经结束" : phase === "stopping" ? "正在停止" : "会话状态已变化，请再次确认是否停止", "warning");
     } else toast(outcome.error.message, "error");
-    return;
   }
-  if (outcome.result.status === "done") restoreCleared(state.id, outcome.result);
 }
 
 /**
- * 把清出的排队消息放回发起请求时所在会话的输入框：确定的草稿在前，归属不明、可能已发送的草稿在后，由输入框提示用户检查。
- * 不弹确认框，也不看当前导航：用户已切换到其他会话时存入原会话的待放回记录。
+ * 发送停止或关闭，得到结果后把清出的排队消息放回发起请求时所在会话的输入框（restoreCleared）。
+ * 等待结果期间，这次请求对应的服务端记录不在本页的待取回条中显示。
  */
-function restoreCleared(sessionId: string, result: { clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }): void {
-  deliverRestored(localStorage, sessionId, [
+async function clearing(sessionId: string, command: Extract<PaneControlCommand, { type: "stop" | "close" }>): Promise<ControlOutcome> {
+  let release = () => {}; const owner = nav;
+  try {
+    const outcome = await control(command, undefined, (body) => { release = awaitSaved(body.requestId); });
+    if (outcome.ok && outcome.result.status === "done") await restoreCleared(sessionId, command.type, outcome.result, () => nav === owner);
+    return outcome;
+  } finally { release(); }
+}
+
+/**
+ * 把清出的排队消息放回原会话的输入框：确定的草稿在前，归属不明、可能已发送的草稿在后，由输入框提示用户检查。
+ * 不弹确认框，也不看当前导航：用户已切换到其他会话时存入原会话的待放回记录。
+ * 结果带 draftsRecord 时草稿已保存为服务端记录，按该 id 领取，领到才放回：其他页面可能已在待取回条中领走。
+ * 没有 draftsRecord（没有草稿或服务端保存失败）时直接放回结果中的草稿。
+ * 领取结果未知时，这一条以结果中的草稿显示在待取回条中，标“领取结果未知”，由用户重试。
+ * 提示只在用户仍停留在发起时的会话（here）时显示，迟到的结果不在其他会话中提示。
+ */
+async function restoreCleared(sessionId: string, reason: "stop" | "close", result: Extract<PaneControlResult, { status: "done" }>, here: () => boolean): Promise<void> {
+  const drafts = [
     ...result.clearedDrafts.map((nodes) => ({ nodes, uncertain: false })),
     ...(result.uncertainDrafts ?? []).map((nodes) => ({ nodes, uncertain: true })),
-  ]);
+  ];
+  if (!result.draftsRecord) { deliverRestored(localStorage, sessionId, drafts); return; }
+  let record;
+  try { record = await claimSaved(sessionId, result.draftsRecord, {}, { record: { id: result.draftsRecord, reason, at: new Date().toISOString(), drafts } }); }
+  catch { if (here()) toast("排队中的消息没能放回输入框，请在输入框上方的待取回列表中查看", "warning"); return; }
+  if (record) deliverRestored(localStorage, sessionId, recordDrafts(record));
+  else if (here()) toast("排队中的消息已在其他页面放回或放弃", "warning");
 }
 
 export async function restart(): Promise<void> {
@@ -313,15 +339,14 @@ export async function restart(): Promise<void> {
 export async function closeSession(): Promise<"ok" | "failed" | "unknown"> {
   const state = current.get(); if (!state?.model) return "failed";
   const owner = nav;
-  let outcome = await control({ type: "close" });
+  let outcome = await clearing(state.id, { type: "close" });
   if (!outcome.ok && outcome.error.code === "holdsConfirmation") {
     const holds = current.get()?.model?.view.holds.map((h) => `· ${h.reason}（${h.source}）`).join("\n") ?? "";
     const answer = await ask("关闭会话", `会话仍被保活：\n${holds}\n仍要关闭吗？`, [{ label: "取消", value: "cancel" }, { label: "关闭", value: "ok", danger: true }]);
     if (answer !== "ok" || nav !== owner) return "failed";
-    outcome = await control({ type: "close", confirmHolds: true });
+    outcome = await clearing(state.id, { type: "close", confirmHolds: true });
   }
   if (!outcome.ok) { toast(outcome.error.code === "revisionChanged" ? "会话状态已变化，请确认后重新关闭" : outcome.error.message, "error"); return outcomeUnknown(outcome.error) ? "unknown" : "failed"; }
-  if (outcome.result.status === "done") restoreCleared(state.id, outcome.result);
   toast("会话已关闭");
   if (current.get()?.id === state.id) void reload();
   return "ok";

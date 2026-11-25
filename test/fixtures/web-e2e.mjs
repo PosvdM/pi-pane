@@ -3,10 +3,17 @@ import { readFile } from "node:fs/promises";
 import { requireChrome, launch, openPaired, startWebServer, assertNoPageErrors, screenshot } from "./browser.mjs";
 import { piFixture, until } from "./helpers.mjs";
 import { snapshot } from "./client.mjs";
+import { draftKey as restoredDraftKey } from "../../packages/web/src/lib/restored.ts";
 
 export const replyScript = text => ({ fallback: { segments: [{ type: "text", text }] } });
 export const slowReply = (text, delayMs = 60) => ({ segments: [{ type: "text", chunks: [...text].map(text => ({ text, delayMs })) }] });
 export const byId = (page, id) => page.locator(`[data-testid="${id}"]`);
+/** 页面所在标签页的输入框草稿键（按标签页分键，见 packages/web/src/lib/restored.ts 的 draftKey）。 */
+export async function draftKey(page, sessionId) {
+  const tabId = await page.evaluate(() => sessionStorage.getItem("pi-pane.tab"));
+  if (!tabId) throw new Error("页面还没有确定标签页标识");
+  return restoredDraftKey(sessionId, tabId);
+}
 
 export async function records(file) {
   // 日志按行追加，每行以换行结尾；末尾没有换行的是对方尚未写完的行，留到下次读取。

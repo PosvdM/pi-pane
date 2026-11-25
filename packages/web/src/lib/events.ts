@@ -1,8 +1,9 @@
-// 会话事件之外的 WebSocket 消息：扩展 UI 请求与项目信任询问。
+// 会话事件之外的 WebSocket 消息：扩展 UI 请求、项目信任询问与服务端清出草稿记录的变更。
 import { editorText } from "./session.ts";
 import { emptyUi, extensionUi, toast, trustRequests, type DialogRequest } from "./ui-state.ts";
 import * as ws from "./ws.ts";
 import { api } from "./api.ts";
+import { refreshSaved } from "./saved-drafts.ts";
 import type { PaneTrustRequest } from "./types.ts";
 
 let editorSeq = 0;
@@ -52,6 +53,8 @@ export function installEventHandlers(): void {
     } else if (message.type === "project_trust_resolved") {
       trustVersion++;
       trustRequests.set((list) => list.filter((r) => r.id !== message.id));
+    } else if (message.type === "drafts_changed") {
+      void refreshSaved(message.ref.id);
     } else if (message.type === "banners") {
       // 重连后补取连接断开期间发出的信任询问。
       syncTrust();

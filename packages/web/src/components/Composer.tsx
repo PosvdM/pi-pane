@@ -6,13 +6,15 @@ import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
 import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions } from "../lib/restored.ts";
+import { ADOPT_SETTLE_MS, addNotice, adoptDrafts, attachComposer, batchPrefix, beginSubmit, clearNotice, draftPrefix, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions, watchOwner } from "../lib/restored.ts";
+import { ownTab, TAB_ID } from "../lib/tab.ts";
 import { closeSession, control, current, editorText, navigation, outcomeUnknown, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
 import { ask, overlay, toast } from "../lib/ui-state.ts";
 import type { DraftNode, PaneCommand, PaneControlCommand, PaneThinkingLevel } from "../lib/types.ts";
 import { downloadExport, sidebarOpen } from "../lib/actions.ts";
+import { SavedDrafts } from "./SavedDrafts.tsx";
 
 const DRAFT_MIME = "application/x-pi-pane-draft";
 
@@ -39,6 +41,14 @@ function chipHtml(assetId: string, expired = false): string {
 }
 function nodesHtml(nodes: DraftNode[], expired: Set<string> = new Set()): string {
   return nodes.map((n) => n.type === "image" ? chipHtml(n.assetId, expired.has(n.assetId)) : escapeHtml(n.text).replace(/\n/g, "<br>")).join("");
+}
+/**
+ * 整个输入框的 HTML，与 readNodes 互逆。contenteditable 末尾的 <br> 不占一行，Chrome 在末尾换行后另加一个占位 <br>，
+ * readNodes 读取时去掉它；这里同样在以换行结尾的内容后加上占位 <br>，否则末尾的换行写入后读不回来。
+ */
+export function editorHtml(nodes: DraftNode[]): string {
+  const last = nodes.at(-1);
+  return nodesHtml(nodes) + (last?.type === "text" && last.text.endsWith("\n") ? "<br>" : "");
 }
 
 /** 从 DOM 读出草稿节点。Chrome 可能把换行写成 <br> 或块元素，两种都按换行处理。 */
@@ -84,13 +94,13 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   const running = phase !== "idle" || view.status === "running";
   const blocked = view.readonlyReason === "externalWriter" ? "该会话正由其他程序托管，只能查看" : model.replaced ? "此会话的进程已切换到其他会话" : current.get()?.warning === "recentModification" ? "该会话可能正在别处运行，只能查看" : null;
 
-  // 待写入 localStorage 的草稿：编辑时立即捕获内容，延迟写入；切换会话或卸载时同步写入。
+  // 待写入 localStorage 的草稿：编辑时立即捕获内容，延迟写入；切换会话、卸载、页面隐藏（visibilitychange）和关闭或刷新（pagehide）时同步写入。
+  // 草稿存储按标签页分键，只由本页写入（architecture.md“取回草稿的交付”）。
   const pendingSave = useRef<{ sessionId: string; nodes: DraftNode[] } | null>(null);
   const flush = () => {
     clearTimeout(saveTimer.current);
     const pending = pendingSave.current; pendingSave.current = null;
-    if (!pending) return;
-    saveDraft(localStorage, pending.sessionId, pending.nodes);
+    if (pending) saveDraft(localStorage, pending.sessionId, ownTab(), pending.nodes);
   };
   /** 读取输入框内容并安排保存。byUser：由用户编辑引起，此时清空输入框即移除归属不明提示。 */
   const refresh = (byUser = true) => {
@@ -107,7 +117,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   /** 同步替换输入框内容；之后异步核对图片是否仍在服务端，只给已过期的图片节点加标记，不覆盖期间的编辑。 */
   const setNodes = (nodes: DraftNode[]) => {
     const el = editor.current; if (!el) return;
-    el.innerHTML = nodesHtml(nodes);
+    el.innerHTML = editorHtml(normalize(nodes));
     refresh(false);
     const ids = imageIds(nodes);
     if (!ids.length) return;
@@ -117,12 +127,21 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     }, () => { /* 无法核对时按存在处理，发送时由服务端校验。 */ });
   };
 
+  /** 显示与本页草稿存储一致的内容，不安排保存。焦点在输入框中时光标移到末尾。 */
+  const show = (nodes: DraftNode[]) => {
+    const el = editor.current; if (!el) return;
+    const focused = document.activeElement === el;
+    setNodes(nodes);
+    clearTimeout(saveTimer.current); pendingSave.current = null;
+    if (focused) { const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection()?.removeAllRanges(); getSelection()?.addRange(range); }
+  };
+
   // 切换会话时恢复该会话保存的草稿，再放回停止、关闭或提交失败时取回、尚未放回的草稿；离开时先写入尚未保存的编辑。
   // 用 layout effect 在浏览器绘制和用户输入之前完成恢复，避免覆盖挂载后立即输入的内容。
   useLayoutEffect(() => {
     const el = editor.current!;
     let alive = true; let timer: ReturnType<typeof setTimeout> | undefined;
-    setNodes(loadDraft(localStorage, sessionId));
+    show(loadDraft(localStorage, sessionId, ownTab()));
     const detach = attachComposer(sessionId, {
       // 取回的草稿放在现有草稿之前，并立即保存，之后才删除待放回记录。
       deliver: (drafts, message) => {
@@ -142,14 +161,45 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     const recover = () => {
       void recoverFlights(localStorage, sessionId).then((wait) => { if (alive && wait !== null) timer = setTimeout(recover, wait + 50); });
     };
-    take(); recover();
-    // 其他标签页存入的待放回草稿，以及其他标签页对提示的修改。
+    // 收养本会话中已关闭标签页的草稿：放在本页现有内容之前，先写入本页的键，之后才删除原键。
+    // 仍开着的标签页在它的锁上排队等待（watchOwner），它关闭后稍等再收养一次，前台页关闭、本页接替时也能及时收养。
+    const watching = new Set<string>(); const stop = new AbortController(); const settles = new Set<ReturnType<typeof setTimeout>>();
+    const watch = (owner: string) => {
+      if (!navigator.locks || watching.has(owner) || stop.signal.aborted) return;
+      watching.add(owner);
+      watchOwner(navigator.locks, owner, stop.signal, () => {
+        watching.delete(owner);
+        const settle = setTimeout(() => { settles.delete(settle); adopt(); }, ADOPT_SETTLE_MS); settles.add(settle);
+      });
+    };
+    const adopt = () => {
+      void adoptDrafts(localStorage, sessionId, ownTab(), (nodes, legacy) => {
+        if (!alive || !el.isConnected) return undefined;
+        const merged = prependDrafts([nodes], readNodes(el));
+        show(merged);
+        if (!legacy) toast("已关闭的标签页中这个会话的草稿已放入输入框");
+        return saveDraft(localStorage, sessionId, ownTab(), merged);
+      }).then((held) => { if (alive) held.forEach(watch); });
+    };
+    take(); recover(); adopt();
+    const onVisible = () => { if (document.visibilityState === "visible") adopt(); else flush(); };
+    document.addEventListener("visibilitychange", onVisible);
+    // 刷新、关闭或离开页面不触发卸载：立即写入防抖期间的编辑。
+    addEventListener("pagehide", flush);
+    // 其他标签页存入的待放回草稿、对提示的修改，以及其他标签页新写的草稿键（等它关闭后收养）。另一标签页的草稿本页不读取、不同步。
+    const prefix = draftPrefix(sessionId);
     const onStorage = (event: StorageEvent) => {
       if (event.key?.startsWith(batchPrefix(sessionId)) && event.newValue) take();
       if (event.key === noticeKey(sessionId)) noticeChanged.set((n) => n + 1);
+      const owner = event.key?.startsWith(prefix) ? event.key.slice(prefix.length) : "";
+      if (event.newValue && TAB_ID.test(owner) && owner !== ownTab()) watch(owner);
     };
     addEventListener("storage", onStorage);
-    return () => { alive = false; clearTimeout(timer); removeEventListener("storage", onStorage); detach(); flush(); };
+    return () => {
+      alive = false; clearTimeout(timer); stop.abort(); settles.forEach(clearTimeout);
+      removeEventListener("storage", onStorage); removeEventListener("pagehide", flush); document.removeEventListener("visibilitychange", onVisible);
+      detach(); flush();
+    };
   }, [sessionId]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;
@@ -410,6 +460,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
           ))}
         </div>
       )}
+      <SavedDrafts sessionId={sessionId} />
       {unsaved && <div class="composer-notice error" data-testid="unsaved-notice" role="alert">浏览器存储空间不足，这个会话的草稿只保存到页面关闭前。请先发送或复制草稿，或清理浏览器存储。</div>}
       {notice > 0 && (
         <div class="composer-notice warn" data-testid="restored-notice">

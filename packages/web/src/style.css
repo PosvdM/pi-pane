@@ -151,6 +151,9 @@ a { color: var(--accent); }
 .composer-notice span { flex: 1; }
 .composer-notice.warn { background: var(--warn-soft); color: var(--warn); }
 .composer-notice.error { background: var(--err-soft); color: var(--danger); }
+.saved-draft { background: var(--accent-soft); }
+.composer-notice .saved-draft-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
 .composer { border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
 .composer:focus-within { border-color: var(--accent); }
 .editor { min-height: 44px; max-height: 40vh; overflow-y: auto; padding: 10px 12px; outline: none; white-space: pre-wrap; word-break: break-word; counter-reset: image; }
