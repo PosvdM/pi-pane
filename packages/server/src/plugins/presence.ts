@@ -189,6 +189,7 @@ export class PresenceBroker {
     if (this.closed || !targets.length) return Promise.reject(failure("noDevice"));
     const { title, summary } = req;
     const id = randomUUID();
+    const expiresAt = new Date(Date.now() + Math.min(timeoutMs, 600_000)).toISOString();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.finish(id, { error: "timeout" }), Math.min(timeoutMs, 600_000));
       timer.unref();
@@ -202,7 +203,7 @@ export class PresenceBroker {
         recipients.add(connection);
         try {
           connection.send({ type: "presence", request: {
-            id, title, summary, payload: snapshot(payload), source,
+            id, title, summary, payload: snapshot(payload), source, expiresAt,
           } });
         } catch {
           recipients.delete(connection);

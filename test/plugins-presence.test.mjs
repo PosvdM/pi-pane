@@ -68,7 +68,8 @@ test('无 origin、伪造 origin、离线 origin 和重连前 origin 均回退�
     const pending = api.confirm(request({ origin }));
     const id = a.at(-1).request.id;
     assert.equal(b.at(-1).request.id, id);
-    assert.deepEqual(a.at(-1), { type: 'presence', request: { id, ...request(), source: 'plugin-a' } });
+    assert.ok(Number.isFinite(Date.parse(a.at(-1).request.expiresAt)), '确认帧带到期时间');
+    assert.deepEqual(a.at(-1), { type: 'presence', request: { id, ...request(), source: 'plugin-a', expiresAt: a.at(-1).request.expiresAt } });
     broker.respond('b', id, { proof: proof('device-b') });
     assert.deepEqual(await pending, proof('device-b'));
     assert.deepEqual(a.at(-1), { type: 'presenceClosed', id, reason: 'confirmed' });
