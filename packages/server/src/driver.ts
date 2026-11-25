@@ -26,7 +26,14 @@ export interface DriverCallbacks {
   onRecord(event: any): void;
   onReady(state: any, entries: any, reason: string, handle: DriverHandle): void;
   onExit(reason: string, report?: StopReport, error?: unknown): void;
+  /**
+   * 停止流程发送 clear_queue 之前同步调用。返回的函数接收 clear_queue 清出的文字（请求失败时为 undefined），
+   * 停止流程等它完成后才结束进程，用于在进程退出前保存清出的草稿。
+   */
+  beforeClearQueue?(): ((cleared: ClearedQueue | undefined) => Promise<void>) | undefined;
 }
+/** pi clear_queue 响应的 data：按队列顺序清出的文字。 */
+export interface ClearedQueue { steering?: string[]; followUp?: string[] }
 export interface SessionDriver { start(spec: DriverSpec, callbacks: DriverCallbacks, signal?: AbortSignal): Promise<DriverHandle> }
 export interface DriverHandle {
   readonly identity: ProcessIdentity; readonly ready: Promise<void>; readonly exited: Promise<void>; readonly sessionFile: string;
@@ -302,7 +309,13 @@ class RpcHandle implements DriverHandle {
     let report: StopReport | undefined; let failure: unknown;
     try {
       for (const lock of this.locks.values()) { try { await this.hostkit(() => lock.update({ state: "stopping" })); } catch (error) { failure ??= error; } }
-      try { await this.rpc({ type: "clear_queue" }, { timeoutMs: 2000 }); } catch { /* 管道已关闭时仍执行 hostkit 的停止和身份复查。 */ }
+      // 清出的文字交给会话层保存，不能随进程结束而丢失；保存失败由回调自行报告，不影响停止。
+      let settle: ((cleared: ClearedQueue | undefined) => Promise<void>) | undefined;
+      try { settle = this.callbacks.beforeClearQueue?.(); } catch { /* 回调不得阻止停止。 */ }
+      let cleared: ClearedQueue | undefined;
+      try { const response = await this.rpc({ type: "clear_queue" }, { timeoutMs: 2000 }); if (response.success) cleared = response.data as ClearedQueue; }
+      catch { /* 管道已关闭时仍执行 hostkit 的停止和身份复查。 */ }
+      if (settle) await settle(cleared).catch(() => {});
       report = await this.hostkit(() => this.proc.stop(this.options.stopOptions), true); await this.hostkit(() => verifyStopped(this.identity, report!));
       if (failure) throw failure;
       for (const lock of this.locks.values()) await this.release(lock); this.locks.clear();

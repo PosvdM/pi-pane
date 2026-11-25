@@ -115,6 +115,7 @@ test("关闭期间仅保留实例探测，其他 HTTP 入口统一返回 serverS
       ["POST", "/api/auth/pair"], ["POST", "/api/auth/logout"], ["POST", "/api/auth/code"], ["POST", "/api/ws-ticket"],
       ["GET", "/api/sessions"], ["GET", "/api/exports/AAAAAAAAAAAAAAAAAAAAAA"], ["GET", "/api/trust"], ["POST", "/api/trust/test"], ["POST", "/api/sessions/open"],
       ...["snapshot", "history", "control", "query", "ui"].map(operation => [operation === "snapshot" || operation === "history" ? "GET" : "POST", "/api/sessions/test/" + operation]),
+      ["GET", "/api/sessions/test/drafts"], ["POST", "/api/sessions/test/drafts"],
       ["POST", "/api/assets"], ["POST", "/api/assets/touch"], ["GET", "/api/assets/sha256-" + "a".repeat(64)],
       ["GET", "/api/assets/sha256-" + "a".repeat(64) + "/thumb"], ["GET", "/api/blobs/sha256-" + "a".repeat(64)],
       ["GET", "/api/blobs/sha256-" + "a".repeat(64) + "/thumb"], ["POST", "/bridge/launch"], ["POST", "/bridge/event"],

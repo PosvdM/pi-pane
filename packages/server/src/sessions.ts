@@ -12,7 +12,8 @@ import { terminalOnlyCommand } from "./pi-commands.js";
 import { AssetStore } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { ControlQueue, RequestLedger } from "./control.js";
-import { RpcSubprocessDriver, verifyStopped, type DriverHandle, type DriverOptions } from "./driver.js";
+import { RpcSubprocessDriver, verifyStopped, type ClearedQueue, type DriverHandle, type DriverOptions } from "./driver.js";
+import { DraftOutbox, type SavedDraft, type SavedDrafts, type SavedDraftsReason } from "./draft-outbox.js";
 import { assert, duration, PaneError } from "./errors.js";
 import { SessionModel } from "./model.js";
 import { fileKey, PiStore, readSession, type Entry } from "./store.js";
@@ -29,11 +30,16 @@ interface HostedSession {
   queued: QueueMirror; clients: number; lastActive: number;
   holds: Map<string, { source: string; reason: string }>; ui: Map<string, { request: PaneUiDialog; timer?: ReturnType<typeof setTimeout> }>; recentExternal: boolean; closed: boolean;
 }
+/** clear_queue 之前取的队列镜像与编码草稿记录副本。clear_queue 会先发出空的 queue_update，之后镜像和记录都已清空。 */
+interface QueueCapture { mirror: QueueMirror; encoded: Map<string, DraftNode[]> }
+/** 清出的文字及对应的原草稿；keys 为已取回、需要释放的编码草稿记录。 */
+interface ClearedDrafts { texts: string[]; drafts: DraftNode[][]; uncertain: DraftNode[][]; keys: string[] }
 const mutations = new Set(["prompt", "steer", "follow_up", "stop", "close", "restart", "set_model", "set_thinking_level", "compact", "new_session", "fork", "clone", "set_session_name", "export"]);
 export interface SessionManagerOptions extends DriverOptions { idleReclaimMs?: number }
 export class Sessions {
   readonly ledger: RequestLedger;
   readonly exports: ExportStore;
+  readonly outbox: DraftOutbox;
   private records = new Map<string, HostedSession>(); private files = new Map<string, HostedSession>();
   private driver: RpcSubprocessDriver; private timer: ReturnType<typeof setInterval>; private projects = new Set<string>();
   private state: Record<string, unknown> = {};
@@ -52,6 +58,7 @@ export class Sessions {
     private readonly emitUi: (sessionId: string, request: PaneUiRequest) => void,
     private readonly emitUiResolved: (sessionId: string, id: string, reason: Extract<PaneServerMessage, { type: "ui_resolved" }>["reason"]) => void = () => {}) {
     this.exports = new ExportStore(options.home);
+    this.outbox = new DraftOutbox(options.home);
     const waits = [options.stopOptions?.abortTimeoutMs ?? 10000, options.stopOptions?.graceMs ?? 5000, options.stopOptions?.termGraceMs ?? 3000];
     assert(waits.every(ms => Number.isFinite(ms) && ms >= 0), "invalidConfig", "停止宽限必须为非负有限毫秒");
     // 与固定 hostkit 的 StopOptions 默认值一致；clear_queue 2 秒，身份核查及清理另留 5 秒。
@@ -231,9 +238,9 @@ export class Sessions {
       if (command.type === "close") {
         assert(!session.holds.size || command.confirmHolds === true, "holdsConfirmation", "会话仍有保活原因，请确认关闭", 409);
         const preempted = session.control.preempt();
-        const result = await this.stop(session, true, preempted); session.holds.clear(); this.mainChanged(); return result;
+        const result = await this.stop(session, true, preempted, { id: request.requestId, reason: "close" }); session.holds.clear(); this.mainChanged(); return result;
       }
-      if (command.type === "stop") return this.stop(session, false, session.control.preempt());
+      if (command.type === "stop") return this.stop(session, false, session.control.preempt(), { id: request.requestId, reason: "stop" });
       assert(model.inFlight.phase !== "stopping", "stopping", "正在停止，请稍后重试", 409);
       signal.throwIfAborted();
       let encoded: ReturnType<AssetStore["encode"]> | undefined;
@@ -376,6 +383,13 @@ export class Sessions {
           else { attached.handle = source; this.mainChanged(); }
         },
         onRecord: (event) => { if (attached.owner === owner && !attached.closed) this.receive(attached, event); },
+        // 写者停止（服务端关停、bridge 故障、关闭会话后的兜底等）时清出的草稿：保存后由浏览器打开该会话时取回。
+        beforeClearQueue: () => {
+          const session = attached;
+          if (session.owner !== owner) return undefined;
+          const id = session.id; const capture = this.captureQueue(session); const reason = this.closing ? "shutdown" : "exit";
+          return async (cleared) => { await this.saveCleared(session, id, { id: randomUUID(), reason }, this.resolveCleared(capture, cleared)); };
+        },
         onReady: (state, data, reason, source) => {
           if (this.closing || attached.owner !== owner || attached.closed || attached.handle && attached.handle !== source) return;
           // bridge 就绪可能先于 start 返回；回调携带来源 handle，绑定不能读取另一代的写者。
@@ -502,18 +516,60 @@ export class Sessions {
     })().finally(() => { session.syncing = undefined; });
     return session.syncing;
   }
-  private async stop(session: HostedSession, close: boolean, preempted = false): Promise<any> {
+  private captureQueue(session: HostedSession): QueueCapture {
+    return { mirror: { steering: [...session.queued.steering], followUp: [...session.queued.followUp] }, encoded: new Map(session.drafts) };
+  }
+  /**
+   * 把 clear_queue 清出的文字对应到原草稿。优先按队列镜像取回原草稿（含图片节点），steering 在前、followUp 在后，与 clear_queue 的顺序一致。
+   * 镜像无法确认时依次按完整编码文字、图片标记 nonce 查找，都找不到时只放回文字。
+   * 归属不明的草稿另外交出，由输入框放在确定的草稿之后并提示用户检查；其候选位置只放回实际文字，不再按文字回退查找。
+   */
+  private resolveCleared(capture: QueueCapture, cleared: ClearedQueue | undefined): ClearedDrafts {
+    const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
+    const steering = restore(capture.mirror.steering, cleared?.steering ?? []); const followUp = restore(capture.mirror.followUp, cleared?.followUp ?? []);
+    const items = [...steering.certain, ...followUp.certain];
+    const uncertain = [...new Set([...steering.uncertain, ...followUp.uncertain])];
+    const queuedDrafts = items.map((item) => item?.draft);
+    const grouped = new Set(uncertain.flatMap((claim) => claim.key ? [claim.key] : []));
+    const keys = texts.map((text, i) => {
+      if (queuedDrafts[i]) return items[i]?.key;
+      if (capture.encoded.has(text) && !grouped.has(text)) return text;
+      const nonce = /⟦pane-img:([a-z0-9]{6,8}):\d+⟧/.exec(text)?.[1];
+      return nonce ? [...capture.encoded.keys()].find((key) => !grouped.has(key) && key.includes(`⟦pane-img:${nonce}:`)) : undefined;
+    });
+    const drafts = texts.map((text, i) => queuedDrafts[i] ?? ((keys[i] && capture.encoded.get(keys[i]!)) || [{ type: "text" as const, text }]));
+    return { texts, drafts, uncertain: uncertain.map((claim) => claim.draft), keys: [...keys, ...grouped].filter((key): key is string => !!key) };
+  }
+  /**
+   * 清出的草稿先保存到服务端（draft-outbox.ts），浏览器确认取回后删除；之后的 abort、进程退出或服务端关停都不会让它丢失。
+   * 保存失败不改变停止结果：草稿仍随结果返回，失败记入诊断。
+   */
+  private async saveCleared(session: HostedSession, sessionId: string, record: { id: string; reason: SavedDraftsReason }, cleared: ClearedDrafts): Promise<void> {
+    const drafts: SavedDraft[] = [...cleared.drafts.map((nodes) => ({ nodes, uncertain: false })), ...cleared.uncertain.map((nodes) => ({ nodes, uncertain: true }))];
+    if (!drafts.length) return;
+    try { await this.outbox.save(sessionId, { ...record, drafts }); }
+    catch (error) {
+      console.error("清出的草稿未能保存到服务端：", error);
+      session.model.emit({ type: "pane_diagnostic", message: `清出的草稿未能保存到服务端：${String(error)}` });
+    }
+  }
+  /** 浏览器取回服务端保存的清出草稿；不要求会话已登记，服务端重启后也能按会话 id 读取。 */
+  savedDrafts(sessionId: string): Promise<SavedDrafts[]> { return this.inflight.run("drafts.list", () => this.outbox.list(sessionId)); }
+  removeSavedDrafts(sessionId: string, ids: string[]): Promise<void> { return this.inflight.run("drafts.remove", () => this.outbox.remove(sessionId, ids)); }
+  private async stop(session: HostedSession, close: boolean, preempted = false, record: { id: string; reason: SavedDraftsReason } = { id: randomUUID(), reason: "exit" }): Promise<any> {
     if (!session.handle) return { status: "nothingToStop" };
     const handle = session.handle;
     session.model.control("running", "stopping", undefined, true);
-    let cleared: any = { steering: [], followUp: [] };
-    // clear_queue 会先发出空的 queue_update；发送前取镜像快照，用于把清出的文字对应到原草稿。
-    const mirror = { steering: [...session.queued.steering], followUp: [...session.queued.followUp] };
     // 编码草稿记录会在队列项清出时释放，回退查找使用停止开始时的副本。
-    const encodedDrafts = new Map(session.drafts);
+    const capture = this.captureQueue(session);
+    let cleared: ClearedQueue | undefined; let queueFailed = false;
+    try { cleared = (await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 })).data as ClearedQueue; }
+    catch { queueFailed = true; }
+    const result = this.resolveCleared(capture, cleared);
+    if (!session.handle || session.handle === handle) for (const key of result.keys) session.drafts.delete(key);
+    await this.saveCleared(session, session.id, record, result);
     try {
-      const response = await handle.send({ type: "clear_queue" }, { timeoutMs: 2000 }); cleared = response.data;
-      if (close) await handle.stop();
+      if (queueFailed || close) await handle.stop();
       else {
         try {
           await handle.send({ type: "abort" }, { timeoutMs: this.options.stopOptions?.abortTimeoutMs ?? 10000 });
@@ -524,25 +580,8 @@ export class Sessions {
         catch { await handle.stop(); }
       }
     } catch { await handle.stop(); }
-    const texts: string[] = [...(cleared?.steering ?? []), ...(cleared?.followUp ?? [])];
-    // 优先按队列镜像取回原草稿（含图片节点），steering 在前、followUp 在后，与 clear_queue 的顺序一致。
-    // 镜像无法确认时依次按完整编码文字、图片标记 nonce 查找，都找不到时只放回文字。
-    const steering = restore(mirror.steering, cleared?.steering ?? []); const followUp = restore(mirror.followUp, cleared?.followUp ?? []);
-    const items = [...steering.certain, ...followUp.certain];
-    const uncertain = [...new Set([...steering.uncertain, ...followUp.uncertain])];
     if (!session.handle || session.handle === handle) session.queued = emptyMirror();
-    const queuedDrafts = items.map((item) => item?.draft);
-    // 归属不明的草稿另外交出，由输入框放在确定的草稿之后并提示用户检查；其候选位置只放回实际文字，不再按文字回退查找。
-    const grouped = new Set(uncertain.flatMap((claim) => claim.key ? [claim.key] : []));
-    const keys = texts.map((text, i) => {
-      if (queuedDrafts[i]) return items[i]?.key;
-      if (encodedDrafts.has(text) && !grouped.has(text)) return text;
-      const nonce = /⟦pane-img:([a-z0-9]{6,8}):\d+⟧/.exec(text)?.[1];
-      return nonce ? [...encodedDrafts.keys()].find((key) => !grouped.has(key) && key.includes(`⟦pane-img:${nonce}:`)) : undefined;
-    });
-    const drafts = texts.map((text, i) => queuedDrafts[i] ?? ((keys[i] && encodedDrafts.get(keys[i]!)) || [{ type: "text", text }]));
-    if (!session.handle || session.handle === handle) for (const key of [...keys, ...grouped]) if (key) session.drafts.delete(key);
-    return { status: "done", clearedText: texts, clearedDrafts: drafts, ...(uncertain.length ? { uncertainDrafts: uncertain.map((claim) => claim.draft) } : {}) };
+    return { status: "done", clearedText: result.texts, clearedDrafts: result.drafts, ...(result.uncertain.length ? { uncertainDrafts: result.uncertain } : {}) };
   }
   private reclaim(): Promise<void> { return this.inflight.run("sessions.reclaim", () => this.performReclaim()); }
   private async performReclaim(): Promise<void> {

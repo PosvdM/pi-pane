@@ -121,6 +121,19 @@ export interface PaneCommandOutcome {
   exportId?: string;               // export 的下载标识，见 GET /api/exports/:id
 }
 
+/**
+ * 服务端保存的清出草稿（GET /api/sessions/:id/drafts）。停止、关闭或服务端关停时从 pi 队列清出、尚未确认交到浏览器的草稿，
+ * 浏览器放回输入框后用 POST /api/sessions/:id/drafts 的 {requestId, remove: id[]} 删除。
+ * reason 为 stop、close 时 id 是发起请求的 requestId；shutdown 为服务端关停，exit 为写者因其他原因停止。
+ */
+export interface PaneSavedDrafts {
+  id: string;
+  reason: "stop" | "close" | "shutdown" | "exit";
+  at: string;                      // ISO 时间
+  drafts: { nodes: DraftNode[]; uncertain: boolean }[];
+}
+export interface PaneSavedDraftsList { records: PaneSavedDrafts[] }
+
 /** 错误响应体；HTTP 状态码见 architecture.md。 */
 export interface PaneErrorBody { error: string; message: string; instanceId: string }
 

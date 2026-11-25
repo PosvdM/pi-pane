@@ -13,6 +13,7 @@ import { AssetStore, MAX_IMAGE_BYTES } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { assert, PaneError } from "./errors.js";
 import { Sessions, type SessionManagerOptions } from "./sessions.js";
+import type { PaneSavedDraftsList } from "./web-api.js";
 import { PiStore } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
@@ -117,7 +118,9 @@ export class PaneServer {
       server.port = await listenAvoidingForbidden(server.http, "127.0.0.1", port);
       // 驱动延迟到第一次发送才启动，监听端口确定后设置回连地址。
       server.sessions.setBridgeUrl(server.origin);
-      server.sweep = setInterval(() => { server.auth.sweep(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
+      const sweepDrafts = () => { void server.sessions.inflight.run("drafts.sweep", () => server.sessions.outbox.sweep()).catch(() => {}); };
+      sweepDrafts();
+      server.sweep = setInterval(() => { server.auth.sweep(); sweepDrafts(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
       return server;
     } catch (error) { await server.close().catch(() => {}); throw error; }
   }
@@ -172,13 +175,19 @@ export class PaneServer {
       if (req.method === "POST" && pathname === "/api/sessions/open") {
         const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, () => { this.assertAccepting(); return this.sessions.open(body); })); return;
       }
-      const route = pathname.match(/^\/api\/sessions\/([^/]+)\/(snapshot|history|control|query|ui)$/);
+      const route = pathname.match(/^\/api\/sessions\/([^/]+)\/(snapshot|history|control|query|ui|drafts)$/);
       if (route) {
         const id = decodeURIComponent(route[1]); const operation = route[2];
         if (req.method === "GET" && operation === "snapshot") { sendJson(res, 200, this.sessions.snapshot(id)); return; }
         if (req.method === "GET" && operation === "history") { sendJson(res, 200, this.sessions.history(id, url.searchParams.get("before") ?? "", Number(url.searchParams.get("limit") ?? 50))); return; }
         if (req.method === "POST" && operation === "control") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.command(id, body)); return; }
         if (req.method === "POST" && operation === "query") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.query(id, body.type)); return; }
+        if (req.method === "GET" && operation === "drafts") { sendJson(res, 200, { records: await this.sessions.savedDrafts(id) } satisfies PaneSavedDraftsList); return; }
+        if (req.method === "POST" && operation === "drafts") {
+          const body = await jsonBody(req); this.assertAccepting();
+          assert(Array.isArray(body.remove) && body.remove.length <= 256 && body.remove.every((item: unknown) => typeof item === "string" && item.length >= 1 && item.length <= 256), "invalidDraftIds", "要删除的草稿记录标识无效");
+          sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); await this.sessions.removeSavedDrafts(id, body.remove); return { status: "done" }; })); return;
+        }
         if (req.method === "POST" && operation === "ui") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); return this.sessions.respondUi(id, body); })); return; }
       }
       if (req.method === "POST" && pathname === "/api/assets") {
