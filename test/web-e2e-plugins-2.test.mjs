@@ -54,6 +54,15 @@ test("插件输入框：提交即清空、被拒或放弃后放回、等待期�
   await node(page, "uitest:session:d").click();
   await page.getByText("留言：第二段").waitFor();
   assert.equal(await editor(page).inputValue(), "新写的");
+  // 机器较慢时，上面等待放行的请求可能超过动作超时（1 秒），服务端按“结果未知”返回 pending，留下查询入口，文字不放回。
+  // 插件随后已执行：查询结算为已送达，入口消失，输入框里期间新写的文字不受影响。
+  await until(async () => {
+    const entries = byId(page, "action-pending");
+    if ((await entries.count()) === 0) return true;
+    await entries.first().locator('[data-testid="action-query"]').click({ timeout: 1000 }).catch(() => {});
+    return false;
+  });
+  assert.equal(await editor(page).inputValue(), "新写的");
 
   // needsInput：放弃后续表单视为没有执行，文字放回。
   plugin().composerMode = "needsInput";
