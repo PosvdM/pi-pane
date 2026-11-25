@@ -154,6 +154,11 @@ test("插件 Chrome 横幅、通知、全局动作结果未知后查询、侧栏
   await byId(page, "banner-action").filter({ hasText: "检查状态" }).click();
   await byId(page, "plugin-title").filter({ hasText: "任务甲" }).waitFor();
 
+  // 动作结果的 openNodeId 指向尚未推送到浏览器的节点：等节点出现后打开。
+  await byId(page, "add-menu-btn").click();
+  await byId(page, "global-action").filter({ hasText: "新建任务" }).click();
+  await byId(page, "plugin-title").filter({ hasText: "新建的任务" }).waitFor();
+
   plugin().notify({ id: "n1", level: "info", title: "任务甲已完成", nodeId: "uitest:session:a" });
   plugin().notify({ id: "n1", level: "info", title: "任务甲已完成", nodeId: "uitest:session:a" });
   await byId(page, "notification").filter({ hasText: "任务甲已完成" }).waitFor();

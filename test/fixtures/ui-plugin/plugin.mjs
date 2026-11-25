@@ -152,6 +152,7 @@ export default function createPlugin() {
         { id: "uitest.steer", source: "uitest", title: "插话", scope: ["node"] },
         { id: "uitest.ping", source: "uitest", title: "检查状态", scope: ["global"] },
         { id: "uitest.slow", source: "uitest", title: "慢动作", scope: ["global"], timeoutMs: 1000 },
+        { id: "uitest.create", source: "uitest", title: "新建任务", scope: ["global"] },
         { id: "uitest.wipe", source: "uitest", title: "清空", scope: ["global"], confirm: "确定清空？", danger: true },
       ],
       async resolveForm(actionId, target) {
@@ -166,6 +167,11 @@ export default function createPlugin() {
           if (inv.actionId === "uitest.slow") {
             await new Promise((resolve) => { slowRelease = resolve; setTimeout(resolve, 30000); });
             return { status: "ok", message: "慢动作完成" };
+          }
+          if (inv.actionId === "uitest.create") {
+            // 树变更晚于动作结果到达浏览器：节点在返回结果之后才推送。
+            setTimeout(() => upsert(node("uitest:session:c", { parentId: "uitest:group:tasks", title: "新建的任务", sessionRef: { source: "uitest", id: "c" }, sortKey: "4" })), 300);
+            return { status: "ok", message: "已新建任务", openNodeId: "uitest:session:c" };
           }
           if (inv.actionId === "uitest.ping") return { status: "ok", message: "状态正常", openNodeId: "uitest:session:a" };
           if (inv.actionId === "uitest.steer") { control.append(inv.target.nodeId.split(":").pop(), "插话：" + inv.input?.fields?.message); return { status: "ok", message: "已插话" }; }

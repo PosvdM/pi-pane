@@ -1,7 +1,7 @@
 // 打开会话树节点：主会话按文件打开，插件节点打开插件视图。侧栏、面板、通知和工具卡片链接共用。
-import { closePluginView, openPluginNode } from "./plugin-session.ts";
-import { openFile } from "./session.ts";
-import { findNode } from "./tree.ts";
+import { closePluginView, openPluginNode, pluginView } from "./plugin-session.ts";
+import { current, openFile } from "./session.ts";
+import { findNode, loadTree, pinNode, trees } from "./tree.ts";
 import { toast } from "./ui-state.ts";
 import type { PaneSessionNodeInfo, TreeNode } from "./types.ts";
 
@@ -17,8 +17,26 @@ export function openNode(node: TreeNode): void {
   void openPluginNode(node);
 }
 
-/** 按 id 打开；节点不在已加载的树里时提示，不猜测来源。 */
+let waiting: (() => void) | null = null;
+
+/**
+ * 按 id 打开。节点还不在已加载的树里时（如动作刚创建的节点，树变更晚于动作结果到达），
+ * 把它加入该来源快照的打开列表并重取，等节点出现后再打开；10 秒内没有出现，或期间用户已切换视图，则放弃。
+ */
 export function openNodeById(id: string): void {
+  waiting?.(); waiting = null;
   const node = findNode(id);
-  if (node) openNode(node); else toast("该节点不在会话列表中，可能已被删除或尚未加载", "warning");
+  if (node) { openNode(node); return; }
+  const source = id.slice(0, id.indexOf(":"));
+  if (!source) { toast("该节点不在会话列表中", "warning"); return; }
+  pinNode(source, id); void loadTree(source);
+  const view = pluginView.get(); const main = current.get();
+  const stop = () => { clearTimeout(timer); off(); if (waiting === stop) waiting = null; };
+  const off = trees.subscribe(() => {
+    if (pluginView.get() !== view || current.get() !== main) { stop(); return; }
+    const found = findNode(id);
+    if (found) { stop(); openNode(found); }
+  });
+  const timer = setTimeout(() => { stop(); toast("该节点不在会话列表中，可能已被删除", "warning"); }, 10000);
+  waiting = stop;
 }
