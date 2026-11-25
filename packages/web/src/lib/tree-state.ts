@@ -187,7 +187,10 @@ export function childrenAcross(trees: ReadonlyMap<string, SourceTree>, parentId:
 export interface HiddenChildren {
   /** 已知数目的未加载子节点数。 */
   count: number;
-  /** 有未加载的子节点但数目未知（hasChildren 为 true、没有 childCount）：只显示“历史”。 */
+  /**
+   * 有未加载的子节点但数目不可用：hasChildren 为 true、没有 childCount，或已开始分页、还有下一页而数目差值不大于 0。
+   * 只显示“历史”，不带数字。
+   */
   unknown: boolean;
   /** 展开“历史”时要分页的来源。 */
   sources: string[];
@@ -197,24 +200,31 @@ export interface HiddenChildren {
  * 节点下尚未加载的子节点（plugin-api.md“按需加载”）。
  * - 同一来源：按父节点的 hasChildren/childCount，扣除该来源已加载的子节点；childCount 由来源随推送更新。
  * - 其他来源：按各来源快照报告的 foreignChildCounts，每个来源只扣除自己经快照或分页取到的子节点。
- * 某个来源对该父节点已分页到最后一页时，它不再有未加载的子节点。
+ * 是否还有历史以分页游标为准，数目只是提示：某个来源对该父节点已开始分页、还有下一页时一定显示“历史”，
+ * 差值不大于 0 时不带数字（插件可能把不计入数目的节点也列在分页里）；已分页到最后一页时，该来源不再有未加载的子节点，
+ * 即使差值大于 0。
  */
 export function hiddenChildren(trees: ReadonlyMap<string, SourceTree>, node: TreeNode): HiddenChildren {
   const result: HiddenChildren = { count: 0, unknown: false, sources: [] };
+  // 差值不大于 0 时：已开始分页（listed 有记录且没到最后一页）仍按未知数目显示，否则没有历史。
+  const add = (source: string, hidden: number, paging: boolean) => {
+    if (hidden > 0) result.count += hidden;
+    else if (paging) result.unknown = true;
+    else return;
+    result.sources.push(source);
+  };
   const own = trees.get(node.source);
-  if (own && node.hasChildren && !own.listed.get(node.id)?.done) {
+  const ownListed = own?.listed.get(node.id);
+  if (own && node.hasChildren && !ownListed?.done) {
     if (node.childCount === undefined) { result.unknown = true; result.sources.push(node.source); }
-    else {
-      const hidden = node.childCount - own.children(node.id).length;
-      if (hidden > 0) { result.count += hidden; result.sources.push(node.source); }
-    }
+    else add(node.source, node.childCount - own.children(node.id).length, !!ownListed);
   }
   for (const [source, t] of trees) {
     if (source === node.source) continue;
     const total = t.foreign[node.id];
-    if (!total || t.listed.get(node.id)?.done) continue;
-    const hidden = total - t.children(node.id).filter((child) => t.baseline.has(child.id)).length;
-    if (hidden > 0) { result.count += hidden; result.sources.push(source); }
+    const listed = t.listed.get(node.id);
+    if (!total || listed?.done) continue;
+    add(source, total - t.children(node.id).filter((child) => t.baseline.has(child.id)).length, !!listed);
   }
   return result;
 }

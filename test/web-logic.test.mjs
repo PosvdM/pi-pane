@@ -257,6 +257,31 @@ test("跨来源的子节点与历史数：各来源分别扣除自己的节点�
   assert.equal(hiddenChildren(own, own.get("x").nodes.get("x:root")).count, 1);
 });
 
+test("是否还有历史以分页游标为准：已开始分页且还有下一页时差值不大于 0 也显示不带数字的“历史”，分页到底后差值大于 0 也不显示", () => {
+  // 插件报告 2（有一个热节点不计入），但分页按创建顺序把它也列在第一页：第一页 2 条后差值为 0，nextCursor 仍在。
+  const trees = forest([
+    ["pane", { nodes: [treeNode("pane", "pane:session:1", null)] }],
+    ["a", { nodes: [], foreignChildCounts: { "pane:session:1": 2 } }],
+  ]);
+  const main = trees.get("pane").nodes.get("pane:session:1");
+  assert.deepEqual(hiddenChildren(trees, main), { count: 2, unknown: false, sources: ["a"] });
+  trees.get("a").mergePage("pane:session:1", [treeNode("a", "a:hot", "pane:session:1"), treeNode("a", "a:c2", "pane:session:1")], 6, "2");
+  assert.deepEqual(hiddenChildren(trees, main), { count: 0, unknown: true, sources: ["a"] }, "还有下一页，继续显示“历史”");
+  trees.get("a").mergePage("pane:session:1", [treeNode("a", "a:c3", "pane:session:1")], 6);
+  assert.deepEqual(hiddenChildren(trees, main), { count: 0, unknown: false, sources: [] }, "分页到底，不再有历史");
+  // 同一来源的父节点同理：childCount 2 已加载 2 但还有下一页时显示“历史”；分页到底后 childCount 再大也不显示。
+  const own = forest([["x", { nodes: [treeNode("x", "x:root", null, { kind: "group", hasChildren: true, childCount: 2 })] }]]);
+  const root = () => own.get("x").nodes.get("x:root");
+  own.get("x").mergePage("x:root", [treeNode("x", "x:c1", "x:root"), treeNode("x", "x:c2", "x:root")], 6, "2");
+  assert.deepEqual(hiddenChildren(own, root()), { count: 0, unknown: true, sources: ["x"] });
+  own.get("x").mergePage("x:root", [treeNode("x", "x:c3", "x:root")], 6);
+  assert.equal(own.get("x").apply({ type: "upsert", revision: 7, node: { ...root(), childCount: 9, revision: 7 } }, () => true), "applied");
+  assert.deepEqual(hiddenChildren(own, root()), { count: 0, unknown: false, sources: [] });
+  // 没有开始分页时差值不大于 0 就没有历史。
+  const fresh = forest([["y", { nodes: [treeNode("y", "y:root", null, { kind: "group", hasChildren: true, childCount: 1 }), treeNode("y", "y:c1", "y:root")] }]]);
+  assert.deepEqual(hiddenChildren(fresh, fresh.get("y").nodes.get("y:root")), { count: 0, unknown: false, sources: [] });
+});
+
 test("跨来源的同级节点统一按 sortKey 排序，相同时按 id", () => {
   const trees = forest([
     ["pane", { nodes: [treeNode("pane", "pane:project:p", null, { kind: "group" }), treeNode("pane", "pane:session:1", "pane:project:p", { sortKey: "5" })] }],

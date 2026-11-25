@@ -298,7 +298,7 @@ export interface TreeNode {
 
 - `tree.snapshot(req)` 只返回“热节点”及其全部祖先。热节点是：`req.openNodeIds` 中的节点（浏览器里打开着的）、`status` 为 `running`、`waiting`、`paused` 的节点、`lastActivityAt` 晚于 `req.recentSince` 的节点。
 - 其余节点按需加载：用户展开某个节点时，pi-pane 调 `tree.children(parentId, page)` 分页取子节点。
-- 每个父节点下，已加载的子节点正常显示，没有加载的折叠为一行“历史（N）”（N 为父节点的 `childCount` 减去已加载的子节点数；`hasChildren` 为 true 而没有 `childCount` 时不显示数字），展开后分页加载。因此插件节点的 `childCount` 应是当前的子节点总数，子节点增减时随父节点的 `upsert` 更新。
+- 每个父节点下，已加载的子节点正常显示，没有加载的折叠为一行“历史（N）”（N 为父节点的 `childCount` 减去已加载的子节点数；`hasChildren` 为 true 而没有 `childCount` 时不显示数字），展开后分页加载。是否还有历史以分页游标为准，数目只是提示：某来源对该父节点已开始分页且还有下一页时一定显示“历史”，差值不大于 0 时不带数字；已分页到最后一页时，该来源不再贡献“历史”，即使差值大于 0。因此插件节点的 `childCount` 应是当前的子节点总数，子节点增减时随父节点的 `upsert` 更新。
 - 插件不能为其他来源的节点填写 `childCount` 和 `hasChildren`（例如 pi-pane 的主会话节点），因此在快照的 `foreignChildCounts` 中报告：键为其他来源的父节点 id，值为该插件挂在它下面的子节点总数，没有子节点的父节点不列出。pi-pane 把各来源的数目相加，决定主会话是否显示展开箭头和“历史（N）”，展开时对报告了数目的来源调用 `tree.children(parentId, page)`。数目以最近一次快照为准，订阅推来的新节点照常显示，总数在下一次快照（含 `reset` 之后的快照）时更新。不提供该字段的插件，其挂在其他来源节点下的冷节点只能在变为热节点后显示。
 
 ```ts
