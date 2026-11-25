@@ -4,7 +4,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
-import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
+import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts, startsWith } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
 import { addNotice, attachComposer, batchPrefix, FLIGHT_GRACE_MS, beginSubmit, clearNotice, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, stopPrefix, takePending, unsavedSessions } from "../lib/restored.ts";
 import { closeSession, control, current, editorText, navigation, outcomeUnknown, recoverDrafts, stopRun, type ControlOutcome } from "../lib/session.ts";
@@ -86,11 +86,12 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
 
   // 待写入 localStorage 的草稿：编辑时立即捕获内容，延迟写入；切换会话或卸载时同步写入。
   const pendingSave = useRef<{ sessionId: string; nodes: DraftNode[] } | null>(null);
-  const flush = () => {
+  /** 同步写入尚未保存的编辑；返回是否已写入 localStorage（没有待写入内容时为 true）。 */
+  const flush = (): boolean => {
     clearTimeout(saveTimer.current);
     const pending = pendingSave.current; pendingSave.current = null;
-    if (!pending) return;
-    saveDraft(localStorage, pending.sessionId, pending.nodes);
+    if (!pending) return true;
+    return saveDraft(localStorage, pending.sessionId, pending.nodes);
   };
   /** 读取输入框内容并安排保存。byUser：由用户编辑引起，此时清空输入框即移除归属不明提示。 */
   const refresh = (byUser = true) => {
@@ -129,10 +130,20 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
       // 取回的草稿放在现有草稿之前，并立即保存，之后才删除待放回记录。
       deliver: (drafts, message) => {
         setNodes(prependDrafts(drafts.map((draft) => draft.nodes), readNodes(el)));
-        flush();
+        const saved = flush();
         const uncertain = drafts.filter((draft) => draft.uncertain).length;
         if (uncertain) addNotice(localStorage, sessionId, uncertain);
         if (message) toast(message, uncertain ? "warning" : undefined);
+        return saved;
+      },
+      // 另一标签页放进同一会话输入框的草稿：同样放在本页内容之前并保存，本页之后的保存不会覆盖掉它。提示已由那一页记录。
+      // 本页内容已经以这些草稿开头时不再加入（例如本页读入草稿后，另一页提交同样的内容失败并放回）。
+      mirror: (drafts) => {
+        const head = prependDrafts(drafts.map((draft) => draft.nodes), []); const existing = readNodes(el);
+        if (startsWith(existing, head)) return;
+        setNodes(prependDrafts([head], existing));
+        flush();
+        toast("另一标签页放回的消息已加入输入框");
       },
     });
     // 同一会话可能在多个标签页挂载：用 Web Lock 串行取走待放回记录，避免同一批放回两次。

@@ -29,6 +29,18 @@ export function imageIds(nodes: DraftNode[]): string[] {
   return nodes.flatMap((n) => n.type === "image" ? [n.assetId] : []);
 }
 
+/** nodes 是否以 head 开头（按合并相邻文本后的节点比较，head 末尾的文本可以是 nodes 对应文本的前缀）。 */
+export function startsWith(nodes: DraftNode[], head: DraftNode[]): boolean {
+  const a = normalize(nodes); const b = normalize(head);
+  return b.every((node, i) => {
+    const other = a[i];
+    if (!other || other.type !== node.type) return false;
+    if (node.type === "image") return other.type === "image" && other.assetId === node.assetId;
+    const text = (other as { text: string }).text;
+    return i === b.length - 1 ? text.startsWith(node.text) : text === node.text;
+  });
+}
+
 /** 停止或关闭时清出的草稿按原顺序放在现有草稿之前，用空行分隔。 */
 export function prependDrafts(restored: DraftNode[][], existing: DraftNode[]): DraftNode[] {
   const parts = [...restored.filter((d) => !isEmpty(d)), ...(isEmpty(existing) ? [] : [existing])];

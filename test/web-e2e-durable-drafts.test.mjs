@@ -110,7 +110,7 @@ async function holdFirst(page, id, kind) {
   return state;
 }
 
-test("#10 Chrome Ctrl+C 关停服务端时排队的草稿（含图片）保存，重启并重新配对后放回原会话并提示，双标签页和刷新都不重复", { timeout: 150_000 }, async t => {
+test("#10 Chrome 服务端关停（Ctrl+C 调用的 server.close()）时排队的草稿（含图片）保存，重启并重新配对后放回原会话并提示；双标签页只取回一次、另一页同步且编辑不覆盖，刷新不重复", { timeout: 150_000 }, async t => {
   const s = await setup(t, replyScript("预热完成"), { serverOptions, allowedErrors: restartErrors }); if (!s) return;
   const b = await create(s, "关停乙");
   const a = await create(s, "关停甲");
@@ -125,27 +125,43 @@ test("#10 Chrome Ctrl+C 关停服务端时排队的草稿（含图片）保存�
   assert.deepEqual(record.drafts, drafts.map(nodes => ({ nodes, uncertain: false })), "关停时清出的原草稿（含图片节点）保存在服务端");
   assert.equal((await records(s.fixture.env.FAKE_REQUEST_LOG)).filter(row => row.kind === "request").length, before, "排队的消息没有发送");
 
-  // 第二个标签页先打开同一会话：两页串行取回，只放回一次。
+  // 第二个标签页同时打开同一会话：两页串行取回，只有一页放回；另一页的输入框同步加入同样的草稿，不重复。
   const other = observePage(await s.context.newPage()); s.pages.push(other); other.setDefaultTimeout(15_000);
   await other.goto(s.server.origin); await byId(other, "sidebar").waitFor();
+  // 扣住两页读取服务端记录的请求，直到两页的输入框都显示关停前的输入，确保另一页是在已挂载、显示旧内容时收到同步。
+  let open; const gate = new Promise(resolve => { open = resolve; });
+  for (const page of [paired, other]) await page.route(`**/api/sessions/${a.ref.id}/drafts`, async route => { if (route.request().method() === "GET") await gate; await route.continue(); });
   await Promise.all([choose(paired, a), choose(other, a)]);
-  const restored = await until(async () => {
+  await until(async () => (await Promise.all([draftNodes(paired), draftNodes(other)])).every(nodes => JSON.stringify(nodes) === JSON.stringify(text("关停前的输入"))));
+  open();
+  const want = joined(drafts, text("关停前的输入"));
+  await until(async () => {
     const [mine, theirs] = await Promise.all([draftNodes(paired), draftNodes(other)]);
-    return (mine.some(node => node.type === "image") || theirs.some(node => node.type === "image")) && { mine, theirs };
+    return JSON.stringify(mine) === JSON.stringify(want) && JSON.stringify(theirs) === JSON.stringify(want);
   });
   await until(async () => (await saved(s, a.ref.id)).length === 0);
-  const holder = restored.mine.some(node => node.type === "image") ? paired : other;
-  const want = joined(drafts, text("关停前的输入"));
-  assert.deepEqual(await draftNodes(holder), want, "放回的草稿在关停前的输入之前");
-  assert.match(await toasts(holder), /服务端关闭前排队的消息已放回输入框/);
+  const notices = await Promise.all([toasts(paired), toasts(other)]);
+  assert.equal(notices.filter(value => /服务端关闭前排队的消息已放回输入框/.test(value)).length, 1, "只有一页取回");
+  const holder = /服务端关闭前/.test(notices[0]) ? paired : other; const peer = holder === paired ? other : paired;
+  assert.match(await toasts(peer), /另一标签页放回的消息已加入输入框/);
   assert.deepEqual(await keysWith(holder, "pi-pane.ack."), [], "服务端副本删除后移除待删除登记");
+  const draftKey = `pi-pane.draft.${a.ref.id}`;
+  const stored = () => holder.evaluate(key => JSON.parse(localStorage.getItem(key) ?? "[]"), draftKey);
+  assert.deepEqual(await stored(), want, "放回的草稿在关停前的输入之前，草稿存储只有一份");
+  // 另一页在放回之后编辑：保存的内容包含放回的草稿，不会用放回前的旧内容覆盖（服务端副本已删除）。
+  await byId(peer, "composer").evaluate(el => { el.focus(); const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection().removeAllRanges(); getSelection().addRange(range); });
+  await peer.keyboard.insertText("，另一页补充");
+  const edited = joined(drafts, text("关停前的输入，另一页补充"));
+  await until(async () => JSON.stringify(await stored()) === JSON.stringify(edited));
+  await holder.waitForTimeout(500);
+  assert.deepEqual(await stored(), edited);
 
   // 取回后刷新、切换会话：草稿保留，不再放回第二次。
-  for (const page of [paired, other]) { await page.reload(); await choose(page, a); }
-  await until(async () => JSON.stringify(await draftNodes(paired)) === JSON.stringify(want));
-  assert.deepEqual(await draftNodes(other), want);
+  for (const page of [paired, other]) { await page.unrouteAll({ behavior: "ignoreErrors" }); await page.reload(); await choose(page, a); }
+  await until(async () => JSON.stringify(await draftNodes(paired)) === JSON.stringify(edited));
+  assert.deepEqual(await draftNodes(other), edited);
   await choose(paired, b); await choose(paired, a);
-  assert.deepEqual(await draftNodes(paired), want);
+  assert.deepEqual(await draftNodes(paired), edited);
   assert.doesNotMatch(await toasts(paired), /服务端关闭前/);
 });
 

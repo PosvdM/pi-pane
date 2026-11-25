@@ -9,9 +9,13 @@ import type { DraftNode } from "./types.ts";
 
 /** uncertain：无法确认是否已经发送的草稿。 */
 export interface RestoredDraft { nodes: DraftNode[]; uncertain: boolean }
-/** 本标签页挂载的输入框。deliver 把草稿放在现有内容之前，返回前须保存输入框内容，之后才删除待放回记录。 */
-export interface ComposerHandle { deliver: (drafts: RestoredDraft[], message: string | null) => void }
-interface Batch { at: number; drafts: RestoredDraft[] }
+/**
+ * 本标签页挂载的输入框。deliver 把草稿放在现有内容之前并立即保存输入框内容，返回是否已写入 localStorage，之后才删除待放回记录。
+ * mirror 收到同一浏览器其他标签页放进该会话输入框的草稿，同样放在现有内容之前并保存，见 handTo。
+ */
+export interface ComposerHandle { deliver: (drafts: RestoredDraft[], message: string | null) => boolean; mirror: (drafts: RestoredDraft[]) => void }
+/** message：放进输入框时显示的通知，省略时显示通用的通知。 */
+interface Batch { at: number; drafts: RestoredDraft[]; message?: string }
 /** 归属不明草稿的提示：放回时的条数与最近一次放回的时间。 */
 export interface Notice { count: number; at: number }
 /** 在途提交：提交时从输入框移出的内容。 */
@@ -43,10 +47,24 @@ const memory = new Map<string, { sessionId: string; value: string }>();
 export const unsavedSessions = new Store<ReadonlySet<string>>(new Set());
 /** 提示记录变化的计数，输入框订阅后重新读取。 */
 export const noticeChanged = new Store(0);
+/**
+ * 已放回、但草稿只暂存在页面内存中的服务端草稿记录：会话 id → 记录 id。服务端副本是这些草稿唯一的持久副本，
+ * 不登记删除；本页面续取时跳过这些记录，不重复放回。该会话的记录全部写入 localStorage 后转为待删除登记。
+ */
+const deferred = new Map<string, { storage: Storage; ids: Set<string> }>();
+/** 刚由 deferred 转为待删除登记的会话，订阅方据此请服务端删除副本。 */
+export const deferredSettled = new Store<readonly string[]>([]);
 let unloadGuard = false;
 
 function changed(): void {
-  unsavedSessions.set(new Set([...memory.values()].map((entry) => entry.sessionId)));
+  const unsaved = new Set([...memory.values()].map((entry) => entry.sessionId));
+  unsavedSessions.set(unsaved);
+  const settled = [...deferred.keys()].filter((sessionId) => !unsaved.has(sessionId));
+  for (const sessionId of settled) {
+    const { storage, ids } = deferred.get(sessionId)!; deferred.delete(sessionId);
+    registerAck(storage, sessionId, [...ids]);
+  }
+  if (settled.length) deferredSettled.set(settled);
   // 关闭或刷新页面会丢掉内存中的记录，请浏览器先确认。
   if (memory.size && !unloadGuard && typeof window !== "undefined") {
     unloadGuard = true;
@@ -124,11 +142,38 @@ export function deliverRestored(storage: Storage, sessionId: string, drafts: Res
   const kept = drafts.filter((draft) => !isEmpty(draft.nodes));
   if (!kept.length) return "none";
   const composer = composers.get(sessionId);
-  if (composer) { composer.deliver(kept, message); return "composer"; }
+  if (composer) return handTo(sessionId, composer, kept, message) ? "composer" : "memory";
   // 每批一个键，写入不需要读取旧值，取走时也只删除读到的键，跨标签页不会覆盖或误删其他批次。
   const prefix = batchPrefix(sessionId);
-  const batch: Batch = { at: nextAt(storage, prefix), drafts: kept };
+  const batch: Batch = { at: nextAt(storage, prefix), drafts: kept, ...(message ? { message } : {}) };
   return persist(storage, sessionId, prefix + suffix(batch.at), JSON.stringify(batch)) ? "stored" : "memory";
+}
+
+/**
+ * 同一会话可能在多个标签页挂载着输入框，各自显示读入时的草稿，编辑时整体写回同一个草稿存储键。
+ * 只有一个标签页取到放回的草稿；其他标签页若不知道，之后的编辑或到期的延迟保存会用旧内容覆盖放回的草稿。
+ * 因此放回后经 BroadcastChannel 通知其他标签页，挂载着该会话输入框的标签页把同样的草稿加到自己的内容之前并保存。
+ */
+let channel: BroadcastChannel | null | undefined;
+function restoredChannel(): BroadcastChannel | null {
+  if (channel !== undefined) return channel;
+  channel = typeof BroadcastChannel === "function" ? new BroadcastChannel("pi-pane.restored") : null;
+  if (channel) {
+    // Node.js 中不让频道阻止进程退出；浏览器没有 unref。
+    (channel as { unref?: () => void }).unref?.();
+    channel.onmessage = (event: MessageEvent) => {
+      const { sessionId, drafts } = event.data ?? {};
+      if (typeof sessionId !== "string" || !Array.isArray(drafts) || !drafts.every((draft: any) => Array.isArray(draft?.nodes))) return;
+      composers.get(sessionId)?.mirror(drafts.map((draft: any) => ({ nodes: normalize(draft.nodes), uncertain: draft.uncertain === true })));
+    };
+  }
+  return channel;
+}
+/** 把草稿交给本标签页的输入框，并通知其他标签页的同一会话输入框。返回是否已写入 localStorage。 */
+function handTo(sessionId: string, composer: ComposerHandle, drafts: RestoredDraft[], message: string | null): boolean {
+  const saved = composer.deliver(drafts, message);
+  restoredChannel()?.postMessage({ sessionId, drafts });
+  return saved;
 }
 
 /**
@@ -142,18 +187,21 @@ export function takePending(storage: Storage, sessionId: string): boolean {
   for (const key of keys(storage, batchPrefix(sessionId))) {
     const batch = parse(storage, key);
     if (batch && Array.isArray(batch.drafts) && batch.drafts.every((d: any) => Array.isArray(d?.nodes))) {
-      batches.push({ key, batch: { at: Number(batch.at) || 0, drafts: batch.drafts.map((d: any) => ({ nodes: normalize(d.nodes), uncertain: d.uncertain === true })) } });
+      batches.push({ key, batch: { at: Number(batch.at) || 0, drafts: batch.drafts.map((d: any) => ({ nodes: normalize(d.nodes), uncertain: d.uncertain === true })), ...(typeof batch.message === "string" ? { message: batch.message } : {}) } });
     } else persist(storage, sessionId, key, null);
   }
   if (!batches.length) return false;
   batches.sort((a, b) => b.batch.at - a.batch.at || (a.key < b.key ? 1 : -1));
-  composer.deliver(batches.flatMap(({ batch }) => batch.drafts), "取回的消息已放回输入框");
+  // 通知取最新一批存入时给出的，例如“服务端关闭前排队的消息已放回输入框”。
+  const message = batches.find(({ batch }) => batch.message)?.batch.message ?? "取回的消息已放回输入框";
+  handTo(sessionId, composer, batches.flatMap(({ batch }) => batch.drafts), message);
   for (const { key } of batches) persist(storage, sessionId, key, null);
   return true;
 }
 
 /** 输入框挂载时登记；返回注销函数。待放回记录由调用方用 takePending 取走。 */
 export function attachComposer(sessionId: string, composer: ComposerHandle): () => void {
+  restoredChannel();
   composers.set(sessionId, composer);
   return () => { if (composers.get(sessionId) === composer) composers.delete(sessionId); };
 }
@@ -220,11 +268,12 @@ export async function recoverFlights(storage: Storage, sessionId: string, locks:
   return recheck;
 }
 
-/** 停止或关闭的在途请求：请求体原样保存，结果没有交到发起的页面时，之后的页面用同一 requestId 续取。 */
-export interface StopFlight { sessionId: string; key: string; at: number; body: { requestId: string } & Record<string, unknown> }
+/**
+ * 停止或关闭的在途请求：请求体原样保存，结果没有交到发起的页面时，之后的页面用同一 requestId 续取。
+ * final 为 true 时请求已确定结束（服务端明确拒绝），不再重新提交，只按 requestId 读取服务端保存的记录。
+ */
+export interface StopFlight { sessionId: string; key: string; at: number; body: { requestId: string } & Record<string, unknown>; final: boolean }
 
-/** 本标签页挂载着该会话的输入框。 */
-export function isMounted(sessionId: string): boolean { return composers.has(sessionId); }
 /** 本页面仍在等待该在途记录的结果。 */
 export function isLive(key: string): boolean { return live.has(key); }
 
@@ -235,7 +284,7 @@ export function isLive(key: string): boolean { return live.has(key); }
 export function beginStop(storage: Storage, sessionId: string, body: StopFlight["body"], locks: Locks | null = defaultLocks()): StopFlight {
   const prefix = stopPrefix(sessionId);
   const at = nextAt(storage, prefix);
-  const flight: StopFlight = { sessionId, key: prefix + suffix(at), at, body };
+  const flight: StopFlight = { sessionId, key: prefix + suffix(at), at, body, final: false };
   persist(storage, sessionId, flight.key, JSON.stringify({ at, sessionId, body }));
   let release = () => {};
   const held = new Promise<void>((resolve) => { release = resolve; });
@@ -248,12 +297,20 @@ export function releaseStop(key: string): void {
   live.get(key)?.();
   live.delete(key);
 }
+/**
+ * 请求被服务端明确拒绝、确定没有执行：记录标为 final 后释放锁。续取不再重新提交原请求，以免在幂等记录过期后
+ * 执行用户已经放弃的操作（例如取消确认的关闭）；只按 requestId 读取服务端保存的记录后删除在途请求。
+ */
+export function finalizeStop(storage: Storage, flight: StopFlight): void {
+  persist(storage, flight.sessionId, flight.key, JSON.stringify({ at: flight.at, sessionId: flight.sessionId, body: flight.body, final: true }));
+  releaseStop(flight.key);
+}
 /** 该会话的停止、关闭在途请求；损坏的记录清除。 */
 export function stopFlights(storage: Storage, sessionId: string): StopFlight[] {
   const flights: StopFlight[] = [];
   for (const key of keys(storage, stopPrefix(sessionId))) {
     const record = parse(storage, key);
-    if (record && typeof record.body?.requestId === "string") flights.push({ sessionId, key, at: Number(record.at) || 0, body: record.body });
+    if (record && typeof record.body?.requestId === "string") flights.push({ sessionId, key, at: Number(record.at) || 0, body: record.body, final: record.final === true });
     else persist(storage, sessionId, key, null);
   }
   return flights.sort((a, b) => a.at - b.at);
@@ -271,6 +328,12 @@ export function pendingAcks(storage: Storage, sessionId: string): { key: string;
 }
 /** 服务端已删除记录后移除待删除登记。 */
 export function clearAck(storage: Storage, sessionId: string, key: string): void { persist(storage, sessionId, key, null); }
+function registerAck(storage: Storage, sessionId: string, ids: string[]): void {
+  const prefix = ackPrefix(sessionId);
+  persist(storage, sessionId, prefix + suffix(nextAt(storage, prefix)), JSON.stringify({ sessionId, ids }));
+}
+/** 已放回但草稿只在页面内存中、暂不删除服务端副本的记录 id。 */
+export function deferredIds(sessionId: string): string[] { return [...(deferred.get(sessionId)?.ids ?? [])]; }
 
 /** 有停止在途请求或待删除登记的会话，网络恢复时逐个续取。 */
 export function sessionsWithServerWork(storage: Storage): string[] {
@@ -287,12 +350,14 @@ export function sessionsWithServerWork(storage: Storage): string[] {
 /**
  * 放回服务端交出的清出草稿：先交给该会话的输入框或待放回记录，再登记要在服务端删除的记录 id，最后删除对应的停止在途记录。
  * 三步在同一个同步步骤中完成，并且先登记后删除：其他标签页任何时刻都能看到在途记录或待删除登记之一，不会把同一条记录再放回一次。
+ * 草稿没能写入 localStorage、只在页面内存中时，服务端副本是唯一的持久副本：不登记删除，记入 deferred，
+ * 该会话的记录全部写入 localStorage 后才转为待删除登记。期间其他标签页或页面关闭后可能再放回一次，重复好过丢失。
  */
 export function settleServerDrafts(storage: Storage, sessionId: string, ids: string[], drafts: RestoredDraft[], message: string | null, flightKey?: string): void {
-  deliverRestored(storage, sessionId, drafts, message);
+  const durable = deliverRestored(storage, sessionId, drafts, message) !== "memory";
   if (ids.length) {
-    const prefix = ackPrefix(sessionId);
-    persist(storage, sessionId, prefix + suffix(nextAt(storage, prefix)), JSON.stringify({ sessionId, ids }));
+    if (durable) registerAck(storage, sessionId, ids);
+    else { const held = deferred.get(sessionId) ?? { storage, ids: new Set<string>() }; for (const id of ids) held.ids.add(id); deferred.set(sessionId, held); }
   }
   if (flightKey) { persist(storage, sessionId, flightKey, null); releaseStop(flightKey); }
 }

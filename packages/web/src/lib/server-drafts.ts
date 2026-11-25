@@ -5,7 +5,7 @@
 // 纯逻辑，Storage、Web Locks 和 HTTP 调用由调用方传入，可在 Node.js 中测试。
 import { normalize } from "./draft.ts";
 import {
-  FLIGHT_GRACE_MS, FLIGHT_HELD_RECHECK_MS, FLIGHT_STALE_MS, clearAck, encodeId, isLive, pendingAcks, settleServerDrafts, stopFlights,
+  FLIGHT_GRACE_MS, FLIGHT_HELD_RECHECK_MS, FLIGHT_STALE_MS, clearAck, deferredIds, encodeId, isLive, pendingAcks, settleServerDrafts, stopFlights,
   type RestoredDraft, type StopFlight,
 } from "./restored.ts";
 import type { PaneControlResult, PaneSavedDrafts, PaneSavedDraftsList } from "./types.ts";
@@ -24,8 +24,13 @@ export interface ServerDraftsDeps {
 export const ORPHAN_MS = 10 * 60_000;
 /** 网络或服务端暂时不可用时的重查间隔。 */
 export const UNAVAILABLE_RECHECK_MS = 5_000;
-/** 续取时服务端返回 pending（停止仍在执行）的重查间隔。 */
+/** 续取时服务端返回 pending（停止仍在执行）的重查间隔，删除记录返回 pending 时同样适用。 */
 export const PENDING_RECHECK_MS = 1_000;
+/**
+ * 在途请求只在发起后这段时间内用原请求体重新提交。服务端幂等记录在请求结束后至少保留 24 小时，这段时间内重新提交只会取回原结果；
+ * 超过后幂等记录可能已过期，重新提交会再执行一次，因此只按 requestId 读取服务端保存的记录。留 1 小时余量。
+ */
+export const REPLAY_MS = 23 * 3_600_000;
 
 export const RESTORED_MESSAGE: Record<PaneSavedDrafts["reason"], string> = {
   stop: "排队中的消息已放回输入框",
@@ -43,43 +48,59 @@ export function clearedDrafts(result: { clearedDrafts: PaneSavedDrafts["drafts"]
 }
 const savedDrafts = (record: PaneSavedDrafts): RestoredDraft[] => record.drafts.map((draft) => ({ nodes: normalize(draft.nodes), uncertain: draft.uncertain === true }));
 
-/** 稍后重试即可能成功的失败：网络中断、响应无法解析、需要重新配对、服务端内部错误或正在关闭、请求过多。 */
+const statusOf = (error: unknown) => (error as { status?: number }).status ?? 0;
+const codeOf = (error: unknown) => (error as { code?: string }).code ?? "";
+/** 读取或删除服务端记录时，稍后重试即可能成功的失败：网络中断、响应无法解析、需要重新配对、服务端内部错误或正在关闭、请求过多。 */
 function transient(error: unknown): boolean {
-  const { status = 0, code = "" } = error as { status?: number; code?: string };
+  const status = statusOf(error); const code = codeOf(error);
   return status === 0 || status >= 500 || status === 401 || status === 429 || code === "network" || code === "invalidResponse";
+}
+/**
+ * 重新提交停止或关闭时，请求没有到达幂等记录的失败：网络中断、响应无法解析、服务端正在关闭、请求过多（401 另行处理）。
+ * 其他失败都来自幂等记录，是这次请求的最终结果，包括缓存的服务端内部错误（例如清队列并保存后停止进程失败）。
+ */
+function replayUnreached(error: unknown): boolean {
+  const status = statusOf(error); const code = codeOf(error);
+  return status === 0 || status === 429 || code === "serverStopping" || code === "network" || code === "invalidResponse";
 }
 
 const draftsPath = (sessionId: string) => `/api/sessions/${encodeURIComponent(sessionId)}/drafts`;
 
+/** 下一次续取：delay 毫秒后执行；saved 为 true 时还要读取服务端保存的记录。 */
+export interface RecoveryNext { delay: number; saved: boolean }
+
 /**
  * 续取并放回该会话的服务端草稿，在标签页之间用 Web Lock 串行。依次：
  * 1. 请服务端删除已放回的记录；
- * 2. 续取已无页面等待的停止、关闭在途请求：用原请求体重新提交，得到结果后放回；请求已确定结束而没有结果时
- *    （服务端重启后幂等记录已不在，或请求被拒绝），按 requestId 读取服务端保存的记录；
- * 3. saved 为 true 时读取服务端保存的其他记录并放回：跳过本浏览器仍有在途请求或待删除登记的记录，
- *    由停止或关闭请求产生的记录超过 ORPHAN_MS 才取回。
- * 返回还需多少毫秒后再检查，没有则为 null。
+ * 2. 续取已无页面等待的停止、关闭在途请求：在 REPLAY_MS 内且请求未确定结束时用原请求体重新提交，得到结果后放回；
+ *    请求已确定结束而没有结果时（被拒绝、服务端重启后幂等记录已不在、缓存了失败），或超过 REPLAY_MS，按 requestId 读取服务端保存的记录；
+ * 3. saved 为 true 时读取服务端保存的其他记录并放回：跳过本浏览器仍有在途请求或待删除登记、以及本页面暂不删除的记录，
+ *    由停止或关闭请求产生的记录超过 ORPHAN_MS 才取回，未到期时安排到期后再读。
+ * 返回下一次续取的时间和是否需要再读取记录，没有则为 null。需要重新配对时返回 null，连接建立后由调用方重新续取。
  */
-export async function recoverServerDrafts(deps: ServerDraftsDeps, sessionId: string, saved: boolean): Promise<number | null> {
+export async function recoverServerDrafts(deps: ServerDraftsDeps, sessionId: string, saved: boolean): Promise<RecoveryNext | null> {
   const run = () => recoverLocked(deps, sessionId, saved);
   return deps.locks ? deps.locks.request(`pi-pane.serverdrafts.${encodeId(sessionId)}`, run) : run();
 }
 
-async function recoverLocked(deps: ServerDraftsDeps, sessionId: string, saved: boolean): Promise<number | null> {
+async function recoverLocked(deps: ServerDraftsDeps, sessionId: string, saved: boolean): Promise<RecoveryNext | null> {
   const { storage, locks, call } = deps; const now = deps.now ?? Date.now;
-  let recheck: number | null = null; let unauthorized = false;
-  const later = (ms: number) => { recheck = Math.min(recheck ?? ms, ms); };
-  // 需要重新配对时不再定时重试，配对后连接建立时重新续取（session.ts 的 recoverAllDrafts）。
-  const unavailable = (error: unknown) => { if ((error as { status?: number }).status === 401) unauthorized = true; else later(UNAVAILABLE_RECHECK_MS); };
+  let next: RecoveryNext | null = null; let unauthorized = false;
+  const later = (ms: number, list = false) => { next = { delay: Math.min(next?.delay ?? ms, ms), saved: (next?.saved ?? false) || list }; };
+  const unavailable = (error: unknown, list = false) => { if (statusOf(error) === 401) unauthorized = true; else later(UNAVAILABLE_RECHECK_MS, list); };
 
   const acknowledge = async () => {
     for (const { key, ids } of pendingAcks(storage, sessionId)) {
-      try { await call(draftsPath(sessionId), { requestId: deps.newId(), remove: ids }); clearAck(storage, sessionId, key); }
+      let result: { status?: string } | undefined;
+      try { result = await call<{ status?: string }>(draftsPath(sessionId), { requestId: deps.newId(), remove: ids }); }
       catch (error) {
         if (transient(error)) { unavailable(error); return; }
         // 请求被拒绝时重试也不会成功；记录留在服务端，到期后由服务端清理。
-        clearAck(storage, sessionId, key);
+        clearAck(storage, sessionId, key); continue;
       }
+      // 删除超过服务端的等待期限时返回 pending，记录可能仍在：保留登记，稍后再删一次（删除不存在的记录也成功）。
+      if (result?.status === "pending") { later(PENDING_RECHECK_MS); return; }
+      clearAck(storage, sessionId, key);
     }
   };
   let records: PaneSavedDrafts[] | undefined;
@@ -88,26 +109,31 @@ async function recoverLocked(deps: ServerDraftsDeps, sessionId: string, saved: b
   const resume = async (flight: StopFlight) => {
     // 等待锁期间记录可能已被其他页面取走。
     if (!stopFlights(storage, sessionId).some((item) => item.key === flight.key)) return;
-    let result: PaneControlResult;
-    try { result = await call<PaneControlResult>(`/api/sessions/${encodeURIComponent(sessionId)}/control`, flight.body); }
-    catch (error) {
-      if (transient(error)) { unavailable(error); return; }
-      let record: PaneSavedDrafts | undefined;
-      try { record = (await list()).find((item) => item.id === flight.body.requestId); }
-      catch (error) { unavailable(error); return; }
-      settleServerDrafts(storage, sessionId, record ? [record.id] : [], record ? savedDrafts(record) : [], record ? RESTORED_MESSAGE[record.reason] : null, flight.key);
-      return;
+    if (!flight.final && now() - flight.at < REPLAY_MS) {
+      let result: PaneControlResult | undefined;
+      try { result = await call<PaneControlResult>(`/api/sessions/${encodeURIComponent(sessionId)}/control`, flight.body); }
+      catch (error) {
+        if (statusOf(error) === 401) { unauthorized = true; return; }
+        if (replayUnreached(error)) { later(UNAVAILABLE_RECHECK_MS); return; }
+      }
+      if (result?.status === "pending") { later(PENDING_RECHECK_MS); return; }
+      if (result) {
+        const drafts = result.status === "done" ? clearedDrafts(result) : [];
+        settleServerDrafts(storage, sessionId, drafts.length ? [flight.body.requestId] : [], drafts, RESTORED_MESSAGE.stop, flight.key);
+        return;
+      }
     }
-    if (result.status === "pending") { later(PENDING_RECHECK_MS); return; }
-    const drafts = result.status === "done" ? clearedDrafts(result) : [];
-    settleServerDrafts(storage, sessionId, drafts.length ? [flight.body.requestId] : [], drafts, RESTORED_MESSAGE.stop, flight.key);
+    let record: PaneSavedDrafts | undefined;
+    try { record = (await list()).find((item) => item.id === flight.body.requestId); }
+    catch (error) { unavailable(error); return; }
+    settleServerDrafts(storage, sessionId, record ? [record.id] : [], record ? savedDrafts(record) : [], record ? RESTORED_MESSAGE[record.reason] : null, flight.key);
   };
 
   await acknowledge();
-  const flights = stopFlights(storage, sessionId);
-  for (const flight of flights) {
+  for (const flight of stopFlights(storage, sessionId)) {
     if (isLive(flight.key)) continue;
-    const wait = (locks ? FLIGHT_GRACE_MS : FLIGHT_STALE_MS) - (now() - flight.at);
+    // 已确定结束的请求不再重新提交，没有其他页面需要等待，不设保护期。
+    const wait = flight.final ? 0 : (locks ? FLIGHT_GRACE_MS : FLIGHT_STALE_MS) - (now() - flight.at);
     if (wait > 0) { later(wait); continue; }
     // 持有该记录的锁时续取。发起的页面仍在等待、或刷新时旧页面尚未释放锁时拿不到锁，稍后重查。
     if (locks) await locks.request(flight.key, { ifAvailable: true }, async (lock) => { if (lock) await resume(flight); else later(FLIGHT_HELD_RECHECK_MS); });
@@ -115,14 +141,21 @@ async function recoverLocked(deps: ServerDraftsDeps, sessionId: string, saved: b
   }
   if (saved) {
     try {
-      const skip = new Set([...stopFlights(storage, sessionId).map((flight) => flight.body.requestId), ...pendingAcks(storage, sessionId).flatMap((ack) => ack.ids)]);
+      const skip = new Set([
+        ...stopFlights(storage, sessionId).map((flight) => flight.body.requestId),
+        ...pendingAcks(storage, sessionId).flatMap((ack) => ack.ids),
+        ...deferredIds(sessionId),
+      ]);
       for (const record of await list()) {
         if (skip.has(record.id)) continue;
-        if ((record.reason === "stop" || record.reason === "close") && now() - Date.parse(record.at) < ORPHAN_MS) continue;
+        if (record.reason === "stop" || record.reason === "close") {
+          const age = now() - Date.parse(record.at);
+          if (age < ORPHAN_MS) { later(ORPHAN_MS - age, true); continue; }
+        }
         settleServerDrafts(storage, sessionId, [record.id], savedDrafts(record), RESTORED_MESSAGE[record.reason]);
       }
-    } catch (error) { if (transient(error)) unavailable(error); }
+    } catch (error) { if (transient(error)) unavailable(error, true); }
   }
   await acknowledge();
-  return unauthorized ? null : recheck;
+  return unauthorized ? null : next;
 }

@@ -1,8 +1,8 @@
 // 当前打开的会话：取快照、订阅事件、发送控制命令、处理冲突与会话替换。
 import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
-import { beginStop, releaseStop, sessionsWithServerWork, settleServerDrafts, type StopFlight } from "./restored.ts";
-import { clearedDrafts, recoverServerDrafts, RESTORED_MESSAGE, UNAVAILABLE_RECHECK_MS } from "./server-drafts.ts";
+import { beginStop, finalizeStop, releaseStop, sessionsWithServerWork, settleServerDrafts, type StopFlight } from "./restored.ts";
+import { clearedDrafts, recoverServerDrafts, RESTORED_MESSAGE, UNAVAILABLE_RECHECK_MS, type RecoveryNext } from "./server-drafts.ts";
 import { ResponseOrder } from "./response-order.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
@@ -332,13 +332,14 @@ async function runRecovery(sessionId: string): Promise<void> {
   const state = recovery.get(sessionId)!;
   state.timer = undefined; state.running = true; state.due = Infinity;
   const saved = state.saved; state.saved = false;
-  let wait: number | null;
-  try { wait = await recoverServerDrafts(serverDraftsDeps(), sessionId, saved); }
-  catch { wait = UNAVAILABLE_RECHECK_MS; }
+  let next: RecoveryNext | null;
+  try { next = await recoverServerDrafts(serverDraftsDeps(), sessionId, saved); }
+  catch { next = { delay: UNAVAILABLE_RECHECK_MS, saved }; }
   state.running = false;
   const requested = state.due; state.due = Infinity;
+  // 运行期间的新请求带来的 saved 仍在 state.saved 中，由下面的调度合并。
   if (requested !== Infinity) recoverDrafts(sessionId, false, Math.max(0, requested - Date.now()));
-  if (wait !== null) recoverDrafts(sessionId, false, wait);
+  if (next) recoverDrafts(sessionId, next.saved, next.delay);
   if (!state.timer) recovery.delete(sessionId);
 }
 /** 连接建立或恢复时，续取当前会话和本浏览器有未完成停止、关闭请求或待删除登记的会话。 */
@@ -350,6 +351,8 @@ export function recoverAllDrafts(): void {
 /**
  * 发送停止或关闭。请求体先存为该会话的在途请求（restored.ts），得到结果后把清出的草稿放回所属会话的输入框，
  * 并请服务端删除它保存的副本；结果未知时保留在途请求，由 recoverDrafts 用同一 requestId 续取。
+ * 服务端明确拒绝（如 409 holdsConfirmation、revisionChanged）时请求确定没有执行，在途请求标为已结束，
+ * 续取只核对服务端记录、不再重新提交，用户取消的关闭不会在之后被执行。
  */
 async function clearing(sessionId: string, command: Extract<PaneControlCommand, { type: "stop" | "close" }>): Promise<ControlOutcome> {
   let flight: StopFlight | undefined;
@@ -358,7 +361,8 @@ async function clearing(sessionId: string, command: Extract<PaneControlCommand, 
   if (outcome.ok) {
     const drafts = outcome.result.status === "done" ? clearedDrafts(outcome.result) : [];
     settleServerDrafts(localStorage, sessionId, drafts.length ? [flight.body.requestId] : [], drafts, RESTORED_MESSAGE.stop, flight.key);
-  } else releaseStop(flight.key);
+  } else if (outcomeUnknown(outcome.error)) releaseStop(flight.key);
+  else finalizeStop(localStorage, flight);
   recoverDrafts(sessionId);
   return outcome;
 }

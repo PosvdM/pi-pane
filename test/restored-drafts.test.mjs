@@ -25,11 +25,12 @@ const sure = (nodes) => ({ nodes, uncertain: false });
 const unsure = (nodes) => ({ nodes, uncertain: true });
 const batchKeys = (storage, id) => [...storage.items.keys()].filter((key) => key.startsWith(batchPrefix(id)));
 const flightKeys = (storage, id) => [...storage.items.keys()].filter((key) => key.startsWith(flightPrefix(id)));
-/** 模拟输入框：deliver 把草稿放在现有内容之前，received 记录每次放回的草稿，messages 记录通知。 */
+/** 模拟输入框：deliver 把草稿放在现有内容之前，received 记录每次放回的草稿，messages 记录通知。onDeliver 返回 false 表示没有写入 localStorage。 */
 function composer(onDeliver) {
-  const box = { content: [], received: [], messages: [] };
+  const box = { content: [], received: [], messages: [], mirrored: [] };
   box.handle = {
-    deliver: (drafts, message) => { onDeliver?.(drafts); box.received.push(drafts); box.messages.push(message); box.content = prependDrafts(drafts.map((d) => d.nodes), box.content); },
+    deliver: (drafts, message) => { const saved = onDeliver?.(drafts); box.received.push(drafts); box.messages.push(message); box.content = prependDrafts(drafts.map((d) => d.nodes), box.content); return saved !== false; },
+    mirror: (drafts) => { box.mirrored.push(drafts); },
   };
   return box;
 }
@@ -303,4 +304,24 @@ test("#17 在途提交：刷新时旧页面尚未释放锁的过期记录稍后�
   assert.deepEqual(a.received, [[unsure(text("刷新前在途"))]]);
   assert.equal(storage.getItem(key), null);
   detach();
+});
+
+test("同一会话在多个标签页挂载输入框时，一页放回的草稿经 BroadcastChannel 加到其他标签页的输入框", async () => {
+  const storage = new MemoryStorage(); const box = composer(); const detach = attachComposer("广", box.handle);
+  // peer 代表另一个标签页的频道。
+  const peer = new BroadcastChannel("pi-pane.restored"); const heard = [];
+  peer.onmessage = (event) => heard.push(event.data);
+  try {
+    assert.equal(deliverRestored(storage, "广", [sure(text("放回"))]), "composer");
+    deliverRestored(storage, "广", [unsure(image("x"))]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(heard, [{ sessionId: "广", drafts: [sure(text("放回"))] }, { sessionId: "广", drafts: [unsure(image("x"))] }], "放进本页输入框后通知其他标签页");
+    // 其他标签页放回时：本页挂载着同一会话的输入框收到同样的草稿，其他会话不受影响，格式不符的消息忽略。
+    peer.postMessage({ sessionId: "其他", drafts: [sure(text("别的会话"))] });
+    peer.postMessage({ sessionId: "广", drafts: "坏" });
+    peer.postMessage({ sessionId: "广", drafts: [sure(text("另一页放回"))] });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(box.mirrored, [[sure(text("另一页放回"))]]);
+    assert.equal(box.received.length, 2, "收到的通知不算本页放回");
+  } finally { peer.close(); detach(); }
 });
