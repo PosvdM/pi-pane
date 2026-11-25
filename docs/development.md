@@ -104,7 +104,7 @@
 
 `test/fixtures/fake-provider.ts` 的 `waitForFile` 片段等待指定文件出现，并响应取消信号；日志中的 `waiting` 记录表示模型已进入门闩。浏览器回归通过临时现场中的文件解除门闩，控制当前回合的结束时机，避免用固定延迟猜测排队窗口。
 
-`test/fixtures/ui-plugin/` 是插件界面测试用的插件（id `uitest`，显示名称“测试插件”），与服务端同进程加载，测试通过 `globalThis.__uiPlugin` 增删节点、推送会话事件、发布表单和横幅、发送通知、让取快照失败或让动作超时。以 `startServer(fixture, { plugins: [<该目录>] })` 加载。`test/fixtures/ui-plugin-2/`（id `uitest2`）是第二个插件，节点挂在 `uitest` 的节点下、侧栏面板与 `uitest` 同名，用于跨来源的树和按来源区分的面板，测试通过 `globalThis.__uiPlugin2` 推送面板变化。
+`test/fixtures/ui-plugin/` 是插件界面测试用的插件（id `uitest`，显示名称“测试插件”），与服务端同进程加载，测试通过 `globalThis.__uiPlugin` 增删节点、推送会话事件、发布表单和横幅、发送通知、让取快照失败或让动作超时。以 `startServer(fixture, { plugins: [<该目录>] })` 加载。`test/fixtures/ui-plugin-2/`（id `uitest2`）是第二个插件，节点挂在 `uitest` 的节点下、侧栏面板与 `uitest` 同名，另有一个资源节点及其节点面板，用于跨来源的树、按来源区分的面板和资源节点的点击，测试通过 `globalThis.__uiPlugin2` 推送面板变化。
 
 构建后可执行：
 
@@ -239,19 +239,19 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 
 ## M3 插件界面自动化验收
 
-`test/web-e2e-plugins.test.mjs` 和 `test/web-e2e-plugins-2.test.mjs` 在真实 Chrome 中加载 `test/fixtures/ui-plugin/`（后者的部分用例另加载 `ui-plugin-2/`），覆盖原型 README 的界面项。与 pi-agora 的浏览器联调测试在 pi-agora 仓库，CI 检出 pi-pane 的固定提交。
+`test/web-e2e-plugins.test.mjs`、`test/web-e2e-plugins-2.test.mjs` 和 `test/web-e2e-plugins-3.test.mjs` 在真实 Chrome 中加载 `test/fixtures/ui-plugin/`（后两个文件的部分用例另加载 `ui-plugin-2/`），覆盖原型 README 的界面项。与 pi-agora 的浏览器联调测试在 pi-agora 仓库，CI 检出 pi-pane 的固定提交。
 
 | 验收项 | 测试文件与断言 |
 | --- | --- |
-| 会话树与按需加载 | `web-e2e-plugins`：插件根节点按 `displayName` 分组，冷历史只显示“历史（N）”，展开后分页加载；插件节点挂在主会话下，主会话显示子节点数；`web-e2e-plugins-2`：另一个插件的节点挂在插件节点下，两个来源的冷节点合计为“历史（N）”并一次展开，数目未知时显示“历史”，父节点不存在的节点进入“未归属”；`web-logic`：修订号、tombstone、分页不覆盖较新的订阅内容、冷节点在父节点完整加载后才显示、reset 期间分页作废、跨来源历史数各自扣除、“未归属”与循环 |
+| 会话树与按需加载 | `web-e2e-plugins`：插件根节点按 `displayName` 分组，冷历史只显示“历史（N）”，展开后分页加载；插件节点挂在主会话下，主会话显示子节点数；`web-e2e-plugins-2`：另一个插件的节点挂在插件节点下，两个来源的冷节点合计为“历史（N）”并一次展开，数目未知时显示“历史”，父节点不存在的节点进入“未归属”；`web-e2e-plugins-3`：点击分组展开或折叠并打开适用的节点面板，点击资源打开适用的面板，空主会话显示“（空会话）”；`web-logic`：修订号、tombstone、分页不覆盖较新的订阅内容、冷节点在父节点完整加载后才显示、reset 期间分页作废、跨来源历史数各自扣除、“未归属”与循环 |
 | 侧栏由服务端推送驱动（#20、#21） | `web-e2e-conversation`：新会话首轮在跟随打开前结束，侧栏仍列出该会话；侧栏不再发起 `GET /api/sessions` 的并发刷新，#21 的请求排序状态随之删除；`sessions-catalog-scan`：逆序完成的目录扫描不回退已提交的目录（#18）；`plugins-main-tree`：会话节点按修改时间排序并附带 `paneSession` |
-| 插件会话视图 | `web-e2e-plugins`：面包屑、节点面板、`send` 发送、停止后清出的文字回到输入框、`composer` 动作（插话）、接管后变为只读、工具卡片“打开 <节点>”链接、从面包屑回到主会话；`web-e2e-plugins-2`：等待中的任务声明了 `abort` 时提供停止，会话视图已报告结束时不提供，标题栏最多 3 个动作、其余在“⋯”菜单，输入框提交即清空、被拒或放弃后续表单时放回、等待期间新写的文字保留、切换节点后文字仍在、处理中留下“查询结果”且查到没有执行时放回，旧节点的重载挂起时新节点的事件照常显示 |
+| 插件会话视图 | `web-e2e-plugins`：面包屑、节点面板、`send` 发送、停止后清出的文字回到输入框、`composer` 动作（插话）、接管后变为只读、工具卡片“打开 <节点>”链接、从面包屑回到主会话；`web-e2e-plugins-2`：等待中的任务声明了 `abort` 时提供停止，会话视图已报告结束时不提供，标题栏最多 3 个动作、其余在“⋯”菜单，输入框提交即清空、被拒或放弃后续表单时放回、等待期间新写的文字保留、切换节点后文字仍在、处理中留下“查询结果”且查到没有执行时放回，旧节点的重载挂起时新节点的事件照常显示；`web-e2e-plugins-3`：插件只通过树节点改 `send` 能力时输入框随之出现或消失，`pane_status` 的说明显示在状态栏，带 `confirm` 的动作使用应用内确认框 |
 | resync 后取快照失败时重试 | `web-e2e-plugins`：插件连续两次取快照失败时显示“正在重试”，恢复后续订并收到新条目 |
 | 动作与附带表单 | `web-e2e-plugins`：节点动作先取表单再带答案调用，必填校验，`origin` 来自浏览器；右键菜单列出节点动作；全局动作超时显示“结果未知”，“查询结果”沿用同一幂等键并得到最终结果 |
-| 待处理区与持久表单 | `web-e2e-plugins`：总数角标、节点上的待处理标记与会话视图顶部的“处理”入口，“稍后处理”保留表单，提交后表单移除；两个标签页提交同一 revision，只有一个生效，另一个显示“已在别处处理”；`web-e2e-plugins-2`：断线期间被移除的表单在重连对齐后关闭弹窗 |
+| 待处理区与持久表单 | `web-e2e-plugins`：总数角标、节点上的待处理标记与会话视图顶部的“处理”入口，“稍后处理”保留表单，提交后表单移除；两个标签页提交同一 revision，只有一个生效，另一个显示“已在别处处理”；`web-e2e-plugins-2`：断线期间被移除的表单在重连对齐后关闭弹窗；`web-e2e-plugins-3`：“查询结果”查到已处理时关闭弹窗，提交在途时关闭再打开只显示进度 |
 | 用户在场确认 | `web-e2e-plugins`：提交触发确认，确认框显示倒计时，签名后插件接受；拒绝时插件返回失败并保留表单；`web-e2e-plugins-2`：另一个标签页重置设备密钥后签名仍生效，不能签名的浏览器直接以 `unsupported` 结束 |
 | 横幅与通知 | `web-e2e-plugins`：按级别排序、同 id 更新保持位置、横幅动作；停用插件后 persistent 横幅保留并标为来源不可用、动作不可用，非 persistent 横幅和插件节点移除；同 id 通知只显示一次；`web-e2e-plugins-2`：超过 3 条横幅时只显示前 2 条和“另有 N 条横幅”，自动消失的通知最多 5 条，error 和 sticky 留到手动关闭 |
-| 面板与布局 | `web-e2e-plugins`：侧栏面板角标随 `panelChanged` 更新，分组节点从右键菜单查看详情，未知面板类型显示“此面板需要更新的 pi-pane”；`web-e2e-plugins-2`：同名侧栏面板按来源分别更新角标，切换面板时新内容到达前不显示旧行，主会话显示 `sources` 含 `pane` 的节点面板，“详情”开关刷新后保持，窄屏为抽屉，侧栏宽度限制在 240–480px |
+| 面板与布局 | `web-e2e-plugins`：侧栏面板角标随 `panelChanged` 更新，分组节点从右键菜单查看详情，未知面板类型显示“此面板需要更新的 pi-pane”；`web-e2e-plugins-2`：同名侧栏面板按来源分别更新角标，切换面板时新内容到达前不显示旧行，主会话显示 `sources` 含 `pane` 的节点面板，“详情”开关刷新后保持，窄屏为抽屉，侧栏宽度限制在 240–480px；`web-e2e-plugins-3`：没有横幅的插件停用后树和侧栏面板移除 |
 
 ## M3 服务端自动化验收
 
@@ -265,7 +265,7 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 | 只读子会话、面板与渲染目录 | `plugins-http`：快照、流、面板与静态动作目录；`plugins-host`：会话图片提取、来源隔离、渲染器冲突按配置顺序选择、停用清理和退订后的迟到回调隔离。 |
 | 动作、发送和表单幂等 | `plugins-operations`：共享键命名空间、内容冲突、并发 pending、返回 pending 后查询、真正迟到的最终结果、24 小时保留、容量限制与原样来源传递；`plugins-http`：浏览器同键重试，真实确认超时后以原键再次确认并完成。 |
 | 持久表单与待处理区 | `plugins-operations`：排序、revision、权威对齐和并发事件、双标签页 claim、失败释放、cancel、过期由插件裁定；`plugins-http`：两标签页提交仅一次接受，`formRemoved` 包含来源，浏览器重连/tree reset 对齐、并发查询合并及异常隔离。 |
-| 用户在场确认 | `plugins-presence`：凭证与连接绑定、origin 优先与广播回退、首个有效回应、连接断开、严格 JSON、超时/拒绝/停用关闭帧；`plugins-http`：真实 HTTP/WS 路由，其他连接不能结束挑战。 |
+| 用户在场确认 | `plugins-presence`：凭证与连接绑定、origin 优先与广播回退、首个有效回应、设备不符的回应通知该连接并重发确认、连接断开、严格 JSON、超时/拒绝/停用关闭帧；`plugins-http`：真实 HTTP/WS 路由，其他连接不能结束挑战。 |
 | 保活与主动关闭 | `plugins-holds`：仅列托管、读取历史、预登记 hold、多重 hold、空闲回收、关闭二次确认、旧 release 空操作、进程切换不迁移 hold；`plugins-host`：失败和停用释放插件资源。 |
 | 横幅故障 | `plugins-banners`：原子写、重启、加载失败/停用保留 persistent 并标注不可用、来源恢复后 listBanners 与显式清除、配置移除二次确认/审计、I/O 失败保留旧状态；`plugins-http`：新连接重发、停用和重启、禁止删除仍配置来源。 |
 | 通知、鉴权与关闭门禁 | `plugins-host`：通知按来源去重；`plugins-http`：所有读写使用浏览器凭证；`shutdown-ingress`：插件全路由统一拒绝关闭后的请求，multipart 解析前不插入无关异步路由；`backpressure`：同名不同来源的增量与 resync 隔离。 |

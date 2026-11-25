@@ -384,6 +384,7 @@ type ServerMessage =
   | { type: "project_trust_resolved"; id: string }
   | { type: "form"; form: FormSpec }
   | { type: "formsAligned" }                      // 连接建立后重发的表单到此为止
+  | { type: "plugins"; source: string; active: boolean } // 插件启用或变为不可用，浏览器重读插件列表、目录和树
   | { type: "formRemoved"; source: string; formId: string; reason: FormRemovedReason }
   | { type: "presence"; request: { id: string; title: string; summary: string; payload: unknown; source: string; expiresAt?: string } }
   | { type: "presenceClosed"; id: string; reason: "confirmed" | "cancelled" | "timeout" }
@@ -502,8 +503,9 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 - 会话订阅帧为 `{ type: "subscribe", ref, after: StreamCursor }`，取消帧为 `{ type: "unsubscribe", ref }`；`ref.source` 可以是 `pane` 或已启用的插件。每个连接以完整的 `(source, id)` 隔离订阅和慢客户端重同步，插件同名会话不会覆盖主会话。
 - 插件树订阅帧为 `{ type: "treeSubscribe", source, after: TreeCursor }`，取消帧为 `{ type: "treeUnsubscribe", source }`。插件负责快照切点和重放边界，服务端转发 `tree` 变更；浏览器按 [树同步规则](plugin-api.md#同步) 合并分页、修订号和 tombstone。
 - 插件的同步订阅异常通过现有 `notification` 错误消息报告，只影响该插件的订阅，不关闭承载主会话的共享连接。
-- 设备注册帧为 `{ type: "device", device: PresenceDevice }`，浏览器在每次连接建立和重置设备密钥后发送。同一浏览器的标签页共用 IndexedDB 中的密钥：一个标签页重置后经 BroadcastChannel 通知其他标签页重新登记；回应确认前，签名用的密钥与本连接登记的设备不同时，先在同一连接上重新登记再发送回应。浏览器不能签名（不支持 WebCrypto 或 IndexedDB）时收到确认帧即以 `unsupported` 回应，不等用户操作；确认回应帧为 `{ type: "presenceResponse", id, response: { proof?: UserPresenceProof, error?: "rejected" | "unsupported" } }`。设备字段只用于显示和路由，不能替代插件后台的验签。
-- M3 的 v1 兼容扩展包括 `formRemoved.source`、`panel.source`、`formsAligned` 和 `presenceClosed`。浏览器按 `(source, formId)` 识别持久表单，按 `(source, panelId)` 识别面板的修订号和角标；收到 `presenceClosed` 后关闭同一 `id` 的确认框。确认帧的 `expiresAt` 只用于显示倒计时，到期由服务端裁定。`confirmed` 表示已有标签页确认，`cancelled` 表示拒绝、取消或来源停用，`timeout` 表示到期。
+- 设备注册帧为 `{ type: "device", device: PresenceDevice }`，浏览器在每次连接建立和重置设备密钥后发送。同一浏览器的标签页共用 IndexedDB 中的密钥：一个标签页重置后经 BroadcastChannel 通知其他标签页重新登记；回应确认前，签名用的密钥与本连接登记的设备不同（含连接刚建立、`device` 帧还没发出）时，先在同一连接上重新登记再发送回应。服务端收到签名设备与本连接登记的设备不符的回应时不结束确认，向该连接发“确认未生效”的通知并重发同一确认，让用户再确认一次。浏览器不能签名（不支持 WebCrypto 或 IndexedDB）时收到确认帧即以 `unsupported` 回应，不等用户操作；确认回应帧为 `{ type: "presenceResponse", id, response: { proof?: UserPresenceProof, error?: "rejected" | "unsupported" } }`。设备字段只用于显示和路由，不能替代插件后台的验签。
+- 插件启用（含重新启用）或变为不可用时服务端广播 `plugins`。浏览器据此重读插件列表、各插件目录和树，并丢掉该插件的面板修订号（插件重启后修订号可能从小值重新开始）；没有横幅的插件停用时界面也随之刷新。每次连接建立时浏览器同样丢掉全部面板修订号。
+- M3 的 v1 兼容扩展包括 `formRemoved.source`、`panel.source`、`formsAligned`、`plugins` 和 `presenceClosed`。浏览器按 `(source, formId)` 识别持久表单，按 `(source, panelId)` 识别面板的修订号和角标；收到 `presenceClosed` 后关闭同一 `id` 的确认框。确认帧的 `expiresAt` 只用于显示倒计时，到期由服务端裁定。`confirmed` 表示已有标签页确认，`cancelled` 表示拒绝、取消或来源停用，`timeout` 表示到期。
 
 ### 其他规则
 
@@ -598,10 +600,10 @@ Agent（主代理和子代理）与用户是同一个操作系统用户，在同
 | --- | --- |
 | `lib/tree-state.ts`、`lib/tree.ts` | 每个来源一棵树：快照、订阅、分页按修订号和 tombstone 合并；冷节点只在父节点完整加载后显示；收到 reset 到新快照之间、或快照重建后，发出较早的分页结果作废；取快照失败时按 1 秒起、最长 10 秒的退避间隔重试。父节点可以属于其他来源（主会话或另一个插件），挂在未加载节点下的插件节点触发该来源的快照重取，仍找不到父节点或形成循环时归入“未归属”。“历史（N）”中同一来源的部分按父节点的 `childCount`（随推送更新）扣除已加载的子节点，其他来源的部分按各来源快照的 `foreignChildCounts` 只扣除该来源经快照或分页取到的子节点；`hasChildren` 为 true 而没有 `childCount` 时显示不带数字的“历史” |
 | `lib/plugins.ts` | `GET /api/plugins` 与各插件的静态目录（动作、面板、自定义消息渲染器），每次连接建立和横幅的来源可用性变化时重读 |
-| `lib/plugin-ui.ts` | 持久表单（含重连后的对齐）、横幅、通知、在场确认队列与设备登记、按 `(source, panelId)` 记录的面板修订号；动作与表单的提交、幂等键，处理中和结果未知的操作留下“查询结果” |
+| `lib/plugin-ui.ts` | 持久表单（含重连后的对齐）、横幅、通知、在场确认队列与设备登记、按 `(source, panelId)` 记录的面板修订号（另按节点记录，相邻两次更新指向不同节点时都刷新）；动作与表单的提交、幂等键，处理中和结果未知的操作留下“查询结果”。持久表单从发出提交起记为进行中，关闭弹窗再打开只显示进度和“查询结果”，不能用新的幂等键再交一次；查询到已处理时关闭弹窗。动作的 `confirm` 使用应用内确认框，不用会阻塞页面的 `window.confirm()` |
 | `lib/plugin-state.ts` | 不依赖 DOM 的界面规则：通知保留（自动消失的最多 5 条，error 和 sticky 不被挤掉；info 5 秒、warning 8 秒）、横幅排序与折叠、标题栏动作上限、侧栏宽度范围、输入框文字放回 |
-| `lib/plugin-session.ts` | 打开的插件节点：按 `open` 取快照、按 `subscribe` 订阅，`resync` 后重取；取快照失败时按 1 秒起、最长 10 秒的退避间隔重试。每次打开对应一个控制对象，旧节点的请求返回后不作用于之后打开的节点 |
-| `components/Sidebar.tsx` | 待处理区、合并后的会话树、“＋”菜单、节点右键菜单、侧栏面板、拖动调整宽度（240–480px，保存在 localStorage） |
+| `lib/plugin-session.ts` | 打开的插件节点：按 `open` 取快照、按 `subscribe` 订阅，`resync` 后重取；取快照失败时按 1 秒起、最长 10 秒的退避间隔重试。每次打开对应一个控制对象，旧节点的请求返回后不作用于之后打开的节点。节点的 `send` 能力变化时重取快照，插件只通过树节点改能力、不推 `pane_status` 时只读状态也随之更新 |
+| `components/Sidebar.tsx` | 待处理区、合并后的会话树、“＋”菜单、节点右键菜单、侧栏面板、拖动调整宽度（240–480px，保存在 localStorage）。点击会话打开会话视图；点击分组展开或折叠，有适用的节点面板时同时打开；点击资源打开适用的面板。没有名称和首条用户文本的主会话显示“（空会话）” |
 | `components/PluginSession.tsx` | 插件会话视图：面包屑、标题栏动作（最多 3 个，其余在“⋯”菜单）、输入框或只读条、停止（节点声明 `abort` 且会话没有结束时提供，含排队中的任务）。输入框的文字按节点保存在本标签页内存中，提交即清空，确定没有执行或浏览器侧结果未知时放回到期间新写的内容之前；插件返回处理中时不放回，之后查询到没有执行再放回 |
 | `components/Panels.tsx` | 面板内容的内置渲染；节点面板（插件节点和主会话共用）；“详情”开关按浏览器记住，视口小于 1100px 时面板是从右侧滑出的抽屉 |
 | `components/PluginDialogs.tsx` | 表单弹窗、在场确认弹窗、页面顶部横幅（默认紧凑，超过 3 条时只显示前 2 条和“另有 N 条横幅”）、右上角通知与待查询的操作 |
