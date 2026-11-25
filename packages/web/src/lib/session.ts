@@ -1,7 +1,8 @@
 // 当前打开的会话：取快照、订阅事件、发送控制命令、处理冲突与会话替换。
 import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
-import { deliverRestored } from "./restored.ts";
+import { beginStop, releaseStop, sessionsWithServerWork, settleServerDrafts, type StopFlight } from "./restored.ts";
+import { clearedDrafts, recoverServerDrafts, RESTORED_MESSAGE, UNAVAILABLE_RECHECK_MS } from "./server-drafts.ts";
 import { ResponseOrder } from "./response-order.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
@@ -249,12 +250,16 @@ export function outcomeUnknown(error: ApiError): boolean {
   return ["network", "invalidResponse", "rpcResultUnknown", "unknown", "navigated"].includes(cause.code) || cause.status >= 500;
 }
 
-/** 发送一条控制命令。等待到期返回 pending 时，用同一 requestId 和同一内容重复提交，直到得到最终结果。 */
-export async function control(command: PaneControlCommand, draft?: DraftNode[]): Promise<ControlOutcome> {
+/**
+ * 发送一条控制命令。等待到期返回 pending 时，用同一 requestId 和同一内容重复提交，直到得到最终结果。
+ * onBody 在第一次提交之前收到完整请求体。
+ */
+export async function control(command: PaneControlCommand, draft?: DraftNode[], onBody?: (body: { requestId: string } & Record<string, unknown>) => void): Promise<ControlOutcome> {
   const state = current.get(); const model = state?.model;
   if (!state || !model) return { ok: false, error: new ApiError(0, "noSession", "没有打开的会话") };
   const id = state.id; const mine = nav;
   const body = { requestId: newId(), expectedEpoch: model.view.cursor.epoch, expectedRevision: model.view.controlRevision ?? 0, command, ...(draft ? { draft } : {}) };
+  onBody?.(body);
   const switching = ["new_session", "fork", "clone"].includes(command.type) || (!model.view.hosted && ["prompt", "steer", "follow_up"].includes(command.type));
   if (switching) { followUntil = Number.MAX_SAFE_INTEGER; followNav = mine; }
   const giveUp = Date.now() + NETWORK_RETRY_MS; let warned = false; let delay = 500;
@@ -304,29 +309,70 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[]):
   }
 }
 
+/** 同一会话的续取在本页面内串行；运行期间再次请求时，结束后按请求的时间再执行。 */
+const recovery = new Map<string, { timer?: ReturnType<typeof setTimeout>; due: number; saved: boolean; running: boolean }>();
+const serverDraftsDeps = () => ({ storage: localStorage, locks: navigator.locks ?? null, call: api, newId });
+
+/**
+ * 续取并放回该会话的服务端草稿（server-drafts.ts）：delay 毫秒后执行，saved 为 true 时也读取服务端保存的记录。
+ * 结果不看当前导航：输入框未挂载时进入该会话的待放回记录。
+ */
+export function recoverDrafts(sessionId: string, saved = false, delay = 0): void {
+  let state = recovery.get(sessionId);
+  if (!state) { state = { due: Infinity, saved: false, running: false }; recovery.set(sessionId, state); }
+  state.saved ||= saved;
+  const due = Date.now() + delay;
+  if (due >= state.due) return;
+  state.due = due;
+  if (state.running) return;
+  clearTimeout(state.timer);
+  state.timer = setTimeout(() => { void runRecovery(sessionId); }, delay);
+}
+async function runRecovery(sessionId: string): Promise<void> {
+  const state = recovery.get(sessionId)!;
+  state.timer = undefined; state.running = true; state.due = Infinity;
+  const saved = state.saved; state.saved = false;
+  let wait: number | null;
+  try { wait = await recoverServerDrafts(serverDraftsDeps(), sessionId, saved); }
+  catch { wait = UNAVAILABLE_RECHECK_MS; }
+  state.running = false;
+  const requested = state.due; state.due = Infinity;
+  if (requested !== Infinity) recoverDrafts(sessionId, false, Math.max(0, requested - Date.now()));
+  if (wait !== null) recoverDrafts(sessionId, false, wait);
+  if (!state.timer) recovery.delete(sessionId);
+}
+/** 连接建立或恢复时，续取当前会话和本浏览器有未完成停止、关闭请求或待删除登记的会话。 */
+export function recoverAllDrafts(): void {
+  const id = current.get()?.id;
+  for (const sessionId of new Set([...(id ? [id] : []), ...sessionsWithServerWork(localStorage)])) recoverDrafts(sessionId, true);
+}
+
+/**
+ * 发送停止或关闭。请求体先存为该会话的在途请求（restored.ts），得到结果后把清出的草稿放回所属会话的输入框，
+ * 并请服务端删除它保存的副本；结果未知时保留在途请求，由 recoverDrafts 用同一 requestId 续取。
+ */
+async function clearing(sessionId: string, command: Extract<PaneControlCommand, { type: "stop" | "close" }>): Promise<ControlOutcome> {
+  let flight: StopFlight | undefined;
+  const outcome = await control(command, undefined, (body) => { flight = beginStop(localStorage, sessionId, body); });
+  if (!flight) return outcome;
+  if (outcome.ok) {
+    const drafts = outcome.result.status === "done" ? clearedDrafts(outcome.result) : [];
+    settleServerDrafts(localStorage, sessionId, drafts.length ? [flight.body.requestId] : [], drafts, RESTORED_MESSAGE.stop, flight.key);
+  } else releaseStop(flight.key);
+  recoverDrafts(sessionId);
+  return outcome;
+}
+
 /** 停止：clear_queue + abort，清出的消息回到输入框。 */
 export async function stopRun(): Promise<void> {
   const state = current.get(); if (!state?.model) return;
-  const outcome = await control({ type: "stop" });
+  const outcome = await clearing(state.id, { type: "stop" });
   if (!outcome.ok) {
     if (outcome.error.code === "revisionChanged") {
       const phase = current.get()?.model?.view.inFlight?.phase;
       toast(phase === "idle" ? "这次运行已经结束" : phase === "stopping" ? "正在停止" : "会话状态已变化，请再次确认是否停止", "warning");
     } else toast(outcome.error.message, "error");
-    return;
   }
-  if (outcome.result.status === "done") restoreCleared(state.id, outcome.result);
-}
-
-/**
- * 把清出的排队消息放回发起请求时所在会话的输入框：确定的草稿在前，归属不明、可能已发送的草稿在后，由输入框提示用户检查。
- * 不弹确认框，也不看当前导航：用户已切换到其他会话时存入原会话的待放回记录。
- */
-function restoreCleared(sessionId: string, result: { clearedDrafts: DraftNode[][]; uncertainDrafts?: DraftNode[][] }): void {
-  deliverRestored(localStorage, sessionId, [
-    ...result.clearedDrafts.map((nodes) => ({ nodes, uncertain: false })),
-    ...(result.uncertainDrafts ?? []).map((nodes) => ({ nodes, uncertain: true })),
-  ]);
 }
 
 export async function restart(): Promise<void> {
@@ -345,15 +391,14 @@ export async function restart(): Promise<void> {
 export async function closeSession(): Promise<"ok" | "failed" | "unknown"> {
   const state = current.get(); if (!state?.model) return "failed";
   const owner = nav;
-  let outcome = await control({ type: "close" });
+  let outcome = await clearing(state.id, { type: "close" });
   if (!outcome.ok && outcome.error.code === "holdsConfirmation") {
     const holds = current.get()?.model?.view.holds.map((h) => `· ${h.reason}（${h.source}）`).join("\n") ?? "";
     const answer = await ask("关闭会话", `会话仍被保活：\n${holds}\n仍要关闭吗？`, [{ label: "取消", value: "cancel" }, { label: "关闭", value: "ok", danger: true }]);
     if (answer !== "ok" || nav !== owner) return "failed";
-    outcome = await control({ type: "close", confirmHolds: true });
+    outcome = await clearing(state.id, { type: "close", confirmHolds: true });
   }
   if (!outcome.ok) { toast(outcome.error.code === "revisionChanged" ? "会话状态已变化，请确认后重新关闭" : outcome.error.message, "error"); return outcomeUnknown(outcome.error) ? "unknown" : "failed"; }
-  if (outcome.result.status === "done") restoreCleared(state.id, outcome.result);
   toast("会话已关闭");
   if (current.get()?.id === state.id) void reload();
   return "ok";

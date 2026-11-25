@@ -1,4 +1,4 @@
-// 输入框草稿的保存、在途提交，以及停止、关闭或提交失败时取回的草稿（architecture.md“取回草稿的交付”）。
+// 输入框草稿的保存、在途提交、停止与关闭的在途请求，以及停止、关闭或提交失败时取回的草稿（architecture.md“取回草稿的交付”）。
 // 取回的草稿一律放回所属会话的输入框，不经确认框：该会话的输入框在本标签页挂载时直接放回；
 // 未挂载时每批存成一条独立的待放回记录，输入框挂载时取走。
 // localStorage 写入失败（如超出配额）时记录暂存在内存，只保留到页面关闭前，由输入框显示错误提示。
@@ -28,10 +28,14 @@ export const draftKey = (sessionId: string) => `pi-pane.draft.${sessionId}`;
 export const noticeKey = (sessionId: string) => `pi-pane.notice.${sessionId}`;
 export const batchPrefix = (sessionId: string) => `pi-pane.restored.${encodeId(sessionId)}.`;
 export const flightPrefix = (sessionId: string) => `pi-pane.inflight.${encodeId(sessionId)}.`;
+export const stopPrefix = (sessionId: string) => `pi-pane.stopflight.${encodeId(sessionId)}.`;
+export const ackPrefix = (sessionId: string) => `pi-pane.ack.${encodeId(sessionId)}.`;
 
 /** 在途提交的页面已关闭、但锁可能尚未登记的保护期，以及没有 Web Locks 时判定为遗留记录的时长（大于发送的网络重试上限）。 */
 export const FLIGHT_GRACE_MS = 2_000;
 export const FLIGHT_STALE_MS = 130_000;
+/** 在途记录的锁被其他页面持有时的重查间隔：提交的页面仍在等待结果，或刷新时旧页面尚未释放锁。 */
+export const FLIGHT_HELD_RECHECK_MS = 1_000;
 
 /** 未能写入 localStorage 的记录：键 → 所属会话与值。读取时优先于 localStorage。 */
 const memory = new Map<string, { sessionId: string; value: string }>();
@@ -188,8 +192,8 @@ export function finishSubmit(storage: Storage, flight: Flight, end: "sent" | "fa
 
 /**
  * 取回已无页面等待结果的在途提交（例如提交后刷新或关闭了页面），按结果无法确认放回该会话。
- * 有 Web Locks 时以锁是否仍被持有判断；没有时只取超过 FLIGHT_STALE_MS 的记录。
- * 返回还需多少毫秒后再检查（有尚在保护期内的记录时），没有则为 null。
+ * 有 Web Locks 时以锁是否仍被持有判断：锁被持有时不取走，稍后重查，锁释放后记录仍在才取回；没有 Web Locks 时只取超过 FLIGHT_STALE_MS 的记录。
+ * 返回还需多少毫秒后再检查（有尚在保护期内或锁被持有的记录时），没有则为 null。
  */
 export async function recoverFlights(storage: Storage, sessionId: string, locks: Locks | null = defaultLocks(), now = Date.now()): Promise<number | null> {
   let recheck: number | null = null;
@@ -200,15 +204,95 @@ export async function recoverFlights(storage: Storage, sessionId: string, locks:
     const age = now - (Number(record.at) || 0);
     const wait = (locks ? FLIGHT_GRACE_MS : FLIGHT_STALE_MS) - age;
     if (wait > 0) { recheck = Math.min(recheck ?? wait, wait); continue; }
-    // 持有该记录的锁时取回：提交的页面仍在等待、或另一页面正在取回时拿不到锁，跳过。
+    // 持有该记录的锁时取回。提交的页面仍在等待、另一页面正在取回、或刷新时旧页面尚未释放锁时拿不到锁，稍后重查。
     const recover = () => {
       // 等待锁期间记录可能已被结束或被其他页面取走。
       if (live.has(key) || read(storage, key) === null) return;
       deliverRestored(storage, sessionId, [{ nodes: normalize(record.nodes), uncertain: true }], "结果无法确认的消息已放回输入框");
       persist(storage, sessionId, key, null);
     };
-    if (locks) await locks.request(key, { ifAvailable: true }, (lock) => { if (lock) recover(); });
+    if (locks) await locks.request(key, { ifAvailable: true }, (lock) => {
+      if (lock) recover();
+      else if (read(storage, key) !== null) recheck = Math.min(recheck ?? FLIGHT_HELD_RECHECK_MS, FLIGHT_HELD_RECHECK_MS);
+    });
     else recover();
   }
   return recheck;
+}
+
+/** 停止或关闭的在途请求：请求体原样保存，结果没有交到发起的页面时，之后的页面用同一 requestId 续取。 */
+export interface StopFlight { sessionId: string; key: string; at: number; body: { requestId: string } & Record<string, unknown> }
+
+/** 本标签页挂载着该会话的输入框。 */
+export function isMounted(sessionId: string): boolean { return composers.has(sessionId); }
+/** 本页面仍在等待该在途记录的结果。 */
+export function isLive(key: string): boolean { return live.has(key); }
+
+/**
+ * 发送停止或关闭请求前登记在途请求：请求体存入 localStorage，等待结果期间持有以该键命名的 Web Lock。
+ * 结束时调用 settleServerDrafts（得到结果）或 releaseStop（结果未知，留给 server-drafts.ts 续取）。
+ */
+export function beginStop(storage: Storage, sessionId: string, body: StopFlight["body"], locks: Locks | null = defaultLocks()): StopFlight {
+  const prefix = stopPrefix(sessionId);
+  const at = nextAt(storage, prefix);
+  const flight: StopFlight = { sessionId, key: prefix + suffix(at), at, body };
+  persist(storage, sessionId, flight.key, JSON.stringify({ at, sessionId, body }));
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  live.set(flight.key, release);
+  void locks?.request(flight.key, () => held);
+  return flight;
+}
+/** 本页面不再等待结果：释放锁，记录保留。 */
+export function releaseStop(key: string): void {
+  live.get(key)?.();
+  live.delete(key);
+}
+/** 该会话的停止、关闭在途请求；损坏的记录清除。 */
+export function stopFlights(storage: Storage, sessionId: string): StopFlight[] {
+  const flights: StopFlight[] = [];
+  for (const key of keys(storage, stopPrefix(sessionId))) {
+    const record = parse(storage, key);
+    if (record && typeof record.body?.requestId === "string") flights.push({ sessionId, key, at: Number(record.at) || 0, body: record.body });
+    else persist(storage, sessionId, key, null);
+  }
+  return flights.sort((a, b) => a.at - b.at);
+}
+
+/** 已放回、尚未在服务端删除的服务端草稿记录：键 → 记录 id。 */
+export function pendingAcks(storage: Storage, sessionId: string): { key: string; ids: string[] }[] {
+  const acks: { key: string; ids: string[] }[] = [];
+  for (const key of keys(storage, ackPrefix(sessionId))) {
+    const record = parse(storage, key);
+    if (Array.isArray(record?.ids) && record.ids.every((id: unknown) => typeof id === "string")) acks.push({ key, ids: record.ids });
+    else persist(storage, sessionId, key, null);
+  }
+  return acks;
+}
+/** 服务端已删除记录后移除待删除登记。 */
+export function clearAck(storage: Storage, sessionId: string, key: string): void { persist(storage, sessionId, key, null); }
+
+/** 有停止在途请求或待删除登记的会话，网络恢复时逐个续取。 */
+export function sessionsWithServerWork(storage: Storage): string[] {
+  const sessions = new Set<string>();
+  for (const prefix of ["pi-pane.stopflight.", "pi-pane.ack."]) {
+    for (const key of keys(storage, prefix)) {
+      const record = parse(storage, key);
+      if (typeof record?.sessionId === "string") sessions.add(record.sessionId);
+    }
+  }
+  return [...sessions];
+}
+
+/**
+ * 放回服务端交出的清出草稿：先交给该会话的输入框或待放回记录，再登记要在服务端删除的记录 id，最后删除对应的停止在途记录。
+ * 三步在同一个同步步骤中完成，并且先登记后删除：其他标签页任何时刻都能看到在途记录或待删除登记之一，不会把同一条记录再放回一次。
+ */
+export function settleServerDrafts(storage: Storage, sessionId: string, ids: string[], drafts: RestoredDraft[], message: string | null, flightKey?: string): void {
+  deliverRestored(storage, sessionId, drafts, message);
+  if (ids.length) {
+    const prefix = ackPrefix(sessionId);
+    persist(storage, sessionId, prefix + suffix(nextAt(storage, prefix)), JSON.stringify({ sessionId, ids }));
+  }
+  if (flightKey) { persist(storage, sessionId, flightKey, null); releaseStop(flightKey); }
 }

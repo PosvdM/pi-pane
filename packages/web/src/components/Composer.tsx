@@ -6,8 +6,8 @@ import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
 import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions } from "../lib/restored.ts";
-import { closeSession, control, current, editorText, navigation, outcomeUnknown, stopRun, type ControlOutcome } from "../lib/session.ts";
+import { addNotice, attachComposer, batchPrefix, FLIGHT_GRACE_MS, beginSubmit, clearNotice, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, stopPrefix, takePending, unsavedSessions } from "../lib/restored.ts";
+import { closeSession, control, current, editorText, navigation, outcomeUnknown, recoverDrafts, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
 import { ask, overlay, toast } from "../lib/ui-state.ts";
@@ -143,14 +143,18 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
       void recoverFlights(localStorage, sessionId).then((wait) => { if (alive && wait !== null) timer = setTimeout(recover, wait + 50); });
     };
     take(); recover();
-    // 其他标签页存入的待放回草稿，以及其他标签页对提示的修改。
+    // 其他标签页存入的待放回草稿、发起的停止或关闭（该页关闭后由本页续取），以及其他标签页对提示的修改。
     const onStorage = (event: StorageEvent) => {
       if (event.key?.startsWith(batchPrefix(sessionId)) && event.newValue) take();
+      if (event.key?.startsWith(stopPrefix(sessionId)) && event.newValue) recoverDrafts(sessionId, false, FLIGHT_GRACE_MS);
       if (event.key === noticeKey(sessionId)) noticeChanged.set((n) => n + 1);
     };
     addEventListener("storage", onStorage);
     return () => { alive = false; clearTimeout(timer); removeEventListener("storage", onStorage); detach(); flush(); };
   }, [sessionId]);
+  // 服务端保存的清出草稿（服务端关停、写者停止、结果未交到页面的停止或关闭）：挂载时取回；
+  // 写者停止或更换（托管状态、epoch 变化）时可能刚保存了新的记录，再取一次。
+  useEffect(() => { recoverDrafts(sessionId, true); }, [sessionId, view.hosted, view.cursor.epoch]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;
     editorText.set(null);

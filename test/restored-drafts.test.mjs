@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { prependDrafts } from "../packages/web/src/lib/draft.ts";
 import {
   FLIGHT_GRACE_MS, FLIGHT_STALE_MS, addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, deliverRestored, draftKey, encodeId,
-  finishSubmit, flightPrefix, loadDraft, loadNotice, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions,
+  finishSubmit, flightPrefix, FLIGHT_HELD_RECHECK_MS, loadDraft, loadNotice, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions,
 } from "../packages/web/src/lib/restored.ts";
 
 class MemoryStorage {
@@ -255,7 +255,7 @@ test("在途提交：页面关闭后遗留的记录按结果无法确认放回�
   storage.setItem(youngKey, JSON.stringify({ at: now - 500, nodes: text("刚提交") }));
   storage.setItem(flightPrefix("A") + "300-bad", "{坏");
 
-  assert.equal(await recoverFlights(storage, "A", locks, now), FLIGHT_GRACE_MS - 500, "保护期内的记录稍后再查");
+  assert.equal(await recoverFlights(storage, "A", locks, now), Math.min(FLIGHT_HELD_RECHECK_MS, FLIGHT_GRACE_MS - 500), "保护期内和锁被持有的记录稍后再查");
   assert.deepEqual(a.received, [[unsure(text("页面关闭时在途"))]]);
   assert.equal(storage.getItem(orphanKey), null);
   assert.notEqual(storage.getItem(otherKey), null);
@@ -266,6 +266,14 @@ test("在途提交：页面关闭后遗留的记录按结果无法确认放回�
   await recoverFlights(storage, "A", locks, now);
   assert.equal(a.received.length, 1);
   finishSubmit(storage, mine, "sent");
+  storage.removeItem(youngKey);
+
+  // 锁被持有的记录：只重查，不取走。持有的页面正常结束（删除记录）后释放锁，不放回。
+  assert.equal(await recoverFlights(storage, "A", locks, now + FLIGHT_GRACE_MS), FLIGHT_HELD_RECHECK_MS);
+  assert.notEqual(storage.getItem(otherKey), null);
+  storage.removeItem(otherKey); locks.held.delete(otherKey);
+  assert.equal(await recoverFlights(storage, "A", locks, now + FLIGHT_GRACE_MS), null);
+  assert.equal(a.received.length, 1);
   detach();
 
   // 没有 Web Locks 时只取超过时限的记录。
@@ -278,4 +286,21 @@ test("在途提交：页面关闭后遗留的记录按结果无法确认放回�
   takePending(plain, "B");
   assert.deepEqual(b.received, [[unsure(text("很久以前"))]]);
   detachB();
+});
+
+test("#17 在途提交：刷新时旧页面尚未释放锁的过期记录稍后重查，锁释放后按结果无法确认放回", async () => {
+  const storage = new MemoryStorage(); const locks = fakeLocks();
+  const a = composer(); const detach = attachComposer("A", a.handle);
+  const key = flightPrefix("A") + "1000-reload";
+  storage.setItem(key, JSON.stringify({ at: 1_000, nodes: text("刷新前在途") }));
+  locks.held.add(key); // 旧页面尚未销毁，仍持有锁。
+  const now = 1_000 + FLIGHT_GRACE_MS + 5_000;
+  assert.equal(await recoverFlights(storage, "A", locks, now), FLIGHT_HELD_RECHECK_MS, "已过保护期但锁被持有时仍要重查");
+  assert.deepEqual(a.received, []);
+  assert.notEqual(storage.getItem(key), null);
+  locks.held.delete(key); // 旧页面销毁，锁释放。
+  assert.equal(await recoverFlights(storage, "A", locks, now + FLIGHT_HELD_RECHECK_MS), null);
+  assert.deepEqual(a.received, [[unsure(text("刷新前在途"))]]);
+  assert.equal(storage.getItem(key), null);
+  detach();
 });
