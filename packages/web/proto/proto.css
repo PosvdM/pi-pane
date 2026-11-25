@@ -1,0 +1,113 @@
+/* 原型新增的样式，只用 src/style.css 已有的颜色变量。 */
+
+/* 外壳：横幅在最上方，下面是原有的侧栏 + 主区域布局。 */
+.proto-shell { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.proto-layout { flex: 1; height: auto; min-height: 0; }
+.main.with-panel { flex-direction: row; }
+.main.with-panel > .chat { flex: 1; min-width: 0; }
+
+/* 共用小标签 */
+.src-tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; margin-left: 6px; font-weight: normal; white-space: nowrap; }
+.node-badge { font-size: 11px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; white-space: nowrap; flex: none; }
+.head-badge { margin-left: 8px; vertical-align: 1px; }
+.count-badge { background: var(--accent); color: #fff; border-radius: 999px; font-size: 11px; padding: 0 7px; line-height: 17px; font-weight: 600; }
+.pending-dot { background: var(--warn); color: #fff; border-radius: 999px; font-size: 10px; min-width: 15px; height: 15px; line-height: 15px; text-align: center; padding: 0 4px; flex: none; font-weight: 600; }
+.small-btn { padding: 1px 10px; font-size: 12px; }
+.chip-btn.on { border-color: var(--accent); color: var(--accent); }
+
+/* 会话树 */
+.tree-row { display: flex; align-items: center; gap: 6px; padding: 4px 12px 4px 6px; cursor: pointer; min-width: 0; }
+.tree-row:hover { background: var(--line); }
+.tree-row.active { background: var(--accent-soft); }
+.tree-row .session-label { font-size: 13.5px; }
+.tree-row.main-row .session-label { font-size: 14px; }
+.tree-row.av-archived .session-label { color: var(--muted); }
+.tree-row.av-missing .session-label { color: var(--muted); text-decoration: line-through; }
+.twisty { border: none; background: none; color: var(--muted); padding: 0; width: 12px; font-size: 10px; cursor: pointer; flex: none; }
+.twisty-static { color: var(--muted); font-size: 10px; width: 12px; display: inline-block; }
+.tree-history { display: block; margin-top: 1px; margin-bottom: 3px; }
+.node-status { width: 12px; text-align: center; font-size: 11px; line-height: 1; flex: none; color: var(--muted); }
+.ns-running { color: var(--accent); animation: pulse 1s infinite alternate; }
+.ns-waiting, .ns-paused { color: var(--warn); font-weight: 700; }
+.ns-done { color: var(--ok); font-weight: 700; }
+.ns-failed, .ns-interrupted { color: var(--danger); font-weight: 700; }
+.ns-stopped { color: var(--muted); }
+
+/* 待处理区 */
+.pending { margin: 0 8px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); max-height: 38vh; overflow-y: auto; flex: none; }
+.pending-head { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: none; padding: 6px 8px; cursor: pointer; font-weight: 600; font-size: 13px; text-align: left; }
+.pending-source { font-size: 11px; color: var(--muted); padding: 2px 10px 0 26px; }
+.pending-item { display: flex; flex-direction: column; width: 100%; border: none; background: none; text-align: left; padding: 4px 10px 5px 26px; cursor: pointer; border-left: 3px solid transparent; }
+.pending-item:hover { background: var(--accent-soft); border-left-color: var(--accent); }
+.pending-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pending-meta { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.expiry { color: var(--warn); }
+.busy { color: var(--accent); }
+
+/* 会话视图 */
+.crumbs { font-size: 12px; line-height: 1.3; }
+.composer-hint { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.readonly-bar { border-top: 1px solid var(--line); background: var(--panel); color: var(--muted); font-size: 13px; padding: 10px 16px; text-align: center; }
+.tool-linked > .tool { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.tool-node-link { display: flex; align-items: center; gap: 8px; width: 100%; border: 1px solid var(--line); border-top: 1px dashed var(--line); border-radius: 0 0 8px 8px; background: var(--accent-soft); padding: 4px 10px; font-size: 12.5px; cursor: pointer; text-align: left; color: var(--accent); }
+.tool-node-link:hover { border-color: var(--accent); }
+.custom-card .card-body .kv { margin: 4px 0 6px; width: auto; }
+
+/* 节点面板 */
+.node-panel { width: 300px; flex: none; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+.panel-head { display: flex; align-items: center; gap: 4px; padding: 8px 8px 0 12px; border-bottom: 1px solid var(--line); }
+.panel-tab { border: none; background: none; padding: 6px 4px 7px; font-size: 13px; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; }
+.panel-tab.on { border-bottom-color: var(--accent); }
+.panel-body { padding: 10px 12px; overflow-y: auto; flex: 1; }
+.panel-kv th { width: 76px; }
+.panel-kv td, .panel-kv th { padding-top: 5px; padding-bottom: 5px; border-bottom: 1px solid var(--line); }
+
+/* 全局横幅 */
+.g-banners { flex: none; }
+.g-banner { border-bottom: 1px solid var(--line); font-size: 13px; }
+.g-banner.lv-error { background: var(--err-soft); }
+.g-banner.lv-warning { background: var(--warn-soft); }
+.g-banner.lv-info { background: var(--accent-soft); }
+.g-banner-line { display: flex; align-items: center; gap: 8px; padding: 5px 16px; cursor: pointer; }
+.g-icon { flex: none; }
+.g-title { font-weight: 600; }
+.lv-error .g-title { color: var(--danger); }
+.g-unavail { font-size: 12px; color: var(--muted); border: 1px dashed var(--muted); border-radius: 4px; padding: 0 6px; }
+.g-banner.unavailable .g-title { color: var(--muted); }
+.g-banner-body { padding: 0 16px 8px 40px; }
+.g-banner-body .md p, .g-banner-body .md ul { margin: 2px 0; }
+.g-banner-body .row { margin: 6px 0 0; }
+
+/* 通知：位于主区域右上角、会话标题栏下方，不遮挡横幅 */
+.proto-toasts { position: absolute; top: 58px; right: 16px; }
+.toast-main { flex: 1; min-width: 0; }
+.toast-title { font-weight: 600; }
+.toast .md p { margin: 2px 0; }
+.toast-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+
+/* 表单与确认弹窗 */
+.later { font-weight: normal; font-size: 13px; padding: 2px 10px; }
+.form-meta { margin-bottom: 6px; }
+.form-meta .src-tag { margin-left: 0; margin-right: 4px; }
+.form-q { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.q-header { display: inline-block; font-size: 11px; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 0 6px; }
+.form-q .md p { margin: 4px 0; font-weight: 600; }
+.q-option { justify-content: flex-start; align-items: flex-start; gap: 10px; }
+.q-mark { color: var(--accent); width: 14px; flex: none; }
+.q-text { display: flex; flex-direction: column; }
+.rec { font-size: 11px; color: var(--ok); border: 1px solid var(--ok); border-radius: 4px; padding: 0 4px; margin-left: 8px; }
+.q-custom { align-items: center; cursor: text; }
+.q-custom .text-input { padding: 3px 8px; }
+.form-actions { align-items: center; }
+.modal.presence { border-top: 4px solid var(--accent); width: 520px; }
+.presence-title { display: flex; align-items: center; gap: 8px; }
+.presence-kv { margin: 8px 0; }
+.payload { font-size: 12px; max-height: 180px; }
+.readonly-bar { display: flex; align-items: center; justify-content: center; gap: 12px; }
+
+/* ?theme=light：截图用，覆盖系统深色偏好（选择器比 :root 更具体）。 */
+html.theme-light {
+  --bg: #f7f7f5; --panel: #ffffff; --side: #efeeea; --text: #1f2328; --muted: #6b7178; --line: #dedcd6;
+  --accent: #3b5bdb; --accent-soft: #e7ecff; --danger: #c92a2a; --warn: #b7791f; --warn-soft: #fff4dc; --err-soft: #ffe8e8;
+  --ok: #2b8a3e; --code: #f1f0ec; --user: #eef2ff; color-scheme: light;
+}
