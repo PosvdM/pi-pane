@@ -111,7 +111,7 @@ export class DraftOutbox {
     let record: SavedDrafts | undefined;
     try { record = parseRecord(JSON.parse(await readFile(claiming, "utf8")), sessionId); }
     catch (error) {
-      // 读不出内容时放回原处，记录仍可再次领取。
+      // 读不出内容时放回原处，记录仍可再次领取。附件扫描发现领取中文件消失时重扫，能看到改回的记录文件，见 assets。
       await rename(claiming, file).catch(() => {});
       if (error instanceof SyntaxError) return undefined;
       throw error;
@@ -126,9 +126,12 @@ export class DraftOutbox {
 
   /**
    * 全部记录、写入中的临时文件和领取中文件引用的图片 assetId。附件清理跳过这些图片，见 AssetStore.sweep。
-   * 列出目录后、读取前记录文件消失时，可能是领取把它改名成了列表中没有的领取中文件（或保存把临时文件改名成了记录），
-   * 重新扫描该目录：重扫时领取中文件仍在就计入；已经不在，说明领取已刷新图片的使用时间（touch 在删除领取中文件之前）。
-   * 同一目录连续 ASSET_RESCANS 次都有文件消失，或读取出错时抛错，由调用方放弃本次附件清理。
+   * 列出目录后、读取前文件可能改名为列表中没有的文件：领取把记录改成领取中文件，领取读不出内容时把领取中文件改回记录，
+   * 保存把临时文件改成记录。任何一种文件在读取前消失都重新扫描该目录，重扫时能看到改名后的文件；
+   * 领取中文件在领取完成后消失时重扫是多余的，但无害（刷新使用时间在删除领取中文件之前）。
+   * 临时文件可能还没写完，内容无法解析时同样重扫，不跳过：写完后它会改名为记录。
+   * 同一目录连续 ASSET_RESCANS 次都有变化（包括中断写入留下、无法解析的临时文件，它在 1 小时后由 sweep 删除），
+   * 或读取出错时抛错，由调用方放弃本次附件清理。
    */
   async assets(): Promise<Set<string>> {
     const found = new Set<string>();
@@ -141,19 +144,19 @@ export class DraftOutbox {
     }
     return found;
   }
-  /** 扫描一个会话目录中引用的图片；有记录或临时文件在列出后消失时返回 undefined，由调用方重扫。 */
+  /** 扫描一个会话目录中引用的图片；有文件在列出后消失、或临时文件无法解析时返回 undefined，由调用方重扫。 */
   private async scanAssets(directory: string): Promise<string[] | undefined> {
     let entries;
     try { entries = await readdir(directory, { withFileTypes: true }); } catch (error) { if (missing(error)) return []; throw error; }
     const ids: string[] = []; let vanished = false;
     for (const entry of entries) {
-      const claiming = CLAIMING.test(entry.name);
-      if (!entry.isFile() || !(claiming || entry.name.endsWith(".json") || entry.name.endsWith(".tmp"))) continue;
+      const temporary = entry.name.endsWith(".tmp");
+      if (!entry.isFile() || !(CLAIMING.test(entry.name) || entry.name.endsWith(".json") || temporary)) continue;
       let value: any;
       try { value = JSON.parse(await this.readScanned(path.join(directory, entry.name))); }
       catch (error) {
-        // 领取中文件只在刷新使用时间之后删除，消失时无需重扫；记录和临时文件消失时可能已改名为列表中没有的文件。
-        if (missing(error)) { if (!claiming) vanished = true; continue; }
+        if (missing(error) || (temporary && error instanceof SyntaxError)) { vanished = true; continue; }
+        // 无法解析的记录或领取中文件不会再变成有效记录（领取读不出时原样改回），跳过。
         if (error instanceof SyntaxError) continue;
         throw error;
       }

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -288,12 +288,13 @@ test("记录超过 30 天被定期清理删除时，通知所属的会话；期�
   assert.deepEqual(changes, [], "没有删除记录时不通知");
 });
 
-/** 附件扫描在列出目录后、读取第一个记录文件前，按 between 的方式改动目录，模拟与领取的改名并发。 */
+/** 附件扫描在列出目录后、读取第一个匹配 match 的文件前（默认为记录文件），按 between 的方式改动目录，模拟与领取、保存的改名并发。 */
 class RacingOutbox extends DraftOutbox {
   between = null;
+  match = (file) => file.endsWith(".json");
   async readScanned(file) {
-    const between = this.between; this.between = null;
-    if (between && file.endsWith(".json")) await between(file);
+    const between = this.between;
+    if (between && this.match(file)) { this.between = null; await between(file); }
     return super.readScanned(file);
   }
 }
@@ -326,6 +327,41 @@ test("附件扫描与领取的改名并发：读取前记录已改名为领取�
   outbox.readScanned = async function (file) { if (file.endsWith(".json")) { rounds++; await rm(file); await outbox.save("会话", { id: `r3-${rounds}`, reason: "shutdown", drafts: [sure(text("三"))] }); } return RacingOutbox.prototype.readScanned.call(this, file); };
   await assert.rejects(outbox.assets(), /持续变化/);
   assert.equal(rounds, 5, "同一目录最多重扫 5 次");
+});
+
+test("附件扫描：读到尚未写完的临时文件时重扫，写完改名为记录后计入；领取读不出内容、把领取中文件改回记录时重扫并计入；无法解析的临时文件一直在时放弃本次清理", async (t) => {
+  const f = await piFixture(); t.after(() => f.cleanup());
+  const home = path.join(f.root, "pane"); const now = Date.parse("2026-11-25T00:00:00Z");
+  const assets = new AssetStore(home, undefined, () => now); const outbox = new RacingOutbox(home, () => now);
+  const image = assets.upload(Buffer.from(png(0, 2, 2)), "image/png", thumbnail).assetId;
+  const body = (id) => JSON.stringify({ version: 1, sessionId: "会话", id, reason: "shutdown", at: new Date(now).toISOString(), drafts: [sure([{ type: "image", assetId: image }])] });
+  await outbox.save("会话", { id: "占位", reason: "shutdown", drafts: [sure(text("占位"))] });
+  const [placeholder] = await files(outbox.root); const directory = path.dirname(placeholder);
+  const digest = (value) => createHash("sha256").update(value).digest("hex");
+
+  // 保存写到一半：列出目录时只有不完整的临时文件；读取它之后保存写完并改名为记录。
+  const record = path.join(directory, digest("写入中") + ".json"); const temporary = `${record}.0f.tmp`;
+  await writeFile(temporary, body("写入中").slice(0, 20));
+  const original = outbox.readScanned.bind(outbox); let finished = false;
+  outbox.readScanned = async (file) => {
+    const content = await original(file);
+    if (file === temporary && !finished) { finished = true; await writeFile(temporary, body("写入中")); await rename(temporary, record); }
+    return content;
+  };
+  assert.deepEqual([...await outbox.assets()], [image], "不完整的临时文件不跳过：重扫后从写完的记录计入图片");
+  outbox.readScanned = original; await rm(record);
+
+  // 领取读不出内容，把领取中文件改回记录：列出目录时看到领取中文件，读取前它已改回记录。
+  const claimed = path.join(directory, digest("领取中") + ".json"); const claimingFile = `${claimed}.${now}-0f.claiming`;
+  await writeFile(claimingFile, body("领取中"));
+  outbox.match = (file) => file.endsWith(".claiming");
+  outbox.between = async (file) => { await rename(file, claimed); };
+  assert.deepEqual([...await outbox.assets()], [image], "领取中文件消失时重扫，计入改回的记录");
+  await rm(claimed);
+
+  // 中断写入留下、无法解析的临时文件一直在：重扫到上限后放弃本次附件清理，由 sweep 在 1 小时后删除它。
+  await writeFile(temporary, "{不完整");
+  await assert.rejects(outbox.assets(), /持续变化/);
 });
 
 test("服务端草稿接口：未鉴权 401，Host 或 Origin 不符 403，同一 requestId 领取不同记录 409", { timeout: 30_000 }, async (t) => {
