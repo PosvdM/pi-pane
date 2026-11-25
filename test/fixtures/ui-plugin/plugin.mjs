@@ -43,6 +43,7 @@ export default function createPlugin() {
     capabilities: ["open", "subscribe", "send", "abort", "action:uitest.retry", "action:uitest.steer", "action:uitest.extra1", "action:uitest.extra2"],
     composer: { actionId: "uitest.note", placeholder: "给排队的任务留言" }, sortKey: "1d" }));
   session("a").status = "running";
+  session("d").status = "waiting";
   session("a").entries = [{ type: "message", id: "a1", parentId: null, timestamp: now(), message: { role: "user", content: [{ type: "text", text: "开始任务甲" }], timestamp: Date.now() } }];
   session("old").readonly = true;
 
