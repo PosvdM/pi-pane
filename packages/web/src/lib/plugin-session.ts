@@ -27,8 +27,10 @@ export const pluginView = new Store<PluginView | null>(null);
  * 旧节点的重载、重试、冲突后的重新确认都不会作用到之后打开的节点上。
  */
 interface Opened {
+  /** 会话节点的引用；停止（abort）不依赖 open 能力，没有 open 时也保留。 */
   ref?: SessionRef;
-  live: boolean;           // 是否订阅实时流（节点有 subscribe 能力）
+  open: boolean;           // 是否取快照（节点有 open 能力）
+  live: boolean;           // 是否订阅实时流（节点同时有 open 和 subscribe 能力）
   send: boolean;           // 节点有 send 能力；变化时快照中的 readonly 可能已过时
   unsubscribe: (() => void) | null;
   reloading: Promise<void> | null;
@@ -56,22 +58,34 @@ export async function openPluginNode(node: TreeNode): Promise<void> {
   pinNode(node.source, node.id);
   const session = node.kind === "session" && !!node.sessionRef;
   const canOpen = session && node.capabilities.includes("open");
-  const o: Opened = { ...(canOpen ? { ref: node.sessionRef } : {}), live: canOpen && node.capabilities.includes("subscribe"), send: node.capabilities.includes("send"), unsubscribe: null, reloading: null, retries: 0 };
+  const o: Opened = { ...(session ? { ref: node.sessionRef } : {}), open: canOpen, live: canOpen && node.capabilities.includes("subscribe"), send: node.capabilities.includes("send"), unsubscribe: null, reloading: null, retries: 0 };
   opened = o;
   pluginView.set({ nodeId: node.id, source: node.source, ...(canOpen ? { ref: node.sessionRef } : {}), model: null, partials: [], loading: canOpen, ...(session && !canOpen ? { closed: true } : {}) });
   if (canOpen) await refresh(o);
 }
 
 /**
- * 节点能力变化时调整：不再提供实时流（如任务结束）就取消订阅；开始提供实时流，或 send 能力有变化（如接管后
- * 开放输入），重取快照。插件可能只通过树节点改能力、不在会话流里推 pane_status，快照中的 readonly 随之更新。
+ * 节点能力变化时调整已打开的视图（plugin-api.md 的能力表）：
+ * - 撤销 open：取消订阅、丢掉已显示的内容，改为只显示节点信息和面板；补上 open：取快照，有 subscribe 时订阅。
+ * - 不再提供实时流（如任务结束）就取消订阅；开始提供实时流，或 send 能力有变化（如接管后开放输入），重取快照。
+ *   插件可能只通过树节点改能力、不在会话流里推 pane_status，快照中的 readonly 随之更新。
  */
 export function syncCapabilities(node: TreeNode): void {
   const o = opened; const view = pluginView.get();
   if (!o?.ref || view?.nodeId !== node.id) return;
-  const live = node.capabilities.includes("subscribe");
+  const open = node.capabilities.includes("open");
+  const live = open && node.capabilities.includes("subscribe");
   const send = node.capabilities.includes("send");
   const sendChanged = send !== o.send; o.send = send;
+  if (open !== o.open) {
+    o.open = open; o.live = live; o.unsubscribe?.(); o.unsubscribe = null; clearTimeout(o.retryTimer); o.retries = 0;
+    if (!open) { pluginView.set((v) => v && { nodeId: v.nodeId, source: v.source, model: null, partials: [], loading: false, closed: true }); return; }
+    const ref = o.ref;
+    pluginView.set((v) => v && { nodeId: v.nodeId, source: v.source, ref, model: null, partials: [], loading: true });
+    void refresh(o);
+    return;
+  }
+  if (!open) return;
   if (live !== o.live) {
     o.live = live;
     if (!live) { o.unsubscribe?.(); o.unsubscribe = null; }
@@ -82,7 +96,7 @@ export function syncCapabilities(node: TreeNode): void {
 function retry(o: Opened, error: unknown): void {
   pluginView.set((v) => v && { ...v, loading: false, error: `${(error as Error).message}（正在重试）` });
   const delay = Math.min(10000, 1000 * 2 ** o.retries++);
-  clearTimeout(o.retryTimer); o.retryTimer = setTimeout(() => { if (isCurrent(o)) void refresh(o); }, delay);
+  clearTimeout(o.retryTimer); o.retryTimer = setTimeout(() => { if (isCurrent(o) && o.open) void refresh(o); }, delay);
 }
 
 /**
@@ -95,8 +109,8 @@ function refresh(o: Opened): Promise<void> {
   const run = (async () => {
     let snapshot: SessionSnapshot;
     try { snapshot = await api<SessionSnapshot>(sessionPath(ref, "snapshot")); }
-    catch (error) { if (isCurrent(o)) retry(o, error); return; }
-    if (!isCurrent(o)) return;
+    catch (error) { if (isCurrent(o) && o.open) retry(o, error); return; }
+    if (!isCurrent(o) || !o.open) return;
     pluginView.set((v) => v && { ...v, model: fromSnapshot(toView(snapshot)), partials: snapshot.unfinishedPartials ?? [], loading: false, error: undefined });
     o.retries = 0;
     if (!o.live) return;
@@ -118,7 +132,7 @@ function onEvent(o: Opened, record: Parameters<typeof apply>[1]): void {
 
 /** 游标断开、epoch 变化或收到 resync：重取快照，再以新游标续订。 */
 function reload(o: Opened): Promise<void> {
-  return isCurrent(o) && o.ref ? refresh(o) : Promise.resolve();
+  return isCurrent(o) && o.ref && o.open ? refresh(o) : Promise.resolve();
 }
 
 export async function loadOlder(): Promise<void> {
@@ -132,15 +146,18 @@ export async function loadOlder(): Promise<void> {
 }
 
 /**
- * 向插件会话发消息（节点有 send 能力、没有 composer 时）。
- * 返回 sent（已受理）、failed（确定没有执行，调用方把文字放回输入框）或 unknown（超时或断网，文字放回，并留下“查询结果”）。
+ * 向插件会话发消息（节点有 send 能力、没有 composer 时）的结果：sent 已受理；pending 插件已受理仍在处理（含服务端
+ * 等待超时），文字不放回，留下“查询结果”；failed 确定没有执行，调用方把文字放回输入框；unknown 浏览器侧超时或断网，
+ * 文字放回，并留下“查询结果”。
+ * notRun：之后的“查询结果”查到这次发送最终没有执行（被拒、控制状态冲突）时调用，供调用方取回提交时移走的文字。
+ * 查询沿用同一个幂等键和同样的内容（plugin-api.md“幂等规则”）。
  */
-export async function sendToPlugin(text: string, delivery?: "steer" | "followUp"): Promise<"sent" | "failed" | "unknown"> {
-  const o = opened; const view = pluginView.get(); if (!o || !view?.ref) return "failed";
+export async function sendToPlugin(text: string, delivery?: "steer" | "followUp", notRun?: () => void): Promise<"sent" | "pending" | "failed" | "unknown"> {
+  const o = opened; const view = pluginView.get(); if (!o?.ref || !view?.ref) return "failed";
   const ref = view.ref;
   const expectedRevision = view.model?.view.controlRevision;
   const body = { input: { text, ...(delivery ? { delivery } : {}) }, idempotencyKey: newId(), connectionId: ws.link.get().connectionId, ...(expectedRevision === undefined ? {} : { expectedRevision }) };
-  const attempt = async (): Promise<"sent" | "failed" | "unknown"> => {
+  const attempt = async (): Promise<"sent" | "pending" | "failed" | "unknown"> => {
     let result: SendResult;
     try { result = await api<SendResult>(sessionPath(ref, "send"), { ...body, connectionId: ws.link.get().connectionId }); }
     catch (error) {
@@ -151,8 +168,13 @@ export async function sendToPlugin(text: string, delivery?: "steer" | "followUp"
       }
       settleOp(body.idempotencyKey); toast((error as Error).message, "error"); return "failed";
     }
+    if (result.status === "pending") {
+      trackOp({ key: body.idempotencyKey, source: ref.source, state: "pending", message: (result as { message?: string }).message ?? "消息已提交，插件仍在处理",
+        query: async () => { if (await attempt() === "failed") notRun?.(); } });
+      return "pending";
+    }
     settleOp(body.idempotencyKey);
-    if (result.status === "accepted" || result.status === "pending") return "sent";
+    if (result.status === "accepted") return "sent";
     if (result.status === "conflict") {
       await reload(o);
       if (isCurrent(o)) toast(result.message ?? "会话状态已变化，请确认后重新发送", "error");

@@ -67,6 +67,17 @@ function HeadActions({ node, actions }: { node: TreeNode; actions: ActionSpec[] 
 const drafts = new Store<Record<string, string>>({});
 const setDraft = (nodeId: string, update: (value: string) => string) => drafts.set((all) => ({ ...all, [nodeId]: update(all[nodeId] ?? "") }));
 
+/**
+ * 停止的语义是取消：清出的待发文本按原顺序放回该节点的输入框（plugin-api.md“向会话发消息与停止”）。
+ * 从只读条停止时输入框不在，文字同样存进该节点的草稿，节点之后开放输入时出现在输入框里。
+ */
+async function stopNode(nodeId: string, readonly = false): Promise<void> {
+  const cleared = await abortPlugin();
+  if (!cleared?.length) return;
+  setDraft(nodeId, (value) => [...cleared, value].filter(Boolean).join("\n"));
+  if (readonly) toast("已停止，清出的待发消息已存入该会话的输入框，开放输入后可以继续编辑");
+}
+
 /** 已结束的会话没有可停止的运行。 */
 const ENDED = new Set<NodeStatus>(["done", "failed", "stopped", "interrupted"]);
 
@@ -76,12 +87,11 @@ function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: 
   const [delivery, setDelivery] = useState<"steer" | "followUp">("steer");
   const composer = node.composer;
   const action = composer && actionSpec(node.source, composer.actionId);
-  // 停止的语义是取消：清出的待发文本按原顺序放回输入框。
-  const stop = async () => { const cleared = await abortPlugin(); if (cleared?.length) setDraft(node.id, (value) => [...cleared, value].filter(Boolean).join("\n")); };
+  const stop = () => void stopNode(node.id);
   /**
    * 提交即清空：文字移出输入框后发出请求，等待期间输入框可以继续输入；确定没有执行（被拒、放弃了附带的表单）
    * 或浏览器侧结果未知（断网）时，按原样放回到期间新写的内容之前。插件返回处理中（含服务端调用超时）时
-   * 文字不放回，留下“查询结果”；之后查到没有执行时再放回。
+   * 文字不放回，留下“查询结果”；之后查到没有执行时再放回。动作和普通发送（sessions.send）走同样的规则。
    */
   const submit = async () => {
     const value = text.trim(); if (!value || busy) return;
@@ -95,7 +105,7 @@ function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: 
       // 有 composer 时改为调用指定动作，文字放在 input.fields.message；不弹确认，也不取附带表单。
       outcome = action
         ? await invokeAction(action, { type: "node", nodeId: node.id }, { answers: [], fields: { message: value } }, openNodeById, restore)
-        : await sendToPlugin(value, running ? delivery : undefined);
+        : await sendToPlugin(value, running ? delivery : undefined, restore);
     } catch (error) { toast((error as Error).message, "error"); outcome = "failed"; }
     finally { setBusy(false); }
     if (outcome === "failed" || outcome === "abandoned" || outcome === "unknown") restore();
@@ -115,7 +125,7 @@ function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: 
             </select>
           )}
           <span class="spacer" />
-          {canAbort && <button class="btn danger" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stop()}>停止</button>}
+          {canAbort && <button class="btn danger" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={stop}>停止</button>}
           <button class="btn primary" data-testid="plugin-send" disabled={!text.trim() || busy} onClick={() => void submit()}>发送</button>
         </div>
       </div>
@@ -158,7 +168,6 @@ export function PluginSessionView() {
   // 节点声明了 abort 就提供停止，包括排队等名额、还没有运行进程的任务；没有可停止的运行时插件返回 nothingToStop。
   // 显示的状态取自会话视图，可能先于节点能力更新：会话已结束时不再提供。
   const canAbort = node.capabilities.includes("abort") && !ENDED.has(status);
-  const stop = async () => { const cleared = await abortPlugin(); if (cleared?.length) toast("已停止，清出的待发消息：" + cleared.join(" / ")); };  // 只读视图没有输入框
   const pendingBanner = pending.map((f) => (
     <div key={f.id} class="banner warn" data-testid="node-pending-banner">待处理：{f.title}<button class="btn small" onClick={() => openForm.set({ key: formKey(f.source, f.id), persistent: true, form: f })}>处理</button></div>
   ));
@@ -206,7 +215,7 @@ export function PluginSessionView() {
         {canSend ? <PluginComposer key={node.id} node={node} running={running} canAbort={canAbort} /> : (
           <div class="readonly-bar" data-testid="plugin-readonly">
             <span data-testid="plugin-readonly-reason">只读：{readonlyText}</span>
-            {canAbort && !view.closed && <button class="btn danger small-btn" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stop()}>停止</button>}
+            {canAbort && <button class="btn danger small-btn" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stopNode(node.id, true)}>停止</button>}
           </div>
         )}
         <div class="statusbar" data-testid="plugin-statusbar">{(model?.detail ?? node.statusDetail) && <span>{model?.detail ?? node.statusDetail}</span>}<span>来源：{pluginName(node.source)}</span></div>
