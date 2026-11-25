@@ -3,7 +3,7 @@
 // 未挂载时每批存成一条独立的待放回记录，输入框挂载时取走。
 // localStorage 写入失败（如超出配额）时记录暂存在内存，只保留到页面关闭前，由输入框显示错误提示。
 // 纯逻辑，Storage 和 Web Locks 由调用方传入，可在 Node.js 中测试。
-import { isEmpty, normalize } from "./draft.ts";
+import { isEmpty, mergeDrafts, normalize } from "./draft.ts";
 import { Store } from "./store.ts";
 import type { DraftNode } from "./types.ts";
 
@@ -83,13 +83,42 @@ function nextAt(storage: Storage, prefix: string): number {
 }
 const suffix = (at: number) => `${at}-${Math.random().toString(36).slice(2, 10)}`;
 
+/**
+ * 草稿存储的版本：存储中的原始值，null 表示没有草稿。每个页面记住自己最后读到或写入的版本，
+ * 写入前比较：存储中的值与基准不同，说明另一页面写过，写入前先合并（commitDraft）。
+ */
+export type DraftVersion = string | null;
+const parseNodes = (raw: DraftVersion): DraftNode[] => { try { const nodes = JSON.parse(raw ?? "null"); return Array.isArray(nodes) ? normalize(nodes) : []; } catch { return []; } };
+
 export function loadDraft(storage: Storage, sessionId: string): DraftNode[] {
-  const nodes = parse(storage, draftKey(sessionId));
-  return Array.isArray(nodes) ? nodes : [];
+  return readDraft(storage, sessionId).nodes;
 }
-/** 保存输入框草稿，空草稿删除记录。返回是否已写入 localStorage。 */
+/** 读出草稿和它的版本。 */
+export function readDraft(storage: Storage, sessionId: string): { nodes: DraftNode[]; version: DraftVersion } {
+  const version = read(storage, draftKey(sessionId));
+  return { nodes: parseNodes(version), version };
+}
+/** 保存输入框草稿，空草稿删除记录，不比较版本。返回是否已写入 localStorage。 */
 export function saveDraft(storage: Storage, sessionId: string, nodes: DraftNode[]): boolean {
-  return persist(storage, sessionId, draftKey(sessionId), isEmpty(nodes) ? null : JSON.stringify(nodes));
+  return persist(storage, sessionId, draftKey(sessionId), encodeDraft(nodes));
+}
+const encodeDraft = (nodes: DraftNode[]): DraftVersion => isEmpty(nodes) ? null : JSON.stringify(normalize(nodes));
+
+/**
+ * 比较后写入：存储中的版本仍是 base 时写入 nodes；否则另一页面写过，把存储中的内容与 nodes 按 mergeDrafts 合并后写入，
+ * 不覆盖另一页面的内容。返回写入后的内容和版本；merged 表示结果同时包含了两个页面的修改，调用方应更新输入框并提示用户。
+ */
+export function commitDraft(storage: Storage, sessionId: string, nodes: DraftNode[], base: DraftVersion): { nodes: DraftNode[]; version: DraftVersion; merged: boolean } {
+  const key = draftKey(sessionId); const current = read(storage, key);
+  let result = normalize(nodes); let merged = false;
+  if (current !== base) {
+    const stored = parseNodes(current);
+    result = mergeDrafts(parseNodes(base), result, stored);
+    merged = encodeDraft(result) !== encodeDraft(normalize(nodes)) && encodeDraft(result) !== current;
+  }
+  const version = encodeDraft(result);
+  if (version !== current) persist(storage, sessionId, key, version);
+  return { nodes: result, version, merged };
 }
 
 export function loadNotice(storage: Storage, sessionId: string): Notice | null {

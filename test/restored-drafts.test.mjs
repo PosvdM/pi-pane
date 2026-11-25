@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { prependDrafts } from "../packages/web/src/lib/draft.ts";
+import { mergeDrafts, prependDrafts } from "../packages/web/src/lib/draft.ts";
 import {
-  FLIGHT_GRACE_MS, FLIGHT_STALE_MS, addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, deliverRestored, draftKey, encodeId,
-  finishSubmit, flightPrefix, FLIGHT_HELD_RECHECK_MS, loadDraft, loadNotice, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions,
+  FLIGHT_GRACE_MS, FLIGHT_STALE_MS, addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, commitDraft, deliverRestored, draftKey, encodeId,
+  finishSubmit, flightPrefix, FLIGHT_HELD_RECHECK_MS, loadDraft, loadNotice, noticeKey, readDraft, recoverFlights, saveDraft, takePending, unsavedSessions,
 } from "../packages/web/src/lib/restored.ts";
 
 class MemoryStorage {
@@ -155,7 +155,7 @@ test("R9-1 取回草稿：localStorage 超出配额时草稿保存在内存并�
   assert.equal(takePending(storage, "满"), true);
   detach();
   assert.equal(full.received[0].length, 2);
-  assert.equal(loadDraft(storage, "满").length, 3, "读取时内存记录优先");
+  assert.deepEqual(loadDraft(storage, "满"), [{ type: "text", text: "很长的排队消息".repeat(10) + "图 " }, { type: "image", assetId: "q" }], "读取时内存记录优先");
   assert.ok(unsavedSessions.get().has("满"), "草稿仍只在内存中");
   storage.quota = Infinity;
   assert.equal(saveDraft(storage, "满", text("已发送一部分")), true);
@@ -305,3 +305,59 @@ test("#17 在途提交：刷新时旧页面尚未释放锁的过期记录稍后�
   detach();
 });
 
+
+test("草稿合并：一方只在开头或末尾增加时接到另一方的同一端；其余两份都保留，存储内容在前；相同内容不重复", () => {
+  const nodes = (...parts) => prependDrafts([], []).concat(...parts.map((part) => typeof part === "string" ? [{ type: "text", text: part }] : [{ type: "image", assetId: part.image }])).reduce((list, node) => {
+    const last = list.at(-1); if (node.type === "text" && last?.type === "text") list[list.length - 1] = { type: "text", text: last.text + node.text }; else list.push(node); return list;
+  }, []);
+  const base = nodes("原稿");
+  assert.deepEqual(mergeDrafts(base, nodes("原稿"), nodes("原稿，另一页")), nodes("原稿，另一页"), "本页没有改动时取存储");
+  assert.deepEqual(mergeDrafts(base, nodes("原稿，本页"), nodes("原稿")), nodes("原稿，本页"), "存储没有改动时取本页");
+  assert.deepEqual(mergeDrafts(base, nodes("相同"), nodes("相同")), nodes("相同"), "两边相同时不重复");
+  // 本页在末尾打字，另一页把取回的草稿放在开头（P0 的情形）：两份修改都在。
+  assert.deepEqual(mergeDrafts(base, nodes("原稿", "，本页打字"), nodes("取回", { image: "a" }, "\n\n原稿")), nodes("取回", { image: "a" }, "\n\n原稿，本页打字"));
+  // 本页放回（加在开头），另一页在末尾打字。
+  assert.deepEqual(mergeDrafts(base, nodes("取回\n\n原稿"), nodes("原稿，另一页打字")), nodes("取回\n\n原稿，另一页打字"));
+  // 本页提交（清空），另一页在末尾补充：保留另一页补充的部分，不重复已提交的原稿。
+  assert.deepEqual(mergeDrafts(base, [], nodes("原稿，另一页补充")), nodes("，另一页补充"));
+  // 另一页提交（清空），本页在末尾补充：只保留本页补充的部分。
+  assert.deepEqual(mergeDrafts(base, nodes("原稿，本页补充"), []), nodes("，本页补充"));
+  // 两页各放回一批（同一浏览器两页几乎同时领取不同记录）：两批都在。
+  assert.deepEqual(mergeDrafts(base, nodes("甲批\n\n原稿"), nodes("乙批\n\n原稿")), nodes("甲批\n\n乙批\n\n原稿"));
+  // 两边都改了中间：都保留，存储在前，空行分隔；原稿出现两次，宁可重复不丢失。
+  assert.deepEqual(mergeDrafts(nodes("一二三"), nodes("一本页三"), nodes("一另一页三")), nodes("一另一页三\n\n一本页三"));
+  assert.deepEqual(mergeDrafts([], nodes("本页"), nodes("另一页")), nodes("另一页\n\n本页"), "基准为空时两份都保留");
+  assert.deepEqual(mergeDrafts([], nodes("本页"), []), nodes("本页"));
+});
+
+test("草稿比较后写入：版本未变时直接写入；另一页写过时合并而不覆盖；只在内容含两页修改时标记已合并", () => {
+  const storage = new MemoryStorage();
+  saveDraft(storage, "S", text("原稿"));
+  const a = readDraft(storage, "S"); const b = readDraft(storage, "S");
+  assert.deepEqual(a.nodes, text("原稿")); assert.equal(a.version, storage.getItem(draftKey("S")));
+  // A 放回取回的草稿：版本未变，直接写入。
+  const restored = commitDraft(storage, "S", prependDrafts([text("取回")], a.nodes), a.version);
+  assert.equal(restored.merged, false); assert.deepEqual(loadDraft(storage, "S"), text("取回\n\n原稿"));
+  // B 一直在打字（没有收到或忽略了 storage 事件），保存时基准仍是旧版本：合并，A 放回的草稿保留。
+  const typed = commitDraft(storage, "S", text("原稿，B 打字"), b.version);
+  assert.equal(typed.merged, true);
+  assert.deepEqual(typed.nodes, text("取回\n\n原稿，B 打字"));
+  assert.deepEqual(loadDraft(storage, "S"), typed.nodes); assert.equal(typed.version, storage.getItem(draftKey("S")));
+  // A 随后以自己写入的版本为基准再保存：版本又变了，B 的内容同样不会丢。
+  const again = commitDraft(storage, "S", text("取回\n\n原稿！"), restored.version);
+  assert.equal(again.merged, true);
+  assert.match(again.nodes[0].text, /取回/); assert.match(again.nodes.map((n) => n.text).join(""), /B 打字/);
+  // 以最新版本为基准时直接写入，清空时删除键。
+  const cleared = commitDraft(storage, "S", [], again.version);
+  assert.equal(cleared.merged, false); assert.equal(cleared.version, null); assert.equal(storage.getItem(draftKey("S")), null);
+  // 本页没有实际修改、另一页写过：取存储内容，不标记合并（调用方静默刷新输入框）。
+  saveDraft(storage, "S", text("另一页"));
+  const adopted = commitDraft(storage, "S", [], null);
+  assert.deepEqual(adopted.nodes, text("另一页")); assert.equal(adopted.merged, false);
+  // 写入失败时暂存在内存，版本取内存中的值，之后照常比较。
+  storage.quota = 0;
+  const memo = commitDraft(storage, "S", text("另一页，配额已满"), adopted.version);
+  assert.equal(memo.merged, false); assert.deepEqual(loadDraft(storage, "S"), text("另一页，配额已满"));
+  assert.equal(readDraft(storage, "S").version, memo.version);
+  storage.quota = Infinity; saveDraft(storage, "S", []);
+});

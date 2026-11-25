@@ -37,6 +37,38 @@ export function prependDrafts(restored: DraftNode[][], existing: DraftNode[]): D
   return normalize(result);
 }
 
+/** 草稿的单元序列：文本拆成 UTF-16 码元，图片为一个单元。用于按前缀、后缀比较两份草稿。 */
+type Unit = string | { image: string };
+const units = (nodes: DraftNode[]): Unit[] => normalize(nodes).flatMap((n): Unit[] => n.type === "text" ? n.text.split("") : [{ image: n.assetId }]);
+const sameUnit = (a: Unit, b: Unit) => typeof a === "string" ? a === b : typeof b !== "string" && a.image === b.image;
+const fromUnits = (list: Unit[]): DraftNode[] => normalize(list.map((u) => typeof u === "string" ? { type: "text" as const, text: u } : { type: "image" as const, assetId: u.image }));
+function startsWith(list: Unit[], head: Unit[]): boolean { return head.length <= list.length && head.every((u, i) => sameUnit(u, list[i])); }
+function endsWith(list: Unit[], tail: Unit[]): boolean { const offset = list.length - tail.length; return offset >= 0 && tail.every((u, i) => sameUnit(u, list[offset + i])); }
+const sameDraft = (a: Unit[], b: Unit[]) => a.length === b.length && startsWith(a, b);
+
+/**
+ * 两个标签页基于同一份草稿 base 各自修改后的合并（architecture.md“取回草稿的交付”）：本页内容 local，存储中另一页写入的内容 stored。
+ * 宁可重复，不可丢失：
+ * 1. 一方与 base 相同时取另一方；两方相同时取其一。
+ * 2. local 只在 base 的末尾（开头）增加了内容时，把增加的部分接到 stored 的末尾（开头）。
+ * 3. stored 只在 base 的末尾（开头）增加了内容时，把增加的部分接到 local 的末尾（开头）。
+ * 4. 其余情况（包括 base 为空）两份都保留：stored 在前，local 在后，用空行分隔。
+ */
+export function mergeDrafts(base: DraftNode[], local: DraftNode[], stored: DraftNode[]): DraftNode[] {
+  const b = units(base); const l = units(local); const s = units(stored);
+  if (sameDraft(l, s) || sameDraft(l, b)) return fromUnits(s);
+  if (sameDraft(s, b)) return fromUnits(l);
+  if (b.length && !isEmpty(base)) {
+    if (startsWith(l, b)) return fromUnits([...s, ...l.slice(b.length)]);
+    if (endsWith(l, b)) return fromUnits([...l.slice(0, l.length - b.length), ...s]);
+    if (startsWith(s, b)) return fromUnits([...l, ...s.slice(b.length)]);
+    if (endsWith(s, b)) return fromUnits([...s.slice(0, s.length - b.length), ...l]);
+  }
+  if (isEmpty(stored)) return fromUnits(l);
+  if (isEmpty(local)) return fromUnits(s);
+  return normalize([...stored, { type: "text", text: "\n\n" }, ...local]);
+}
+
 /** 服务端编码的图片标记 ⟦pane-img:<nonce>:<k>⟧ 在队列文字中显示为 [Image #k]。 */
 export function displayQueued(text: string): string {
   return text.replace(/⟦pane-img:[a-z0-9]{6,8}:(\d+)⟧/g, "[Image #$1]");

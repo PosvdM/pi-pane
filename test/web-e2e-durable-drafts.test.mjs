@@ -255,3 +255,79 @@ test("Chrome 停止成功时发起页领取并直接放回，同一会话的另�
   await other.waitForTimeout(800);
   assert.deepEqual(await stored(page, a.ref.id), want, "另一页没有写回旧内容");
 });
+
+test("Chrome 一页停止、结果返回期间另一页连续打字：保存时发现另一页已放回，两边的内容合并保留并提示；待取回条的放弃先确认，放弃后各页的条消失、输入框不变", { timeout: 150_000 }, async t => {
+  const s = await setup(t, replyScript("预热完成"), { serverOptions }); if (!s) return;
+  const { page } = s;
+  const a = await create(s, "合并甲");
+  const other = await tab(s);
+  await choose(other, a);
+  const drafts = await queueDrafts(s);
+
+  // 扣住停止的响应：服务端照常执行并保存记录，放行后发起页才领取并放回。
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const held = { result: null };
+  await page.route(`**/api/sessions/${a.ref.id}/control`, async route => {
+    if (route.request().postDataJSON().command.type !== "stop") return route.continue();
+    held.result = await (await route.fetch()).json();
+    await gate;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(held.result) });
+  });
+  await byId(page, "stop").click();
+  await until(() => held.result);
+  assert.equal(held.result.status, "done");
+
+  // 另一页开始打字，防抖期间一直有未保存的编辑；此时放行，发起页领取后把草稿写入共享的草稿存储。
+  let typed = "乙";
+  await typeAtEnd(other, typed);
+  release();
+  const restored = prependDrafts(drafts, []);
+  let written = false;
+  for (let i = 0; i < 100 && !written; i++) {
+    await other.keyboard.insertText("字"); typed += "字";
+    written = same(await stored(page, a.ref.id), restored);
+    if (!written) await other.waitForTimeout(60);
+  }
+  assert.ok(written, "发起页已领取并写入草稿存储");
+  assert.deepEqual(await draftNodes(other), text(typed), "另一页有未保存的编辑，不因 storage 事件重新读取");
+  await other.keyboard.insertText("完"); typed += "完";
+
+  // 另一页保存时版本已变：与存储中的内容合并，不覆盖发起页放回的草稿；发起页随后同步显示合并结果。
+  const want = prependDrafts(drafts, text(typed));
+  await until(async () => same(await stored(page, a.ref.id), want));
+  await until(async () => same(await draftNodes(other), want));
+  await until(async () => same(await draftNodes(page), want));
+  assert.match(await toasts(other), /另一页面修改了草稿，已合并/);
+  assert.match(await toasts(page), /排队中的消息已放回输入框/);
+  assert.deepEqual(await saved(s, a.ref.id), []);
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+
+  // 放弃：再排两条，停止的结果没有交到发起页（刷新），记录留在待取回条中。
+  await byId(page, "composer").fill("");
+  await until(async () => same(await draftNodes(other), []));
+  await queueDrafts(s);
+  const stop = await holdFirst(page, a.ref.id, "stop");
+  await byId(page, "stop").click();
+  await until(() => stop.result);
+  await page.reload();
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
+  await byId(other, "composer").fill("放弃时的输入");
+  for (const p of [page, other]) await until(async () => await rows(p).count() === 1);
+  await until(async () => same(await draftNodes(page), text("放弃时的输入")));
+
+  // 先确认：取消时什么都不做。
+  await rows(other).first().getByTestId("saved-draft-discard").click();
+  await byId(other, "choice-dialog").locator('[data-choice="cancel"]').click();
+  await other.waitForTimeout(500);
+  assert.equal(await rows(other).count(), 1);
+  assert.equal((await saved(s, a.ref.id)).length, 1, "取消放弃时记录保留");
+  // 确认后领取并丢弃：两页的条都消失，输入框不变。
+  await rows(other).first().getByTestId("saved-draft-discard").click();
+  await byId(other, "choice-dialog").locator('[data-choice="ok"]').click();
+  await until(async () => /已放弃/.test(await toasts(other)));
+  for (const p of [page, other]) await until(async () => await rows(p).count() === 0);
+  assert.deepEqual(await saved(s, a.ref.id), []);
+  for (const p of [page, other]) assert.deepEqual(await draftNodes(p), text("放弃时的输入"));
+  assert.doesNotMatch(await toasts(page), /已放弃/, "提示只出现在放弃的一页");
+});

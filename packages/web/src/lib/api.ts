@@ -1,8 +1,10 @@
 // HTTP 接口调用：所有请求带 Authorization 头；401 交给鉴权模块处理。
 import type { PaneErrorBody } from "./types.ts";
 
+// 不用参数属性：Node.js 只去掉类型就能运行本文件，单测可以直接导入依赖它的模块。
 export class ApiError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string, readonly body?: PaneErrorBody) { super(message); }
+  readonly status: number; readonly code: string; readonly body?: PaneErrorBody;
+  constructor(status: number, code: string, message: string, body?: PaneErrorBody) { super(message); this.status = status; this.code = code; this.body = body; }
 }
 
 let credential: string | null = null;

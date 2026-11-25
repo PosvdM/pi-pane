@@ -6,7 +6,7 @@ import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
 import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, draftKey, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions } from "../lib/restored.ts";
+import { addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, commitDraft, draftKey, finishSubmit, loadNotice, noticeChanged, noticeKey, readDraft, recoverFlights, takePending, unsavedSessions, type DraftVersion } from "../lib/restored.ts";
 import { closeSession, control, current, editorText, navigation, outcomeUnknown, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
@@ -87,11 +87,20 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
 
   // 待写入 localStorage 的草稿：编辑时立即捕获内容，延迟写入；切换会话或卸载时同步写入。
   const pendingSave = useRef<{ sessionId: string; nodes: DraftNode[] } | null>(null);
+  // 本页最后读到或写入的草稿版本（当前会话）。保存时与存储中的版本比较，另一页面写过时合并而不覆盖。
+  const version = useRef<DraftVersion>(null);
+  // 输入框当前所属的会话；切换会话或卸载时先置空，此时保存只写存储，不再改动输入框。
+  const active = useRef<string | null>(null);
   const flush = () => {
     clearTimeout(saveTimer.current);
     const pending = pendingSave.current; pendingSave.current = null;
     if (!pending) return;
-    saveDraft(localStorage, pending.sessionId, pending.nodes);
+    const saved = commitDraft(localStorage, pending.sessionId, pending.nodes, version.current);
+    version.current = saved.version;
+    // 合并后的内容与本页不同：更新输入框。切换会话或卸载时只写存储。
+    if (pending.sessionId !== active.current || JSON.stringify(saved.nodes) === JSON.stringify(normalize(pending.nodes))) return;
+    show(saved.nodes);
+    if (saved.merged) toast("另一页面修改了草稿，已合并", "warning");
   };
   /** 读取输入框内容并安排保存。byUser：由用户编辑引起，此时清空输入框即移除归属不明提示。 */
   const refresh = (byUser = true) => {
@@ -118,20 +127,29 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     }, () => { /* 无法核对时按存在处理，发送时由服务端校验。 */ });
   };
 
+  /** 显示与存储一致的内容，不安排保存。焦点在输入框中时光标移到末尾。 */
+  const show = (nodes: DraftNode[]) => {
+    const el = editor.current; if (!el) return;
+    const focused = document.activeElement === el;
+    setNodes(nodes);
+    clearTimeout(saveTimer.current); pendingSave.current = null;
+    if (focused) { const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection()?.removeAllRanges(); getSelection()?.addRange(range); }
+  };
+
   // 切换会话时恢复该会话保存的草稿，再放回停止、关闭或提交失败时取回、尚未放回的草稿；离开时先写入尚未保存的编辑。
   // 用 layout effect 在浏览器绘制和用户输入之前完成恢复，避免覆盖挂载后立即输入的内容。
   useLayoutEffect(() => {
     const el = editor.current!;
     let alive = true; let timer: ReturnType<typeof setTimeout> | undefined;
+    active.current = sessionId;
     /**
      * 读出草稿存储中的内容，不写回：刚读出的内容与存储一致。另一标签页可能随后放回草稿或编辑并写入同一个键，
      * 延迟写回会用旧内容覆盖它。焦点在输入框中时光标移到末尾。
      */
     const reload = () => {
-      const focused = document.activeElement === el;
-      setNodes(loadDraft(localStorage, sessionId));
-      clearTimeout(saveTimer.current); pendingSave.current = null;
-      if (focused) { const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection()?.removeAllRanges(); getSelection()?.addRange(range); }
+      const draft = readDraft(localStorage, sessionId);
+      version.current = draft.version;
+      show(draft.nodes);
     };
     reload();
     const detach = attachComposer(sessionId, {
@@ -158,12 +176,12 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
     const onStorage = (event: StorageEvent) => {
       if (event.key?.startsWith(batchPrefix(sessionId)) && event.newValue) take();
       // 另一标签页保存了该会话的草稿（编辑、放回或提交时清空）：本页没有未保存的编辑时重新读取并显示，不写回；
-      // 有未保存的编辑时不动，之后保存的一方生效。
+      // 有未保存的编辑时不动，保存时发现版本已变，与存储中的内容合并。
       if (event.key === draftKey(sessionId) && !pendingSave.current) reload();
       if (event.key === noticeKey(sessionId)) noticeChanged.set((n) => n + 1);
     };
     addEventListener("storage", onStorage);
-    return () => { alive = false; clearTimeout(timer); removeEventListener("storage", onStorage); detach(); flush(); };
+    return () => { alive = false; active.current = null; clearTimeout(timer); removeEventListener("storage", onStorage); detach(); flush(); };
   }, [sessionId]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;
