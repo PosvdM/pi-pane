@@ -23,6 +23,8 @@ const code = (error: unknown) => (error as NodeJS.ErrnoException).code;
 const missing = (error: unknown) => code(error) === "ENOENT";
 /** 领取中文件：<记录文件>.<领取时间>-<随机串>.claiming。改名保留原文件的修改时间，清理按名称中的领取时间计算。 */
 const CLAIMING = /\.(\d+)-[0-9a-f-]+\.claiming$/;
+/** 附件扫描时同一会话目录因文件消失而重扫的次数上限。 */
+const ASSET_RESCANS = 5;
 
 /** 校验并取出一条记录；不符合格式或不属于该会话时为 undefined。 */
 function parseRecord(value: any, sessionId: string): SavedDrafts | undefined {
@@ -122,28 +124,56 @@ export class DraftOutbox {
     return record;
   }
 
-  /** 全部记录和领取中文件中引用的图片 assetId。附件清理跳过这些图片，见 AssetStore.sweep。读取出错时抛错，由调用方放弃本次附件清理。 */
+  /**
+   * 全部记录、写入中的临时文件和领取中文件引用的图片 assetId。附件清理跳过这些图片，见 AssetStore.sweep。
+   * 列出目录后、读取前记录文件消失时，可能是领取把它改名成了列表中没有的领取中文件（或保存把临时文件改名成了记录），
+   * 重新扫描该目录：重扫时领取中文件仍在就计入；已经不在，说明领取已刷新图片的使用时间（touch 在删除领取中文件之前）。
+   * 同一目录连续 ASSET_RESCANS 次都有文件消失，或读取出错时抛错，由调用方放弃本次附件清理。
+   */
   async assets(): Promise<Set<string>> {
     const found = new Set<string>();
     for (const directory of await this.directories()) {
-      let entries;
-      try { entries = await readdir(directory, { withFileTypes: true }); } catch (error) { if (missing(error)) continue; throw error; }
-      for (const entry of entries) {
-        if (!entry.isFile() || !(entry.name.endsWith(".json") || CLAIMING.test(entry.name))) continue;
-        let value: any;
-        try { value = JSON.parse(await readFile(path.join(directory, entry.name), "utf8")); }
-        catch (error) { if (missing(error) || error instanceof SyntaxError) continue; throw error; }
-        for (const assetId of imageIds(Array.isArray(value?.drafts) ? value.drafts : [])) found.add(assetId);
+      for (let scan = 1; ; scan++) {
+        const ids = await this.scanAssets(directory);
+        if (ids) { for (const id of ids) found.add(id); break; }
+        if (scan >= ASSET_RESCANS) throw new Error(`草稿目录 ${path.basename(directory)} 持续变化，放弃本次附件清理`);
       }
     }
     return found;
   }
+  /** 扫描一个会话目录中引用的图片；有记录或临时文件在列出后消失时返回 undefined，由调用方重扫。 */
+  private async scanAssets(directory: string): Promise<string[] | undefined> {
+    let entries;
+    try { entries = await readdir(directory, { withFileTypes: true }); } catch (error) { if (missing(error)) return []; throw error; }
+    const ids: string[] = []; let vanished = false;
+    for (const entry of entries) {
+      const claiming = CLAIMING.test(entry.name);
+      if (!entry.isFile() || !(claiming || entry.name.endsWith(".json") || entry.name.endsWith(".tmp"))) continue;
+      let value: any;
+      try { value = JSON.parse(await this.readScanned(path.join(directory, entry.name))); }
+      catch (error) {
+        // 领取中文件只在刷新使用时间之后删除，消失时无需重扫；记录和临时文件消失时可能已改名为列表中没有的文件。
+        if (missing(error)) { if (!claiming) vanished = true; continue; }
+        if (error instanceof SyntaxError) continue;
+        throw error;
+      }
+      ids.push(...imageIds(Array.isArray(value?.drafts) ? value.drafts : []));
+    }
+    return vanished ? undefined : ids;
+  }
 
-  /** 删除超过保留期限的记录、中断写入留下的临时文件和中断领取留下的领取中文件，以及空的会话目录。单个文件出错时跳过。 */
+  /** 附件扫描读取一个文件。单独成为方法，测试可借此在列出目录与读取之间插入领取的改名。 */
+  protected readScanned(file: string): Promise<string> { return readFile(file, "utf8"); }
+
+  /**
+   * 删除超过保留期限的记录、中断写入留下的临时文件和中断领取留下的领取中文件，以及空的会话目录。单个文件出错时跳过。
+   * 删除过期记录后通知该记录所属的会话（会话 id 取自记录内容），打开着的页面据此移除对应条目。
+   */
   async sweep(): Promise<void> {
     for (const directory of await this.directories()) {
       let names: string[];
       try { names = await readdir(directory); } catch { continue; }
+      const removed = new Set<string>();
       for (const name of names) {
         const file = path.join(directory, name);
         try {
@@ -151,10 +181,15 @@ export class DraftOutbox {
           if (claimed) { if (this.now() - Number(claimed[1]) > TEMP_RETENTION_MS) await rm(file, { force: true }); continue; }
           const limit = name.endsWith(".tmp") ? TEMP_RETENTION_MS : SAVED_DRAFTS_RETENTION_MS;
           const info = await stat(file);
-          if (info.isFile() && this.now() - info.mtimeMs > limit) await rm(file, { force: true });
+          if (!info.isFile() || this.now() - info.mtimeMs <= limit) continue;
+          let sessionId: unknown;
+          if (name.endsWith(".json")) { try { sessionId = JSON.parse(await readFile(file, "utf8"))?.sessionId; } catch { /* 无法解析的文件同样删除，不通知。 */ } }
+          await rm(file, { force: true });
+          if (typeof sessionId === "string" && path.basename(directory) === digest(sessionId)) removed.add(sessionId);
         } catch { /* 下次清理重试。 */ }
       }
       await rmdir(directory).catch(() => {});
+      for (const sessionId of removed) this.changed(sessionId);
     }
   }
 

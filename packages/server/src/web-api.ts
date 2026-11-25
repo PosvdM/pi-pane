@@ -173,6 +173,6 @@ export type PaneServerMessage =
   | { type: "ui_resolved"; ref: SessionRef; id: string; reason: "answered" | "cancelled" | "expired" | "closed" }
   | { type: "project_trust"; request: PaneTrustRequest }
   | { type: "project_trust_resolved"; id: string }
-  // 已订阅会话的清出草稿记录有增删，浏览器重新读取 GET /api/sessions/:id/drafts。
+  // 已订阅会话的清出草稿记录有增删（订阅生效后另补推一次），浏览器重新读取 GET /api/sessions/:id/drafts。
   | { type: "drafts_changed"; ref: SessionRef }
   | { type: "pong" };

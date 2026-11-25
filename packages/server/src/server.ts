@@ -274,6 +274,8 @@ export class PaneServer {
             // 该会话的清出草稿记录增删时通知，浏览器重新读取待取回列表。
             const offDrafts = this.sessions.outbox.onChange((sessionId) => { if (sessionId === ref.id) this.push(client, { type: "drafts_changed", ref }); });
             client.subscriptions.set(key, () => { offDrafts(); off(); });
+            // 订阅生效后补推一次：浏览器用 HTTP 读取列表与订阅生效之间的变更不会漏掉。
+            this.push(client, { type: "drafts_changed", ref });
           }
           else this.pluginSubscription(client, ref.source, key, () => this.plugins.subscribe(message.ref, message.after, emit));
         } else if (message.type === "unsubscribe") { const key = subscriptionKey("session", message.ref?.source, message.ref?.id); client.subscriptions.get(key)?.(); client.subscriptions.delete(key); }

@@ -171,10 +171,14 @@ test("#10 服务端正常关停时清出排队的草稿（含图片）保存到�
     // 同一连接上的消息按序处理：收到 pong 时订阅已生效。
     socket.ws.send(JSON.stringify({ type: "ping" }));
     await until(() => socket.messages.some((message) => message.type === "pong"));
+    const changed = (from) => socket.messages.slice(from).filter((message) => message.type === "drafts_changed" && message.ref.id === state.ref.id).length;
+    // 订阅生效后补推一次：浏览器读取列表与订阅生效之间的变更不会漏掉。
+    assert.equal(changed(0), 1, "订阅生效后补推一次 drafts_changed");
+    const mark = socket.messages.length;
     const requestId = randomUUID();
     const claimed = await request(server, token, claimRoute(state.ref.id, record.id), { requestId });
     assert.deepEqual(claimed, { code: 200, value: { status: "claimed", record } });
-    await until(() => socket.messages.some((message) => message.type === "drafts_changed" && message.ref.id === state.ref.id));
+    await until(() => changed(mark) === 1);
     assert.deepEqual((await request(server, token, `/api/sessions/${encodeURIComponent(state.ref.id)}/drafts`)).value.records, []);
     assert.deepEqual((await request(server, token, claimRoute(state.ref.id, record.id), { requestId: randomUUID() })).value, { status: "gone" }, "其他请求领不到");
     assert.deepEqual(await request(server, token, claimRoute(state.ref.id, record.id), { requestId }), claimed, "同一 requestId 重试得到同一份内容");
@@ -195,12 +199,13 @@ for (const kind of ["stop", "close"]) {
       socket.subscribe(view);
       socket.ws.send(JSON.stringify({ type: "ping" }));
       await until(() => socket.messages.some((message) => message.type === "pong"));
+      const mark = socket.messages.length;
       const body = { requestId: randomUUID(), expectedEpoch: view.cursor.epoch, expectedRevision: view.controlRevision, command: { type: kind } };
       const route = `/api/sessions/${encodeURIComponent(state.ref.id)}`;
       const stopped = await request(server, token, route + "/control", body);
       assert.equal(stopped.code, 200, JSON.stringify(stopped));
       assert.deepEqual(stopped.value, { status: "done", clearedText: [drafts[0][0].text, stopped.value.clearedText[1]], clearedDrafts: drafts, draftsRecord: body.requestId });
-      assert.ok(socket.messages.some((message) => message.type === "drafts_changed" && message.ref.id === state.ref.id), "返回结果之前已保存并通知");
+      assert.ok(socket.messages.slice(mark).some((message) => message.type === "drafts_changed" && message.ref.id === state.ref.id), "返回结果之前已保存并通知");
       const saved = (await request(server, token, route + "/drafts")).value.records;
       assert.deepEqual(saved.map(({ id, reason, drafts }) => ({ id, reason, drafts })), [{ id: body.requestId, reason: kind, drafts: drafts.map(sure) }],
         "只保存一条记录：关闭时写者停止流程再次清队列为空，不重复保存");
@@ -261,6 +266,66 @@ test("附件清理跳过仍被草稿记录或领取中文件引用的图片，30
   now += 2 * 86_400_000;
   assets.sweep(await outbox.assets());
   assert.equal(stored(referenced), false, "领取后 7 天未使用即清理");
+});
+
+test("记录超过 30 天被定期清理删除时，通知所属的会话；期限内的记录和其他会话不通知", async (t) => {
+  const f = await piFixture(); t.after(() => f.cleanup());
+  let now = Date.parse("2026-11-25T00:00:00Z");
+  const outbox = new DraftOutbox(path.join(f.root, "pane"), () => now);
+  await outbox.save("会话/甲", { id: "旧", reason: "shutdown", drafts: [sure(text("旧"))] });
+  await outbox.save("会话/乙", { id: "新", reason: "stop", drafts: [sure(text("新"))] });
+  const [old] = (await files(outbox.root)).filter((file) => file.includes(createHash("sha256").update("旧").digest("hex")));
+  const expired = new Date(now - SAVED_DRAFTS_RETENTION_MS - 1000); await utimes(old, expired, expired);
+  // 损坏的过期文件同样删除，但读不出会话 id，不通知。
+  const broken = path.join(path.dirname(old), "坏.json"); await writeFile(broken, "{坏"); await utimes(broken, expired, expired);
+  const changes = []; outbox.onChange((sessionId) => changes.push(sessionId));
+  await outbox.sweep();
+  assert.deepEqual(changes, ["会话/甲"], "删除过期记录后通知所属会话，打开着的页面据此移除条目");
+  assert.deepEqual(await outbox.list("会话/甲"), []);
+  assert.equal(existsSync(broken), false);
+  assert.deepEqual((await outbox.list("会话/乙")).map((record) => record.id), ["新"]);
+  changes.length = 0; await outbox.sweep();
+  assert.deepEqual(changes, [], "没有删除记录时不通知");
+});
+
+/** 附件扫描在列出目录后、读取第一个记录文件前，按 between 的方式改动目录，模拟与领取的改名并发。 */
+class RacingOutbox extends DraftOutbox {
+  between = null;
+  async readScanned(file) {
+    const between = this.between; this.between = null;
+    if (between && file.endsWith(".json")) await between(file);
+    return super.readScanned(file);
+  }
+}
+test("附件扫描与领取的改名并发：读取前记录已改名为领取中文件时重扫并计入；领取中文件已删除时领取已刷新使用时间", async (t) => {
+  const f = await piFixture(); t.after(() => f.cleanup());
+  const home = path.join(f.root, "pane"); let now = Date.parse("2026-11-25T00:00:00Z");
+  const assets = new AssetStore(home, undefined, () => now); const outbox = new RacingOutbox(home, () => now);
+  const stored = (assetId) => existsSync(path.join(home, "assets", assetId.slice(7, 9), assetId.slice(7) + ".png"));
+  const image = assets.upload(Buffer.from(png(0, 2, 2)), "image/png", thumbnail).assetId;
+  await outbox.save("会话", { id: "r", reason: "shutdown", drafts: [sure([{ type: "image", assetId: image }])] });
+  now += 8 * 86_400_000;
+  // 领取已改名、尚未刷新使用时间：扫描看到记录文件消失，重扫时找到领取中文件，图片计入引用，不被清理。
+  outbox.between = async (file) => { await writeFile(`${file}.${now}-0f.claiming`, await readFile(file)); await rm(file); };
+  const keep = await outbox.assets();
+  assert.deepEqual([...keep], [image], "重扫后计入领取中文件引用的图片");
+  assets.sweep(keep);
+  assert.equal(stored(image), true, "超过 7 天的图片在领取刷新使用时间之前不被清理");
+  // 领取中文件在刷新使用时间之后才删除：扫描时它已经不在，图片不计入，但使用时间已刷新，同样不被清理。
+  const [claiming] = await files(outbox.root);
+  outbox.between = null; await rm(claiming);
+  await outbox.save("会话", { id: "r2", reason: "shutdown", drafts: [sure([{ type: "image", assetId: image }])] });
+  outbox.between = async () => { assert.equal((await outbox.claim("会话", "r2", (ids) => assets.touch(ids))).id, "r2"); };
+  const after = await outbox.assets();
+  assert.deepEqual([...after], [], "领取完成后图片不再计入引用");
+  assets.sweep(after);
+  assert.equal(stored(image), true, "领取已刷新使用时间");
+  // 目录持续变化时放弃本次附件清理，不按不完整的引用清理。
+  await outbox.save("会话", { id: "r3", reason: "shutdown", drafts: [sure(text("三"))] });
+  let rounds = 0;
+  outbox.readScanned = async function (file) { if (file.endsWith(".json")) { rounds++; await rm(file); await outbox.save("会话", { id: `r3-${rounds}`, reason: "shutdown", drafts: [sure(text("三"))] }); } return RacingOutbox.prototype.readScanned.call(this, file); };
+  await assert.rejects(outbox.assets(), /持续变化/);
+  assert.equal(rounds, 5, "同一目录最多重扫 5 次");
 });
 
 test("服务端草稿接口：未鉴权 401，Host 或 Origin 不符 403，同一 requestId 领取不同记录 409", { timeout: 30_000 }, async (t) => {
