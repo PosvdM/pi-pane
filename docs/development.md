@@ -45,7 +45,7 @@
 | `packages/bridge-extension/src/` | 会话替换和写锁回报、信任决定、就绪握手、图片顺序还原 |
 | `packages/web/` | Vite 与 Preact 浏览器界面、会话事件投影、草稿和 IndexedDB 设备密钥管理 |
 
-插件宿主通过通用 HTTP 和 WebSocket 提供能力，浏览器中的插件界面尚未实现。多题表单通道保留事件名称和 BridgeFormOutcome 类型，未启用时返回协议已有的 aborted。
+插件宿主通过通用 HTTP 和 WebSocket 提供能力，浏览器中的插件界面见[前端结构](#前端结构)。多题表单通道保留事件名称和 BridgeFormOutcome 类型，未启用时返回协议已有的 aborted。
 
 ## 前端结构
 
@@ -55,9 +55,11 @@
 | --- | --- |
 | `app.tsx`、`main.tsx`、`style.css` | 应用入口、配对页与主界面装配、全局样式 |
 | `lib/api.ts`、`lib/auth.ts` | HTTP 调用与错误、配对、标签页凭证共享和失效处理 |
-| `lib/ws.ts` | WebSocket 首帧鉴权、断线重连和游标续订 |
+| `lib/ws.ts` | WebSocket 首帧鉴权、断线重连，会话订阅（按 `(source, id)`）与树订阅的游标续订 |
 | `lib/session.ts`、`lib/session-model.ts` | 会话导航、快照、控制命令与状态查询；按游标投影会话事件 |
-| `lib/response-order.ts` | 并发请求的采用规则：响应比已采用的结果新才采用，失败不撤销已采用的结果 |
+| `lib/tree-state.ts`、`lib/tree.ts` | 单个来源的树状态（快照、订阅、分页按修订号与 tombstone 合并）；侧栏使用的各来源快照、订阅、分页加载和打开节点的固定 |
+| `lib/plugins.ts`、`lib/navigate.ts` | 插件列表、显示名称与静态目录（动作、面板、自定义消息渲染器）；打开树节点 |
+| `lib/plugin-ui.ts`、`lib/plugin-session.ts` | 持久表单、横幅、通知、在场确认、面板修订号，动作与表单的提交和查询；插件会话的快照、订阅、重试、发送与停止 |
 | `lib/draft.ts`、`lib/images.ts`、`lib/blobs.ts` | 图文草稿运算、图片缩放与上传、鉴权取图及 blob URL 缓存 |
 | `lib/restored.ts` | 输入框草稿的保存（写入失败时暂存内存）、在途提交与页面关闭后的取回、归属不明提示；停止、关闭清出或没有送达的草稿按会话交给输入框，未挂载时存入待放回记录 |
 | `lib/markdown.ts` | 不可信 Markdown 的链接过滤、远程图片替代和代码高亮 |
@@ -65,7 +67,8 @@
 | `lib/events.ts`、`lib/ui-state.ts` | 扩展 UI 与信任询问事件、对话框和提示状态 |
 | `lib/settings.ts`、`lib/actions.ts` | 本地界面偏好、导出下载和侧栏开关 |
 | `lib/store.ts`、`lib/types.ts` | 可订阅状态容器、前端协议类型出口 |
-| `components/Sidebar.tsx`、`components/Chat.tsx` | 按项目分组的会话列表、聊天记录与会话状态布局 |
+| `components/Sidebar.tsx`、`components/Chat.tsx` | 待处理区、主会话与插件节点合并的会话树、菜单与侧栏面板；主会话的聊天记录与会话状态布局 |
+| `components/PluginSession.tsx`、`components/Panels.tsx`、`components/PluginDialogs.tsx` | 插件会话视图与节点面板；面板内容渲染；表单、在场确认、横幅、通知 |
 | `components/Composer.tsx`、`components/Message.tsx` | 输入框、图片占位符与命令补全；消息、思考和工具卡片渲染 |
 | `components/Dialogs.tsx`、`components/Overlays.tsx` | 扩展对话框、信任询问和确认；设置、模型、思考级别及会话操作弹层 |
 
@@ -82,7 +85,7 @@
 - **扩展对话框**：服务端保存权威待答记录，每次订阅前清空本地对话框副本并等待服务端重发，避免显示离线期间已被其他标签页回答的问题。HTTP 回答失败时保留问题，相同答案重试复用请求体和 `requestId`。
 - **草稿保存**：编辑时立即捕获节点，延迟 300 毫秒写入按会话区分的 `localStorage`，写入失败时暂存在页面内存并提示（见 [architecture.md 的“取回草稿的交付”](architecture.md#停止与控制队列)）；切换会话或卸载时同步提交捕获内容并取消计时器，不能把缺失的 DOM ref 当成空草稿。提交消息或命令时立即清空并同步写入，内容存为在途提交，没有送达时放回（见 [architecture.md 的“提交即清空”](architecture.md#停止与控制队列)）。恢复图片草稿先显示内容，异步 touch 仅标记仍在 DOM 中的过期图片，不覆盖等待期间的编辑。
 - **图片编辑**：图片节点通过 `execCommand` 插入、删除和移动，保留 Chrome 原生撤销与重做；插入时暂去节点 class，完成后恢复，避免 Chrome 复制计算样式并生成违反 CSP 的内联样式。
-- **设备密钥**：登录后的应用初始化读取或生成不可导出的私钥，不依赖打开设置页；生成和重置通过同源 Web Locks 串行化，避免多个标签页各自写入不同密钥。签名格式见 [plugin-api.md 的“签名格式”](plugin-api.md#签名格式)，`userPresence` 确认流程与插件运行时属于 M3。
+- **设备密钥**：登录后的应用初始化读取或生成不可导出的私钥，不依赖打开设置页；生成和重置通过同源 Web Locks 串行化，避免多个标签页各自写入不同密钥。签名格式见 [plugin-api.md 的“签名格式”](plugin-api.md#签名格式)，浏览器在每次 WebSocket 建立和重置设备密钥后向服务端登记设备，`userPresence` 确认用它签名。
 
 ## 浏览器测试
 
@@ -99,6 +102,8 @@
 `test/fixtures/ui-extension.ts` 提供 `/pane-dialogs`、`/pane-dialog-timeout` 和 `/pane-widgets`，分别触发顺序对话框、1500 毫秒超时选择框和扩展组件请求。调用方从 `helpers.mjs` 导入 `providerPath` 与 `uiExtensionPath`，以 `startServer(fixture, { extraExtensions: [providerPath, uiExtensionPath] })` 加载；`piFixture()` 不默认加载此扩展。对话框测试须在启动服务前将 `fixture.env.PANE_UI_LOG` 设置为临时现场中的日志路径。扩展将每个结果以 `{method,result}` JSONL 追加到该文件，取消或超时的 `undefined` 结果记录为 `null`。
 
 `test/fixtures/fake-provider.ts` 的 `waitForFile` 片段等待指定文件出现，并响应取消信号；日志中的 `waiting` 记录表示模型已进入门闩。浏览器回归通过临时现场中的文件解除门闩，控制当前回合的结束时机，避免用固定延迟猜测排队窗口。
+
+`test/fixtures/ui-plugin/` 是插件界面测试用的插件（id `uitest`，显示名称“测试插件”），与服务端同进程加载，测试通过 `globalThis.__uiPlugin` 增删节点、推送会话事件、发布表单和横幅、发送通知、让取快照失败或让动作超时。以 `startServer(fixture, { plugins: [<该目录>] })` 加载。
 
 构建后可执行：
 
@@ -231,9 +236,25 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 
 测试文件路径均为 `test/<名称>.test.mjs`。三平台都运行服务端测试，不用模拟进程替代真实 pi。Chrome 路径由本机安装或 CHROME_PATH/CHROME_BIN 定位；本机不存在时明确跳过。CI 的全部矩阵项设置 `PANE_TEST_REQUIRE_CHROME=1`，三平台均须实际运行 Chrome，找不到 Chrome 必须失败。
 
+## M3 插件界面自动化验收
+
+`test/web-e2e-plugins.test.mjs` 在真实 Chrome 中加载 `test/fixtures/ui-plugin/`，覆盖原型 README 的界面项。与 pi-agora 的浏览器联调测试在 pi-agora 仓库，CI 检出 pi-pane 的固定提交。
+
+| 验收项 | 测试文件与断言 |
+| --- | --- |
+| 会话树与按需加载 | `web-e2e-plugins`：插件根节点按 `displayName` 分组，冷历史只显示“历史（N）”，展开后分页加载；插件节点挂在主会话下，主会话显示子节点数；`web-logic`：修订号、tombstone、分页不覆盖较新的订阅内容、冷节点在父节点完整加载后才显示、reset |
+| 侧栏由服务端推送驱动（#20、#21） | `web-e2e-conversation`：新会话首轮在跟随打开前结束，侧栏仍列出该会话；侧栏不再发起 `GET /api/sessions` 的并发刷新，#21 的请求排序状态随之删除；`sessions-catalog-scan`：逆序完成的目录扫描不回退已提交的目录（#18）；`plugins-main-tree`：会话节点按修改时间排序并附带 `paneSession` |
+| 插件会话视图 | `web-e2e-plugins`：面包屑、节点面板、`send` 发送、停止后清出的文字回到输入框、`composer` 动作（插话）、接管后变为只读、工具卡片“打开 <节点>”链接、从面包屑回到主会话 |
+| resync 后取快照失败时重试 | `web-e2e-plugins`：插件连续两次取快照失败时显示“正在重试”，恢复后续订并收到新条目 |
+| 动作与附带表单 | `web-e2e-plugins`：节点动作先取表单再带答案调用，必填校验，`origin` 来自浏览器；右键菜单列出节点动作；全局动作超时显示“结果未知”，“查询结果”沿用同一幂等键并得到最终结果 |
+| 待处理区与持久表单 | `web-e2e-plugins`：总数角标、节点上的待处理标记与会话视图顶部的“处理”入口，“稍后处理”保留表单，提交后表单移除；两个标签页提交同一 revision，只有一个生效，另一个显示“已在别处处理” |
+| 用户在场确认 | `web-e2e-plugins`：提交触发确认，确认框显示倒计时，签名后插件接受；拒绝时插件返回失败并保留表单 |
+| 横幅与通知 | `web-e2e-plugins`：按级别排序、同 id 更新保持位置、横幅动作；停用插件后 persistent 横幅保留并标为来源不可用、动作不可用，非 persistent 横幅和插件节点移除；同 id 通知只显示一次 |
+| 面板 | `web-e2e-plugins`：侧栏面板角标随 `panelChanged` 更新，分组节点从右键菜单查看详情，未知面板类型显示“此面板需要更新的 pi-pane” |
+
 ## M3 服务端自动化验收
 
-验收仅使用 `test/fixtures/pane-plugin/` 的测试插件，不依赖 agora，也不包含浏览器界面验收。源码构建后可运行 `node --test --test-concurrency=1 test/plugins-*.test.mjs test/plugin-api-contract.test.mjs`；完整回归使用 `npm test`。
+验收仅使用 `test/fixtures/pane-plugin/` 的测试插件，不依赖 agora，也不包含浏览器界面验收（见上一节）。源码构建后可运行 `node --test --test-concurrency=1 test/plugins-*.test.mjs test/plugin-api-contract.test.mjs`；完整回归使用 `npm test`。
 
 | 验收项 | 测试文件与断言 |
 | --- | --- |
@@ -279,4 +300,4 @@ M1 固定单张 4 MiB、每条最多 10 张且合计 12 MiB。Windows 本机一�
 
 Windows Job 模式在停止返回前独立确认已知成员退出；platform 测试在 StopReport 返回后立即核对已知后代身份，不设置额外退出观察窗口，也不补杀。真实 PID 复用、机器断电、快照盲窗和真实模型图片语义不在此次实测结论中。
 
-Chrome 测试覆盖真实输入框、BroadcastChannel、流式重连、扩展对话框和生产设备密钥，具体断言见[自动化验收映射](#自动化验收映射)。插件宿主由 Node 测试覆盖（见 [M3 服务端自动化验收](#m3-服务端自动化验收)）；浏览器中的插件界面、`userPresence` 确认界面、持久表单界面和 agora 联调尚未实现，不在端到端验收中。浏览器场景也未覆盖带图片的队列停止取回、图片拖动与剪切、全部数量/大小/模型能力边界及所有内置斜杠命令。HTML 导出的图片排列由 pi 决定。插件宿主的合作式超时不能隔离同步死循环或阻塞计算，也不能强制撤销插件后台已经受理的操作。
+Chrome 测试覆盖真实输入框、BroadcastChannel、流式重连、扩展对话框和生产设备密钥，具体断言见[自动化验收映射](#自动化验收映射)。插件宿主由 Node 测试覆盖（见 [M3 服务端自动化验收](#m3-服务端自动化验收)），插件界面由 Chrome 测试覆盖（见 [M3 插件界面自动化验收](#m3-插件界面自动化验收)），与 agora 的联调测试在 pi-agora 仓库。浏览器场景也未覆盖带图片的队列停止取回、图片拖动与剪切、全部数量/大小/模型能力边界及所有内置斜杠命令。HTML 导出的图片排列由 pi 决定。插件宿主的合作式超时不能隔离同步死循环或阻塞计算，也不能强制撤销插件后台已经受理的操作。
