@@ -18,6 +18,7 @@ export default function createPlugin() {
   const forms = new Map();
   const calls = { invoke: [], submit: [], send: [], abort: 0, resolveForm: 0 };
   let slowRelease;
+  let noteRelease;
 
   const node = (id, extra) => ({ id, source: "uitest", kind: "session", parentId: null, title: id, status: "idle", availability: "online",
     hasChildren: false, sortKey: id, revision, capabilities: ["open", "subscribe"], ...extra });
@@ -30,13 +31,17 @@ export default function createPlugin() {
   };
 
   // 初始树：根分组下一个运行中的会话，另有两个冷历史节点。
-  nodes.set("uitest:group:tasks", node("uitest:group:tasks", { kind: "group", title: "测试任务", hasChildren: true, childCount: 3, sortKey: "0" }));
+  nodes.set("uitest:group:tasks", node("uitest:group:tasks", { kind: "group", title: "测试任务", hasChildren: true, childCount: 4, sortKey: "0" }));
   nodes.set("uitest:session:a", node("uitest:session:a", { parentId: "uitest:group:tasks", title: "任务甲", status: "running", sessionRef: { source: "uitest", id: "a" },
     capabilities: ["open", "subscribe", "send", "abort", "action:uitest.retry"], sortKey: "1" }));
   cold.set("uitest:session:old", node("uitest:session:old", { parentId: "uitest:group:tasks", title: "历史任务", status: "done", availability: "archived",
     sessionRef: { source: "uitest", id: "old" }, sortKey: "2", lastActivityAt: "2020-01-01T00:00:00.000Z", revision: 1 }));
   cold.set("uitest:session:old2", node("uitest:session:old2", { parentId: "uitest:group:tasks", title: "更早的任务", status: "failed", availability: "archived",
     sessionRef: { source: "uitest", id: "old2" }, sortKey: "3", lastActivityAt: "2020-01-01T00:00:00.000Z", revision: 1 }));
+  // 排队中的任务：等待中、还没有运行，但可以停止；动作多于标题栏能放下的 3 个；输入框按 composerMode 返回不同结果。
+  nodes.set("uitest:session:d", node("uitest:session:d", { parentId: "uitest:group:tasks", title: "排队的任务", status: "waiting", sessionRef: { source: "uitest", id: "d" },
+    capabilities: ["open", "subscribe", "send", "abort", "action:uitest.retry", "action:uitest.steer", "action:uitest.extra1", "action:uitest.extra2"],
+    composer: { actionId: "uitest.note", placeholder: "给排队的任务留言" }, sortKey: "1d" }));
   session("a").status = "running";
   session("a").entries = [{ type: "message", id: "a1", parentId: null, timestamp: now(), message: { role: "user", content: [{ type: "text", text: "开始任务甲" }], timestamp: Date.now() } }];
   session("old").readonly = true;
@@ -73,6 +78,11 @@ export default function createPlugin() {
     releaseSlow() { slowRelease?.(); },
     /** 下一次取快照失败的次数（模拟后台离线）。 */
     failSnapshots: 0,
+    /** 输入框动作 uitest.note 的结果：ok、reject、pending、slow（超过动作超时）、hold（等 releaseNote）、needsInput。 */
+    composerMode: "ok",
+    releaseNote() { noteRelease?.(); },
+    /** 把处于 pending 的操作改为最终结果，之后用同一个键查询得到它。 */
+    finishPending(result = { status: "ok", message: "留言已处理" }) { for (const op of operations.values()) if (op.pending) { op.result = result; op.pending = false; } },
   };
   globalThis.__uiPlugin = control;
 
@@ -83,7 +93,7 @@ export default function createPlugin() {
       return known.result ?? { status: "pending" };
     }
     const op = { digest }; operations.set(key, op);
-    const result = await run(); if (result.status !== "pending") op.result = result; return result;
+    const result = await run(); if (result.status !== "pending") op.result = result; else op.pending = true; return result;
   };
 
   return {
@@ -139,10 +149,14 @@ export default function createPlugin() {
         { id: "uitest.detail", source: "uitest", title: "任务详情", placement: "node", revision: 1 },
         { id: "uitest.board", source: "uitest", title: "测试看板", placement: "sidebar", badgeCount: 2, revision: 1 },
         { id: "uitest.future", source: "uitest", title: "将来的面板", placement: "node", appliesTo: { kinds: ["group"] }, revision: 1 },
+        { id: "uitest.checklist", source: "uitest", title: "任务清单", placement: "node", appliesTo: { kinds: ["session"], sources: ["uitest"] }, revision: 1 },
+        { id: "uitest.main", source: "uitest", title: "主会话面板", placement: "node", appliesTo: { kinds: ["session"], sources: ["pane"] }, revision: 1 },
       ],
       async content(panelId, nodeId) {
         if (panelId === "uitest.detail") return { type: "keyValue", rows: [{ key: "节点", value: nodeId ?? "" }, { key: "状态", value: nodes.get(nodeId)?.status ?? "" }] };
         if (panelId === "uitest.board") return { type: "list", items: [{ id: "row1", title: "看板条目", nodeId: "uitest:session:a", actions: ["uitest.retry"] }] };
+        if (panelId === "uitest.checklist") return { type: "list", items: [{ id: "row1", title: "清单条目", actions: ["uitest.retry"] }] };
+        if (panelId === "uitest.main") return { type: "keyValue", rows: [{ key: "主会话", value: nodeId ?? "" }] };
         return { type: "hologram", frames: [] };
       },
     },
@@ -154,6 +168,9 @@ export default function createPlugin() {
         { id: "uitest.slow", source: "uitest", title: "慢动作", scope: ["global"], timeoutMs: 1000 },
         { id: "uitest.create", source: "uitest", title: "新建任务", scope: ["global"] },
         { id: "uitest.wipe", source: "uitest", title: "清空", scope: ["global"], confirm: "确定清空？", danger: true },
+        { id: "uitest.note", source: "uitest", title: "留言", scope: ["node"], timeoutMs: 1000 },
+        { id: "uitest.extra1", source: "uitest", title: "附加一", scope: ["node"] },
+        { id: "uitest.extra2", source: "uitest", title: "附加二", scope: ["node"] },
       ],
       async resolveForm(actionId, target) {
         calls.resolveForm++;
@@ -174,6 +191,16 @@ export default function createPlugin() {
             return { status: "ok", message: "已新建任务", openNodeId: "uitest:session:c" };
           }
           if (inv.actionId === "uitest.ping") return { status: "ok", message: "状态正常", openNodeId: "uitest:session:a" };
+          if (inv.actionId === "uitest.note") {
+            const mode = control.composerMode;
+            if (mode === "reject") return { status: "failed", message: "插件拒绝了留言" };
+            if (mode === "pending") return { status: "pending", message: "留言处理中" };
+            if (mode === "slow") await new Promise((resolve) => setTimeout(resolve, 3000));
+            if (mode === "hold") await new Promise((resolve) => { noteRelease = resolve; });
+            if (mode === "needsInput" && !inv.formId) return { status: "needsInput", followUpForm: { id: "note-more", source: "uitest", revision: 1, title: "补充留言", createdAt: now(), fields: [{ id: "more", label: "补充", type: "text" }] } };
+            control.append("d", "留言：" + inv.input?.fields?.message);
+            return { status: "ok", message: "已留言" };
+          }
           if (inv.actionId === "uitest.steer") { control.append(inv.target.nodeId.split(":").pop(), "插话：" + inv.input?.fields?.message); return { status: "ok", message: "已插话" }; }
           return { status: "ok", message: "已" + (inv.actionId === "uitest.retry" ? "返工" : "执行") };
         });

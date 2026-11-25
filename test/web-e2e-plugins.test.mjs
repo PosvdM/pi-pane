@@ -130,11 +130,11 @@ test("插件 Chrome 待处理区、持久表单、在场确认、多标签页同
   await byId(page, "form-submit").click(); await held;
   await byId(other, "form-submit").click();
   await until(() => plugin().calls.submit.filter((c) => c.formId === "q3").length === 1);
+  // 各自的结果提示在出现后 5 秒消失：每个标签页在自己的结果到达时立即核对，不在最后统一读取。
+  await byId(other, "toast").filter({ hasText: "已提交" }).waitFor();
   release();
+  await byId(page, "toast").filter({ hasText: "已在别处处理" }).waitFor();
   await until(async () => (await byId(page, "pending-item").filter({ hasText: "决策" }).count()) === 0 && (await byId(other, "pending-item").filter({ hasText: "决策" }).count()) === 0);
-  const toasts = [await byId(page, "toast").allTextContents(), await byId(other, "toast").allTextContents()].flat().join("\n");
-  assert.match(toasts, /已在别处处理/);
-  assert.match(toasts, /已提交/);
 });
 
 test("插件 Chrome 横幅、通知、全局动作结果未知后查询、侧栏面板、未知面板与停用插件", { timeout: 120_000 }, async (t) => {

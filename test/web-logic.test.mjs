@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { fromSnapshot, apply, prependHistory } from "../packages/web/src/lib/session-model.ts";
 import { normalize, plainText, prependDrafts, displayQueued, parseSlash, isEmpty, imageIds } from "../packages/web/src/lib/draft.ts";
 import { canonicalize, JcsError } from "../packages/web/src/lib/jcs.ts";
-import { SourceTree, isHot } from "../packages/web/src/lib/tree-state.ts";
+import { SourceTree, isHot, childrenAcross, hiddenChildren, unassigned } from "../packages/web/src/lib/tree-state.ts";
+import { addNotificationTo, clampSidebar, restoreText, sortBanners, splitActions, visibleBanners } from "../packages/web/src/lib/plugin-state.ts";
 import { SessionModel } from "../packages/server/dist/model.js";
 import { NUMBER_VECTORS, hexToDouble, SAMPLE_INPUT, SAMPLE_OUTPUT, SORT_INPUT, SORT_EXPECTED_OUTPUT } from "./fixtures/jcs-vectors.mjs";
 
@@ -210,4 +211,105 @@ test("扩展注入的 custom 消息落盘为 custom_message 后，服务端与�
   server.apply({ type: "message_end", message: { ...custom, content: "另一条" } });
   server.append([{ ...entry, id: "c2", parentId: "c1" }], "c2");
   assert.equal(server.snapshot().inFlight.completed.length, 1);
+});
+
+test("resync 事件不按游标去重：服务端兜底的 resync 用订阅起点作游标时仍触发重取", () => {
+  const state = fromSnapshot(snapshot());
+  receive(state, { type: "queue_update", steering: [], followUp: [] });
+  for (const cursor of [{ epoch: "epoch", seq: 10 }, { epoch: "epoch", seq: 11 }, { epoch: "epoch", seq: 3 }, { epoch: "其他", seq: 1 }]) {
+    assert.equal(apply(state, { ref, cursor, event: { type: "resync" } }), "resync");
+  }
+  assert.equal(state.view.cursor.seq, 11);
+});
+
+const treeNode = (source, id, parentId, extra = {}) => ({ id, source, kind: "session", parentId, title: id, status: "idle", availability: "online",
+  hasChildren: false, sortKey: id, revision: 1, capabilities: [], ...extra });
+function forest(entries) {
+  const map = new Map();
+  for (const [source, snapshot] of entries) { const t = new SourceTree(source); t.load({ source, epoch: "e", revision: 5, ...snapshot }); map.set(source, t); }
+  return map;
+}
+
+test("跨来源的子节点与历史数：各来源分别扣除自己的节点，未知数目只显示“历史”", () => {
+  const trees = forest([
+    ["pane", { nodes: [treeNode("pane", "pane:session:1", "pane:project:p"), treeNode("pane", "pane:project:p", null, { kind: "group" })] }],
+    ["a", { nodes: [treeNode("a", "a:s1", "pane:session:1"), treeNode("a", "a:g", null, { kind: "group", hasChildren: true })], foreignChildCounts: { "pane:session:1": 3 } }],
+    ["b", { nodes: [treeNode("b", "b:x", "a:g")], foreignChildCounts: { "pane:session:1": 2, "a:g": 4 } }],
+  ]);
+  const main = trees.get("pane").nodes.get("pane:session:1");
+  assert.deepEqual(childrenAcross(trees, "pane:session:1").map((n) => n.id), ["a:s1"]);
+  // a 报告 3、已显示 1；b 报告 2、已显示 0。b 的数目不被 a 的已加载节点抵扣。
+  assert.deepEqual(hiddenChildren(trees, main), { count: 4, unknown: false, sources: ["a", "b"] });
+  // 插件节点也可以有其他插件挂的子节点；自身 hasChildren 而无 childCount 时显示“历史”（数目未知）。
+  const group = trees.get("a").nodes.get("a:g");
+  assert.deepEqual(childrenAcross(trees, "a:g").map((n) => n.id), ["b:x"]);
+  assert.deepEqual(hiddenChildren(trees, group), { count: 3, unknown: true, sources: ["a", "b"] });
+  // 订阅推来的新节点不在快照数目里，不抵扣其他来源报告的数目；分页取到的节点抵扣。
+  const hot = () => true;
+  assert.equal(trees.get("a").apply({ type: "upsert", revision: 6, node: treeNode("a", "a:new", "pane:session:1", { revision: 6 }) }, hot), "applied");
+  assert.equal(hiddenChildren(trees, main).count, 4);
+  trees.get("a").mergePage("pane:session:1", [treeNode("a", "a:s2", "pane:session:1")], 6, "next");
+  assert.equal(hiddenChildren(trees, main).count, 3);
+  trees.get("a").mergePage("pane:session:1", [treeNode("a", "a:s3", "pane:session:1")], 6);
+  assert.deepEqual(hiddenChildren(trees, main), { count: 2, unknown: false, sources: ["b"] }, "分页完毕的来源不再有历史");
+  // 同一来源的父节点按 childCount（随推送更新）扣除全部已加载子节点。
+  const own = forest([["x", { nodes: [treeNode("x", "x:root", null, { kind: "group", hasChildren: true, childCount: 2 }), treeNode("x", "x:c1", "x:root")] }]]);
+  assert.equal(hiddenChildren(own, own.get("x").nodes.get("x:root")).count, 1);
+});
+
+test("“未归属”：父节点所在来源已加载却没有它、来源不存在、指向未归属分组或形成循环", () => {
+  const trees = forest([
+    ["pane", { nodes: [treeNode("pane", "pane:session:1", null)] }],
+    ["a", { nodes: [
+      treeNode("a", "a:ok", "pane:session:1"), treeNode("a", "a:lost", "pane:session:9"), treeNode("a", "a:un", "pane:group:unassigned"),
+      treeNode("a", "a:other", "zz:node"), treeNode("a", "a:cross", "b:missing"), treeNode("a", "a:c1", "a:c2"), treeNode("a", "a:c2", "a:c1"),
+      treeNode("a", "a:under-cycle", "a:c1"),
+    ] }],
+    ["b", { nodes: [] }],
+  ]);
+  const t = trees.get("a"); const of = (id) => unassigned(trees, t.nodes.get(id));
+  assert.equal(of("a:ok"), false);
+  assert.equal(of("a:lost"), true);
+  assert.equal(of("a:un"), true);
+  assert.equal(of("a:other"), true, "父节点的来源不存在");
+  assert.equal(of("a:cross"), true, "另一个插件已加载却没有该父节点");
+  assert.equal(of("a:c1"), true); assert.equal(of("a:c2"), true, "循环里的节点");
+  assert.equal(of("a:under-cycle"), false, "挂在循环节点下的节点跟随父节点显示");
+  assert.equal(unassigned(trees, t.nodes.get("a:lost"), (id) => id === "pane:session:9"), false, "已为父节点重取快照、结果未到时暂不归入");
+  const unloaded = new SourceTree("b"); trees.set("b", unloaded);
+  assert.equal(of("a:cross"), false, "父节点的来源还没有快照时等待");
+});
+
+test("树 reset 之后、新快照之前：分页作废，load 之后恢复并重建 baseline", () => {
+  const tree = new SourceTree("x");
+  tree.load({ source: "x", epoch: "e", revision: 5, nodes: [treeNode("x", "x:a", null)] });
+  const generation = tree.generation;
+  assert.equal(tree.stale, false);
+  assert.equal(tree.apply({ type: "reset", epoch: "e" }, () => true), "reset");
+  assert.equal(tree.stale, true);
+  tree.load({ source: "x", epoch: "e", revision: 7, nodes: [] });
+  assert.equal(tree.stale, false); assert.ok(tree.generation > generation, "同 epoch 的新快照也换代，旧分页据此丢弃");
+  assert.equal(tree.baseline.size, 0);
+});
+
+test("通知：自动消失的最多 5 条，error 与 sticky 不被挤掉；同 id 只显示一次", () => {
+  const n = (id, level = "info", sticky) => ({ id, source: "s", level, title: id, ...(sticky ? { sticky } : {}) });
+  let list = [];
+  list = addNotificationTo(list, n("e1", "error")); list = addNotificationTo(list, n("s1", "info", true));
+  for (let i = 0; i < 7; i++) list = addNotificationTo(list, n("i" + i, i % 2 ? "warning" : "info"));
+  assert.deepEqual(list.map((x) => x.id), ["e1", "s1", "i2", "i3", "i4", "i5", "i6"]);
+  assert.equal(addNotificationTo(list, n("e1", "error")), list);
+});
+
+test("横幅排序与折叠、标题栏动作上限、侧栏宽度范围、文字放回", () => {
+  const b = (id, level) => ({ id, source: "s", level, title: id, sourceUnavailable: false });
+  const sorted = sortBanners([b("i", "info"), b("w", "warning"), b("e1", "error"), b("e2", "error")]);
+  assert.deepEqual(sorted.map((x) => x.id), ["e1", "e2", "w", "i"]);
+  assert.deepEqual(visibleBanners(sorted, false), { shown: sorted.slice(0, 2), folded: 2 });
+  assert.deepEqual(visibleBanners(sorted, true), { shown: sorted, folded: 0 });
+  assert.deepEqual(visibleBanners(sorted.slice(0, 3), false), { shown: sorted.slice(0, 3), folded: 0 }, "3 条以内全部显示");
+  assert.deepEqual(splitActions([1, 2, 3, 4, 5]), { shown: [1, 2, 3], more: [4, 5] });
+  assert.deepEqual([100, 240, 300, 480, 900, NaN].map(clampSidebar), [240, 240, 300, 480, 480, 280]);
+  assert.equal(restoreText("提交的", ""), "提交的");
+  assert.equal(restoreText("提交的", "期间新写的"), "提交的\n期间新写的");
 });
