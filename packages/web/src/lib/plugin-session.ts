@@ -34,6 +34,7 @@ interface Opened {
   send: boolean;           // 节点有 send 能力；变化时快照中的 readonly 可能已过时
   unsubscribe: (() => void) | null;
   reloading: Promise<void> | null;
+  again?: boolean;         // 取快照期间又有重取请求
   retries: number;
   retryTimer?: ReturnType<typeof setTimeout>;
 }
@@ -90,7 +91,8 @@ export function syncCapabilities(node: TreeNode): void {
     o.live = live;
     if (!live) { o.unsubscribe?.(); o.unsubscribe = null; }
   } else if (!sendChanged) return;
-  if (view.model && (live || sendChanged)) void reload(o);
+  // 首次快照还没返回时也要重取：在途的快照可能早于这次能力变化（refresh 完成后再取一次）。
+  void reload(o);
 }
 
 function retry(o: Opened, error: unknown): void {
@@ -102,17 +104,21 @@ function retry(o: Opened, error: unknown): void {
 /**
  * 取快照，再以快照的游标订阅或续订（节点有 subscribe 能力时）。
  * 取快照失败时（如插件的后台服务暂时离线）按退避间隔重试，直到成功或离开该节点；否则离线期间推来的 resync 无处送达。
+ * 取快照期间又有重取请求（如节点能力在此期间再次变化）时，这一次的快照可能早于该变化，完成后再取一次。
  */
 function refresh(o: Opened): Promise<void> {
-  if (o.reloading) return o.reloading;
+  if (o.reloading) { o.again = true; return o.reloading; }
   const ref = o.ref!;
   const run = (async () => {
-    let snapshot: SessionSnapshot;
-    try { snapshot = await api<SessionSnapshot>(sessionPath(ref, "snapshot")); }
-    catch (error) { if (isCurrent(o) && o.open) retry(o, error); return; }
-    if (!isCurrent(o) || !o.open) return;
-    pluginView.set((v) => v && { ...v, model: fromSnapshot(toView(snapshot)), partials: snapshot.unfinishedPartials ?? [], loading: false, error: undefined });
-    o.retries = 0;
+    do {
+      o.again = false;
+      let snapshot: SessionSnapshot;
+      try { snapshot = await api<SessionSnapshot>(sessionPath(ref, "snapshot")); }
+      catch (error) { if (isCurrent(o) && o.open) retry(o, error); return; }
+      if (!isCurrent(o) || !o.open) return;
+      pluginView.set((v) => v && { ...v, model: fromSnapshot(toView(snapshot)), partials: snapshot.unfinishedPartials ?? [], loading: false, error: undefined });
+      o.retries = 0;
+    } while (o.again);
     if (!o.live) return;
     if (o.unsubscribe) ws.resubscribe(ref);
     else o.unsubscribe = ws.subscribe(ref, () => pluginView.get()?.model?.view.cursor ?? { epoch: "", seq: 0 }, (record) => onEvent(o, record));

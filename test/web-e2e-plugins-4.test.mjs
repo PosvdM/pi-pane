@@ -87,6 +87,26 @@ test("普通发送处理中可查询、查到被拒时放回文字；连续查�
   plugin().upsert({ ...plugin().nodes.get("uitest:session:e"), capabilities: ["open", "send"] });
   await editor(page).waitFor();
   await until(async () => (await editor(page).inputValue()) === "排队的消息");
+
+  // 首次快照在途时节点能力变化：在途的快照取自变化之前（只读），完成后要再取一次，输入框随之出现。
+  plugin().setSend("uitest:session:a", "a", false);
+  let fetched; const fetchedOnce = new Promise((resolve) => { fetched = resolve; });
+  let releaseSnap; const snapGate = new Promise((resolve) => { releaseSnap = resolve; });
+  let held = true;
+  await page.route("**/sessions/a/snapshot", async (route) => {
+    if (!held) { await route.continue().catch(() => {}); return; }
+    held = false;
+    const response = await route.fetch(); fetched(); await snapGate;
+    await route.fulfill({ response }).catch(() => {});
+  });
+  await node(page, "uitest:session:a").click();
+  await fetchedOnce;
+  plugin().setSend("uitest:session:a", "a", true);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  releaseSnap();
+  await page.getByText("开始任务甲").waitFor();
+  await editor(page).waitFor();
+  await page.unroute("**/sessions/a/snapshot");
 });
 
 test("插件节点挂在项目分组下并与主会话按 sortKey 统一排序；重连后已打开的面板重取；确认框跟随设备变化；窄屏不能拖动侧栏", { timeout: 120_000 }, async (t) => {
