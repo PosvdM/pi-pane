@@ -2,6 +2,7 @@
 import { api, ApiError, newId } from "./api.ts";
 import { deviceLabel, getOrCreateDevice, PresenceError, resetDevice, signPresence, type DeviceInfo, type PresenceProof } from "./device-key.ts";
 import { addNotificationTo, manualClose, NOTIFY_MS } from "./plugin-state.ts";
+import { Operation, type OpEntry, type OpHost, type OpOptions, type OpState, type OpStep, type OpText } from "./operation.ts";
 import { actionSpec, pluginName } from "./plugins.ts";
 import { Store } from "./store.ts";
 import { confirmInApp, toast } from "./ui-state.ts";
@@ -263,34 +264,22 @@ export function queryForm(form: FormSpec): Promise<boolean> | undefined {
 }
 
 /**
- * 结果未确定的操作（动作调用、向插件会话发消息）：pending 为插件已受理仍在处理，unknown 为超时或断网。
- * query 用原幂等键和同样的内容再调用一次，取得这次操作的当前状态（plugin-api.md“幂等规则”）。
+ * 结果未确定的操作（动作调用、向插件会话发消息）的“查询结果”入口：pending 为插件已受理仍在处理，unknown 为超时或断网。
+ * 每次操作是一个 Operation 对象（operation.ts），首次请求和每次查询的结果都由它结算，入口的 query 始终指向它。
  */
-export interface PendingOp { key: string; source: string; state: "pending" | "unknown"; message: string; query: () => Promise<unknown> }
+export type PendingOp = OpEntry;
 export const pendingOps = new Store<PendingOp[]>([]);
-export function trackOp(op: PendingOp): void { pendingOps.set((list) => [...list.filter((a) => a.key !== op.key), op]); }
+/** 关闭查询入口（用户点 ✕）：不再查询，操作对象随之不可达。 */
 export function settleOp(key: string): void { pendingOps.set((list) => list.filter((a) => a.key !== key)); }
+export function queryOp(op: PendingOp): Promise<unknown> { return op.query(); }
 
-/**
- * 同一操作（同一幂等键）同时只进行一次查询：连续点击“查询结果”时后来的点击共用进行中的那次。
- * 否则两条查询各自等待同一个后续表单，用户提交后，另一条把弹窗消失当成放弃，放回已经执行了的内容。
- */
-const querying = new Map<string, Promise<unknown>>();
-export function queryOp(op: PendingOp): Promise<unknown> {
-  let running = querying.get(op.key);
-  if (!running) {
-    running = op.query().finally(() => { querying.delete(op.key); });
-    querying.set(op.key, running);
-  }
-  return running;
-}
-
-/**
- * 一次动作调用的最终去向：ok 已执行；pending 已受理仍在处理；unknown 结果未知；
- * failed 确定没有执行（插件拒绝、幂等冲突或请求被拒）；abandoned 用户放弃了确认或附带的表单，没有调用或没有完成。
- * pending 和 unknown 留下“查询结果”入口。
- */
-export type ActionOutcome = "ok" | "pending" | "unknown" | "failed" | "abandoned";
+const opHost: OpHost = {
+  show: (entry) => pendingOps.set((list) => [...list.filter((a) => a.key !== entry.key), entry]),
+  hide: settleOp,
+  toast: (message, level) => toast(message, level),
+};
+/** 新建一次操作；调用方随后调用 run() 发出首次请求。 */
+export function newOperation(options: OpOptions): Operation { return new Operation(options, opHost); }
 
 /** 弹出动作附带的表单，返回用户的结果；用户放弃（关闭弹窗或打开了其他表单）时返回 null。 */
 function askForm(key: string, form: FormSpec): Promise<FormOutcome | null> {
@@ -306,66 +295,66 @@ function askForm(key: string, form: FormSpec): Promise<FormOutcome | null> {
 interface Call { key: string; spec: ActionSpec; target?: ActionTarget; input?: FormAnswers; formId?: string; formRevision?: number }
 
 /**
- * notRun：之后的“查询结果”查到这次操作确定没有执行（failed）或用户放弃了后续表单时调用，
- * 供调用方取回提交时移走的内容（如输入框的文字）。
+ * 一次动作调用对应的操作。needsInput 时弹出后续表单，提交沿用原幂等键作前缀（<原 key>/<n>），之后的查询用最近一次请求的键；
+ * 用户放弃后续表单按没有执行结算。text 为输入框（composer 动作）移出的原文。
  */
-async function invoke(call: Call, onOpenNode?: (nodeId: string) => void, followUp = 0, notRun?: () => void): Promise<ActionOutcome> {
-  const { spec } = call;
-  const query = async () => {
-    const outcome = await invoke(call, onOpenNode, followUp, notRun);
-    if (outcome === "failed" || outcome === "abandoned") notRun?.();
+function actionOperation(first: Call, onOpenNode?: (nodeId: string) => void, text?: OpText): Operation {
+  const { spec } = first;
+  const base = first.key;
+  let call = first; let followUp = 0;
+  const attempt = async (): Promise<OpStep> => {
+    for (;;) {
+      let result: ActionResult;
+      try {
+        result = await api<ActionResult>(pluginPath(spec.source, `actions/${encodeURIComponent(spec.id)}/invoke`), {
+          idempotencyKey: call.key, connectionId: ws.link.get().connectionId,
+          ...(call.target ? { target: call.target } : {}), ...(call.input ? { input: call.input } : {}),
+          ...(call.formId ? { formId: call.formId, formRevision: call.formRevision } : {}),
+        });
+      } catch (error) {
+        if (unknownResult(error)) return { state: "unknown" };
+        return { state: "notRun", message: (error as Error).message };
+      }
+      switch (result.status) {
+        case "ok": if (result.openNodeId) onOpenNode?.(result.openNodeId); return { state: "done", message: result.message ?? `已${spec.title}` };
+        case "pending": return { state: "pending", ...(result.message ? { message: result.message } : {}) };
+        case "needsInput": {
+          const form = result.followUpForm;
+          const outcome = await askForm("action:" + base, form);
+          if (outcome?.status !== "submitted") return { state: "notRun" };
+          followUp++;
+          call = { key: `${base}/${followUp}`, spec, ...(call.target ? { target: call.target } : {}), input: outcome.values, formId: form.id, formRevision: form.revision };
+          continue;
+        }
+        default: return { state: "notRun", message: result.message };
+      }
+    }
   };
-  let result: ActionResult;
-  try {
-    result = await api<ActionResult>(pluginPath(spec.source, `actions/${encodeURIComponent(spec.id)}/invoke`), {
-      idempotencyKey: call.key, connectionId: ws.link.get().connectionId,
-      ...(call.target ? { target: call.target } : {}), ...(call.input ? { input: call.input } : {}),
-      ...(call.formId ? { formId: call.formId, formRevision: call.formRevision } : {}),
-    });
-  } catch (error) {
-    if (unknownResult(error)) {
-      trackOp({ key: call.key, source: spec.source, state: "unknown", message: `“${spec.title}”结果未知`, query });
-      return "unknown";
-    }
-    settleOp(call.key); toast((error as Error).message, "error"); return "failed";
-  }
-  switch (result.status) {
-    case "ok": settleOp(call.key); toast(result.message ?? `已${spec.title}`); if (result.openNodeId) onOpenNode?.(result.openNodeId); return "ok";
-    case "pending": trackOp({ key: call.key, source: spec.source, state: "pending", message: result.message ?? `“${spec.title}”处理中`, query }); return "pending";
-    case "needsInput": {
-      settleOp(call.key);
-      // 后续表单的提交沿用原 key 作前缀：<原 key>/<n>。
-      const base = call.key.replace(/\/\d+$/, ""); const n = followUp + 1; const form = result.followUpForm;
-      const outcome = await askForm("action:" + base, form);
-      if (outcome?.status !== "submitted") return "abandoned";
-      return invoke({ key: `${base}/${n}`, spec, target: call.target, input: outcome.values, formId: form.id, formRevision: form.revision }, onOpenNode, n, notRun);
-    }
-    default: settleOp(call.key); toast(result.message, "error"); return "failed";
-  }
+  return newOperation({ key: base, source: spec.source, attempt, pendingText: `“${spec.title}”处理中`, unknownText: `“${spec.title}”结果未知`, ...(text ? { text } : {}) });
 }
 
-/** 不经确认和 resolveForm 直接调用动作（输入框的 composer 动作）；每次调用生成新的幂等键。notRun 见 invoke。 */
-export function invokeAction(spec: ActionSpec, target: ActionTarget | undefined, input: FormAnswers | undefined, onOpenNode?: (nodeId: string) => void, notRun?: () => void): Promise<ActionOutcome> {
-  return invoke({ key: newId(), spec, ...(target ? { target } : {}), ...(input ? { input } : {}) }, onOpenNode, 0, notRun);
+/** 不经确认和 resolveForm 直接调用动作（输入框的 composer 动作）；每次调用生成新的幂等键。text 见 actionOperation。 */
+export function invokeAction(spec: ActionSpec, target: ActionTarget | undefined, input: FormAnswers | undefined, onOpenNode?: (nodeId: string) => void, text?: OpText): Promise<OpState> {
+  return actionOperation({ key: newId(), spec, ...(target ? { target } : {}), ...(input ? { input } : {}) }, onOpenNode, text).run();
 }
 
-/** 动作的点击流程：确认 → resolveForm → invoke（plugin-api.md“动作”）。 */
-export async function runAction(source: string, actionId: string, target: ActionTarget | undefined, onOpenNode?: (nodeId: string) => void): Promise<ActionOutcome> {
+/** 动作的点击流程：确认 → resolveForm → invoke（plugin-api.md“动作”）。用户在确认或附带表单处放弃时返回 abandoned。 */
+export async function runAction(source: string, actionId: string, target: ActionTarget | undefined, onOpenNode?: (nodeId: string) => void): Promise<OpState | "abandoned"> {
   const spec = actionSpec(source, actionId);
-  if (!spec) { toast("插件没有声明这个动作", "error"); return "failed"; }
+  if (!spec) { toast("插件没有声明这个动作", "error"); return "notRun"; }
   if (spec.confirm && !(await confirmInApp(spec.confirm, spec.danger))) return "abandoned";
   const key = newId();
   if (spec.hasForm) {
     let form: FormSpec | null;
     try { form = (await api<{ form: FormSpec | null }>(pluginPath(source, `actions/${encodeURIComponent(actionId)}/form`), { target })).form; }
-    catch (error) { toast((error as Error).message, "error"); return "failed"; }
+    catch (error) { toast((error as Error).message, "error"); return "notRun"; }
     if (form) {
       const outcome = await askForm("action:" + key, form);
       if (outcome?.status !== "submitted") return "abandoned";
-      return invoke({ key, spec, target, input: outcome.values, formId: form.id, formRevision: form.revision }, onOpenNode);
+      return actionOperation({ key, spec, ...(target ? { target } : {}), input: outcome.values, formId: form.id, formRevision: form.revision }, onOpenNode).run();
     }
   }
-  return invoke({ key, spec, target }, onOpenNode);
+  return actionOperation({ key, spec, ...(target ? { target } : {}) }, onOpenNode).run();
 }
 
 /** 设置页：来源插件已从配置中移除的 persistent 横幅。 */

@@ -19,6 +19,7 @@ export default function createPlugin() {
   const calls = { invoke: [], submit: [], send: [], abort: 0, resolveForm: 0, presence: [] };
   let slowRelease;
   let noteRelease;
+  let branches = 0;
 
   const node = (id, extra) => ({ id, source: "uitest", kind: "session", parentId: null, title: id, status: "idle", availability: "online",
     hasChildren: false, sortKey: id, revision, capabilities: ["open", "subscribe"], ...extra });
@@ -72,6 +73,13 @@ export default function createPlugin() {
       emitSession(id, { type: "pane_entries", entries: [entry], leafId: entry.id });
     },
     resync(id) { emitSession(id, { type: "resync" }); },
+    /** 换掉会话的当前分支：快照只给 current，更早的 older 要点“加载更早的消息”取得。 */
+    branch(id, older, current) {
+      const s = session(id);
+      const entry = (text, i, prefix) => ({ type: "message", id: `${prefix}${i}`, parentId: null, timestamp: now(), message: { role: "user", content: [{ type: "text", text }], timestamp: Date.now() } });
+      const tag = "b" + (++branches) + "-";
+      s.older = older.map((text, i) => entry(text, i, tag + "o")); s.entries = current.map((text, i) => entry(text, i, tag + "c"));
+    },
     /** 只改树节点的 send 能力和快照中的 readonly，不在会话流里推 pane_status（如接管后开放输入）。 */
     setSend(nodeId, sessionId, on) {
       session(sessionId).readonly = !on;
@@ -135,10 +143,11 @@ export default function createPlugin() {
       async snapshot(ref) {
         if (control.failSnapshots > 0) { control.failSnapshots--; throw new Error("会话服务已关闭"); }
         const s = session(ref.id);
-        return { ref, cursor: { epoch: STREAM, seq: s.seq }, leafId: s.entries.at(-1)?.id ?? null, entries: structuredClone(s.entries), historyBefore: null,
+        return { ref, cursor: { epoch: STREAM, seq: s.seq }, leafId: s.entries.at(-1)?.id ?? null, entries: structuredClone(s.entries),
+          historyBefore: s.older?.length ? s.entries[0]?.id ?? null : null,
           status: s.status, readonly: s.readonly, ...(s.readonly ? { readonlyReason: "archived" } : {}), controlRevision: 1 };
       },
-      async history() { return { entries: [], historyBefore: null }; },
+      async history(ref) { return { entries: structuredClone(session(ref.id).older ?? []), historyBefore: null }; },
       subscribe(ref, after, emit) {
         // 按游标重放之后的事件；游标不属于本流或超前时要求重取快照。
         const s = session(ref.id);

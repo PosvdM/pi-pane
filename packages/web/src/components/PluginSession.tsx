@@ -89,26 +89,20 @@ function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: 
   const action = composer && actionSpec(node.source, composer.actionId);
   const stop = () => void stopNode(node.id);
   /**
-   * 提交即清空：文字移出输入框后发出请求，等待期间输入框可以继续输入；确定没有执行（被拒、放弃了附带的表单）
-   * 或浏览器侧结果未知（断网）时，按原样放回到期间新写的内容之前。插件返回处理中（含服务端调用超时）时
-   * 文字不放回，留下“查询结果”；之后查到没有执行时再放回。动作和普通发送（sessions.send）走同样的规则。
+   * 提交即清空：文字移出输入框后发出请求，等待期间输入框可以继续输入。之后由操作对象（operation.ts）结算：
+   * 确定没有执行（被拒、冲突、放弃了附带的表单）或结果未知（断网、超时）时，原文不在输入框就放回到当前内容之前，
+   * 只放一次；处理中时不放回，留下“查询结果”；已放回后查到已送达时提示删去。动作和普通发送（sessions.send）走同一套。
    */
   const submit = async () => {
     const value = text.trim(); if (!value || busy) return;
     if (composer && !action) { toast("插件没有声明输入框使用的动作", "error"); return; }
     setDraft(node.id, () => ""); setBusy(true);
-    // 文字最多放回一次：当场确定没有执行或结果未知时放回；处理中的动作之后查询到没有执行时放回。
-    let restored = false;
-    const restore = () => { if (restored) return; restored = true; setDraft(node.id, (current) => restoreText(value, current)); };
-    let outcome: string;
+    const original = { restore: () => setDraft(node.id, (current) => restoreText(value, current)) };
     try {
       // 有 composer 时改为调用指定动作，文字放在 input.fields.message；不弹确认，也不取附带表单。
-      outcome = action
-        ? await invokeAction(action, { type: "node", nodeId: node.id }, { answers: [], fields: { message: value } }, openNodeById, restore)
-        : await sendToPlugin(value, running ? delivery : undefined, restore);
-    } catch (error) { toast((error as Error).message, "error"); outcome = "failed"; }
-    finally { setBusy(false); }
-    if (outcome === "failed" || outcome === "abandoned" || outcome === "unknown") restore();
+      if (action) await invokeAction(action, { type: "node", nodeId: node.id }, { answers: [], fields: { message: value } }, openNodeById, original);
+      else await sendToPlugin(value, running ? delivery : undefined, original);
+    } finally { setBusy(false); }
   };
   return (
     <div class="composer-wrap" data-testid="plugin-composer">
@@ -156,7 +150,9 @@ export function PluginSessionView() {
   useLayoutEffect(() => { const el = scroller.current; if (el && stick.current) el.scrollTop = el.scrollHeight; });
   useEffect(() => { stick.current = true; }, [view.nodeId]);
   const capabilities = node?.capabilities.join(" ");
-  useEffect(() => { if (node) syncCapabilities(node); }, [capabilities]);
+  const root = useRef<HTMLDivElement>(null);
+  // data-synced-capabilities 记下已交给 syncCapabilities 处理的能力，测试据此确认浏览器已处理能力更新。
+  useEffect(() => { if (node) { syncCapabilities(node); root.current?.setAttribute("data-synced-capabilities", capabilities ?? ""); } }, [capabilities]);
   if (!node) return <div class="placeholder">该节点已不在会话列表中。</div>;
   const pending = sortedForms(formMap.values()).filter((f) => f.nodeId === node.id);
   const status = model?.view.status ?? node.status;
@@ -192,7 +188,7 @@ export function PluginSessionView() {
     : READONLY_TEXT[model?.view.readonlyReason ?? ""] ?? (node.availability === "archived" ? "会话已存档" : "没有向该会话发消息的权限");
   return (
     <div class="main-split">
-      <div class="chat" data-testid="plugin-session" data-node-id={node.id}>
+      <div class="chat" data-testid="plugin-session" data-node-id={node.id} ref={root}>
         {head}
         {pendingBanner}
         {(status === "failed" || status === "interrupted") && node.statusDetail && <div class="banner error">{STATUS_TEXT[status]}：{node.statusDetail}</div>}

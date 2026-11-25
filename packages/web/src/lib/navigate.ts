@@ -1,6 +1,6 @@
 // 打开会话树节点：主会话按文件打开，插件节点打开插件视图。侧栏、面板、通知和工具卡片链接共用。
 import { closePluginView, openPluginNode, pluginView } from "./plugin-session.ts";
-import { current, openFile } from "./session.ts";
+import { current, detach, openFile } from "./session.ts";
 import { findNode, loadTree, pinNode, trees } from "./tree.ts";
 import { toast } from "./ui-state.ts";
 import type { PaneSessionNodeInfo, TreeNode } from "./types.ts";
@@ -19,6 +19,8 @@ export function openNode(node: TreeNode): void {
     closePluginView(); void openFile(info.cwd, info.sessionFile);
     return;
   }
+  // 打开插件节点也是一次导航：主会话的导航代次随之失效，旧会话迟到的切换结果（/new 等）和替换事件不再把视图拉回主会话。
+  detach();
   void openPluginNode(node);
 }
 

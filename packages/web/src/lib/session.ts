@@ -134,7 +134,7 @@ export async function open(id: string): Promise<void> {
   }
 }
 
-/** 退出主界面（重新配对等）时取消订阅并清空当前会话。 */
+/** 退出主界面（重新配对等）或打开插件节点时：导航代次加一，取消订阅并清空当前会话，在途的打开、重取和控制结果不再改动视图。 */
 export function detach(): void {
   nav++;
   unsubscribe?.(); unsubscribe = null;
