@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { png } from "../experiments/p0/b-bridge/images.mjs";
 import { prependDrafts } from "../packages/web/src/lib/draft.ts";
+import { ADOPT_SETTLE_MS, draftPrefix } from "../packages/web/src/lib/restored.ts";
 import { providerPath, until } from "./fixtures/helpers.mjs";
 import { openPaired, startWebServer } from "./fixtures/browser.mjs";
 import { setup, byId, newSession, idle, sessionView, records, replyScript, sessionItem, observePage, draftKey } from "./fixtures/web-e2e.mjs";
@@ -66,6 +67,16 @@ const rows = page => byId(page, "saved-draft");
 async function typeAtEnd(page, value) {
   await byId(page, "composer").evaluate(el => { el.focus(); const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection().removeAllRanges(); getSelection().addRange(range); });
   await page.keyboard.insertText(value);
+}
+/** 打字前确认输入框可编辑；不可编辑时报出输入框状态、本页 tabId 和草稿键，便于定位。 */
+async function editable(page, id) {
+  const state = await page.evaluate(() => ({
+    contenteditable: document.querySelector('[data-testid="composer"]')?.getAttribute("contenteditable"),
+    blocked: document.querySelector(".composer-blocked")?.textContent ?? null,
+    tabId: sessionStorage.getItem("pi-pane.tab"),
+    drafts: Object.keys(localStorage).filter(key => key.startsWith("pi-pane.tabdraft.") || key.startsWith("pi-pane.draft.")),
+  }));
+  assert.equal(state.contenteditable, "true", `输入框不可编辑：${JSON.stringify({ ...state, key: await draftKey(page, id) })}`);
 }
 async function tab(s, context = s.context) {
   const page = observePage(await context.newPage()); s.pages.push(page); page.setDefaultTimeout(15_000);
@@ -137,8 +148,10 @@ test("#10 Chrome 服务端关停时排队的草稿（含图片）保存，重启
   assert.deepEqual(record.drafts, drafts.map(nodes => ({ nodes, uncertain: false })), "关停时清出的原草稿（含图片节点）保存在服务端");
   assert.equal((await records(s.fixture.env.FAKE_REQUEST_LOG)).filter(row => row.kind === "request").length, before, "排队的消息没有发送");
 
+  // 先后打开：服务端只给先登记的打开请求带 recentModification 警告（只读），同时打开时哪一页只读不确定。
   const other = await tab(s);
-  await Promise.all([choose(paired, a), choose(other, a)]);
+  await choose(paired, a);
+  await choose(other, a);
   for (const page of [paired, other]) {
     await until(async () => await rows(page).count() === 1);
     const row = rows(page).first();
@@ -158,6 +171,7 @@ test("#10 Chrome 服务端关停时排队的草稿（含图片）保存，重启
   assert.doesNotMatch(await toasts(other), /已放回输入框/, "提示只出现在放回的一页");
 
   // 关闭原页（它的键里是“关停前的输入”）：另一页回到前台时收养，接在本页内容之前。
+  await editable(other, a.ref.id);
   await typeAtEnd(other, "另一页的输入");
   await until(async () => same(await stored(other, a.ref.id), text("另一页的输入")));
   const originalKey = await draftKey(s.page, a.ref.id);
@@ -285,7 +299,7 @@ test("Chrome 两页同一会话各写各的草稿，互不覆盖，刷新后仍�
   const all = await draftNodes(page);
   assert.ok(same(all, prependDrafts([text("第二页的草稿"), text("复制页的草稿")], want)) || same(all, prependDrafts([text("复制页的草稿"), text("第二页的草稿")], want)), "收养的草稿在前，本页内容在后");
   await until(async () => same(await stored(page, a.ref.id), all));
-  assert.deepEqual(await page.evaluate(prefix => Object.keys(localStorage).filter(key => key.startsWith(prefix)), `pi-pane.draft.${a.ref.id}.`), [await draftKey(page, a.ref.id)], "被收养的键已删除");
+  assert.deepEqual(await page.evaluate(prefix => Object.keys(localStorage).filter(key => key.startsWith(prefix)), draftPrefix(a.ref.id)), [await draftKey(page, a.ref.id)], "被收养的键已删除");
 
   // 末尾换行、连续换行、图片前后的换行：写进输入框再读出来完全一样。
   const newlines = [{ type: "text", text: "\n开头换行\n\n中间\n" }, { type: "image", assetId: "sha256-" + "b".repeat(64) }, { type: "text", text: "\n图片后\n\n" }];
@@ -380,4 +394,79 @@ test("Chrome 一页停止、结果返回期间另一页连续打字：两页的�
   assert.deepEqual(await draftNodes(other), text("放弃时的输入"));
   assert.deepEqual(await draftNodes(page), []);
   assert.doesNotMatch(await toasts(page), /已放弃/, "提示只出现在放弃的一页");
+});
+
+test("Chrome 输入后立即刷新或关页：页面隐藏时立即保存，防抖期间的输入不丢；刷新的页面不被另一页收养；关掉的页面由另一页不经任何操作收养", { timeout: 150_000 }, async t => {
+  const s = await setup(t, replyScript("预热完成"), { serverOptions }); if (!s) return;
+  const { page } = s;
+  const a = await create(s, "隐藏甲");
+  const other = await tab(s);
+  await choose(other, a);
+
+  // 输入后立即刷新：不等 300 毫秒的防抖。
+  await typeAtEnd(page, "刷新前最后的输入");
+  await page.reload();
+  await choose(page, a);
+  await until(async () => same(await draftNodes(page), text("刷新前最后的输入")));
+  // 另一页在等这一页的锁：刷新时旧页面释放锁，新页面随即取回，另一页稍等后再试收养时取不到，不收走刷新中页面的草稿。
+  await other.waitForTimeout(ADOPT_SETTLE_MS + 1_000);
+  assert.deepEqual(await draftNodes(other), [], "刷新中的页面的草稿没有被另一页收养");
+  assert.deepEqual(await draftNodes(page), text("刷新前最后的输入"));
+
+  // 输入后立即关页：关闭前写入它的键；另一页不需要回到前台或重新打开会话，等到它的锁释放后自动收养。
+  await typeAtEnd(page, "，关页前最后的输入");
+  await page.close();
+  const want = text("刷新前最后的输入，关页前最后的输入");
+  await until(async () => same(await draftNodes(other), want), ADOPT_SETTLE_MS + 15_000);
+  assert.match(await toasts(other), /已关闭的标签页中这个会话的草稿已放入输入框/);
+  await until(async () => same(await stored(other, a.ref.id), want));
+  assert.deepEqual(await other.evaluate(prefix => Object.keys(localStorage).filter(key => key.startsWith(prefix)), draftPrefix(a.ref.id)), [await draftKey(other, a.ref.id)], "被收养的键已删除");
+});
+
+test("#11 Chrome 领取响应丢失后刷新：服务端已领取，列表推送已去掉该条；本页的待取回条仍显示“领取结果未知”，点“重试”用原 requestId 拿到草稿", { timeout: 150_000 }, async t => {
+  const s = await setup(t, replyScript("预热完成"), { serverOptions }); if (!s) return;
+  const { page } = s;
+  const a = await create(s, "未知甲");
+  const drafts = await queueDrafts(s);
+  // 停止的结果没有交到页面（刷新），记录留在待取回条中。
+  const stop = await holdFirst(page, a.ref.id, "stop");
+  await byId(page, "stop").click();
+  await until(() => stop.result);
+  await page.reload();
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
+  await until(async () => await rows(page).count() === 1);
+  const recordId = await rows(page).first().getAttribute("data-record-id");
+
+  // 扣住领取的响应：服务端照常领取并删除记录，响应不交给页面。
+  const claim = { requestId: null, result: null };
+  await page.route("**/drafts/*/claim", async route => {
+    claim.requestId = route.request().postDataJSON().requestId;
+    claim.result = await (await route.fetch()).json();
+  });
+  await rows(page).first().getByTestId("saved-draft-restore").click();
+  await until(() => claim.result);
+  assert.equal(claim.result.status, "claimed");
+  assert.deepEqual(await saved(s, a.ref.id), [], "服务端已删除记录");
+  await page.waitForTimeout(500);
+  assert.equal(await rows(page).count(), 1, "领取进行中，列表推送去掉该条后本页仍显示");
+  assert.equal(JSON.parse(await page.evaluate(() => sessionStorage.getItem("pi-pane.claims." + sessionStorage.getItem("pi-pane.tab"))))[0].requestId, claim.requestId, "发出领取前已记下 requestId");
+
+  // 刷新：请求被取消，结果未知；条目从 sessionStorage 恢复，标“领取结果未知”。
+  await page.reload();
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
+  await until(async () => await rows(page).count() === 1);
+  const row = rows(page).first();
+  assert.equal(await row.getAttribute("data-record-id"), recordId);
+  assert.equal(await row.getAttribute("data-unknown"), "true");
+  assert.match(await row.textContent(), /领取结果未知/);
+  assert.deepEqual(await draftNodes(page), []);
+  const retried = page.waitForRequest(request => request.url().endsWith("/claim"));
+  await row.getByTestId("saved-draft-retry").click();
+  assert.equal((await retried).postDataJSON().requestId, claim.requestId, "重试沿用原 requestId");
+  await page.locator('[data-testid="composer"] .chip[data-asset-id]').waitFor();
+  assert.deepEqual(await draftNodes(page), prependDrafts(drafts, []));
+  await until(async () => await rows(page).count() === 0);
+  assert.equal(await page.evaluate(() => sessionStorage.getItem("pi-pane.claims." + sessionStorage.getItem("pi-pane.tab"))), null, "得到确定结果后删除");
 });

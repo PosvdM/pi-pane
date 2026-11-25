@@ -324,7 +324,7 @@ test("R9-1 取回草稿 Chrome 浏览器存储写入失败时草稿留在内存�
     await page.evaluate(() => {
       const original = Storage.prototype.setItem;
       Storage.prototype.setItem = function (key, value) {
-        if (/^pi-pane\.(draft|restored|notice)\./.test(String(key))) throw new DOMException("模拟配额已满", "QuotaExceededError");
+        if (/^pi-pane\.(tabdraft|draft|restored|notice)\./.test(String(key))) throw new DOMException("模拟配额已满", "QuotaExceededError");
         return original.call(this, key, value);
       };
     });

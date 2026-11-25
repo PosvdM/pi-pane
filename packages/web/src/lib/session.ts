@@ -329,7 +329,7 @@ async function clearing(sessionId: string, command: Extract<PaneControlCommand, 
   let release = () => {}; const owner = nav;
   try {
     const outcome = await control(command, undefined, (body) => { release = awaitSaved(body.requestId); });
-    if (outcome.ok && outcome.result.status === "done") await restoreCleared(sessionId, outcome.result, () => nav === owner);
+    if (outcome.ok && outcome.result.status === "done") await restoreCleared(sessionId, command.type, outcome.result, () => nav === owner);
     return outcome;
   } finally { release(); }
 }
@@ -339,18 +339,17 @@ async function clearing(sessionId: string, command: Extract<PaneControlCommand, 
  * 不弹确认框，也不看当前导航：用户已切换到其他会话时存入原会话的待放回记录。
  * 结果带 draftsRecord 时草稿已保存为服务端记录，按该 id 领取，领到才放回：其他页面可能已在待取回条中领走。
  * 没有 draftsRecord（没有草稿或服务端保存失败）时直接放回结果中的草稿。
+ * 领取结果未知时，这一条以结果中的草稿显示在待取回条中，标“领取结果未知”，由用户重试。
  * 提示只在用户仍停留在发起时的会话（here）时显示，迟到的结果不在其他会话中提示。
  */
-async function restoreCleared(sessionId: string, result: Extract<PaneControlResult, { status: "done" }>, here: () => boolean): Promise<void> {
-  if (!result.draftsRecord) {
-    deliverRestored(localStorage, sessionId, [
-      ...result.clearedDrafts.map((nodes) => ({ nodes, uncertain: false })),
-      ...(result.uncertainDrafts ?? []).map((nodes) => ({ nodes, uncertain: true })),
-    ]);
-    return;
-  }
+async function restoreCleared(sessionId: string, reason: "stop" | "close", result: Extract<PaneControlResult, { status: "done" }>, here: () => boolean): Promise<void> {
+  const drafts = [
+    ...result.clearedDrafts.map((nodes) => ({ nodes, uncertain: false })),
+    ...(result.uncertainDrafts ?? []).map((nodes) => ({ nodes, uncertain: true })),
+  ];
+  if (!result.draftsRecord) { deliverRestored(localStorage, sessionId, drafts); return; }
   let record;
-  try { record = await claimSaved(sessionId, result.draftsRecord); }
+  try { record = await claimSaved(sessionId, result.draftsRecord, {}, { record: { id: result.draftsRecord, reason, at: new Date().toISOString(), drafts } }); }
   catch { if (here()) toast("排队中的消息没能放回输入框，请在输入框上方的待取回列表中查看", "warning"); return; }
   if (record) deliverRestored(localStorage, sessionId, recordDrafts(record));
   else if (here()) toast("排队中的消息已在其他页面放回或放弃", "warning");

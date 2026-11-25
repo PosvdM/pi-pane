@@ -7,6 +7,7 @@ import { current, detach, lastSessionId, open } from "./lib/session.ts";
 import { useStore } from "./lib/store.ts";
 import { link, start, stop } from "./lib/ws.ts";
 import { installTab, tabReady } from "./lib/tab.ts";
+import { restoreClaims } from "./lib/saved-drafts.ts";
 import { sidebarOpen } from "./lib/actions.ts";
 import { overlay } from "./lib/ui-state.ts";
 import { ChatView } from "./components/Chat.tsx";
@@ -74,7 +75,8 @@ export function App() {
   const state = useStore(auth);
   // 输入框草稿按标签页保存：标签页标识确定之前不进入主界面。
   const tab = useStore(tabReady);
-  useEffect(() => { void boot(); void installTab(); }, []);
+  // 本标签页结果未知的领取按 tabId 保存在 sessionStorage 中，主界面显示之前恢复。
+  useEffect(() => { void boot(); void installTab((tabId) => { let storage: Storage | null = null; try { storage = sessionStorage; } catch { /* 不可用。 */ } restoreClaims(storage, tabId); }); }, []);
   return (
     <>
       {state.phase === "ready" && tab ? <Main /> : state.phase === "pairing" ? <PairPage /> : (
