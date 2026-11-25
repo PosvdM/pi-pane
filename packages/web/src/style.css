@@ -189,7 +189,8 @@ a { color: var(--accent); }
 .kv th { text-align: left; color: var(--muted); font-weight: normal; padding: 3px 12px 3px 0; white-space: nowrap; vertical-align: top; }
 .kv td { overflow-wrap: anywhere; }
 .select { user-select: all; word-break: break-all; }
-.toasts { position: fixed; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 8px; z-index: 40; max-width: 380px; }
+.toast-column { position: fixed; top: calc(var(--banners-h, 0px) + 12px); right: 12px; display: flex; flex-direction: column; gap: 8px; z-index: 40; max-width: 380px; pointer-events: none; }
+.toasts { display: flex; flex-direction: column; gap: 8px; pointer-events: auto; }
 .toast { display: flex; gap: 8px; align-items: flex-start; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 6px; padding: 8px 10px; box-shadow: 0 4px 14px rgba(0,0,0,.12); font-size: 13px; }
 .toast.warning { border-left-color: var(--warn); }
 .toast.error { border-left-color: var(--danger); }
@@ -282,7 +283,6 @@ body.resizing { cursor: col-resize; user-select: none; }
 .g-banner-body .md p, .g-banner-body .md ul { margin: 2px 0; }
 .g-banner-body .row { margin: 6px 0 0; }
 
-.plugin-toasts { position: absolute; top: 58px; right: 16px; }
 .toast-main { flex: 1; min-width: 0; }
 .toast-title { font-weight: 600; }
 .toast .md p { margin: 2px 0; }

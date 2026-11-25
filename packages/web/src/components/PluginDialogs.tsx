@@ -1,5 +1,5 @@
 // 插件交给浏览器的弹窗与提示：表单、用户在场确认、横幅、通知、结果未知的动作（plugin-api.md“表单”“用户在场确认”“横幅”“通知”“动作”）。
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { getOrCreateDevice, type DeviceInfo } from "../lib/device-key.ts";
 import { openNodeById } from "../lib/navigate.ts";
 import {
@@ -264,12 +264,23 @@ function Banner({ banner }: { banner: BannerState }) {
 /** 页面顶部的横幅：按级别（error 在前）排列，同级保持服务端给出的顺序；用户不能关闭，只能展开或收起。 */
 export function BannerStack() {
   const list = useStore(banners);
-  if (!list.length) return null;
+  const ref = useRef<HTMLDivElement>(null);
+  const shown = list.length > 0;
+  // 横幅区的高度写入 --banners-h，右上角的提示从横幅下方开始，不遮住横幅的来源标记和动作。
+  useEffect(() => {
+    const root = document.documentElement.style;
+    const el = ref.current;
+    if (!el) { root.setProperty("--banners-h", "0px"); return; }
+    const observer = new ResizeObserver(() => root.setProperty("--banners-h", `${el.offsetHeight}px`));
+    observer.observe(el);
+    return () => { observer.disconnect(); root.setProperty("--banners-h", "0px"); };
+  }, [shown]);
+  if (!shown) return null;
   const sorted = list.map((b, i) => ({ b, i })).sort((x, y) => LEVEL[x.b.level] - LEVEL[y.b.level] || x.i - y.i).map((x) => x.b);
-  return <div class="g-banners" data-testid="banners">{sorted.map((b) => <Banner key={b.source + "\u0000" + b.id} banner={b} />)}</div>;
+  return <div class="g-banners" data-testid="banners" ref={ref}>{sorted.map((b) => <Banner key={b.source + "\u0000" + b.id} banner={b} />)}</div>;
 }
 
-/** 通知与结果未知的动作，位于主区域右上角。 */
+/** 通知与结果未知的动作，与普通提示同在页面右上角的提示列中。 */
 export function PluginToasts() {
   const list = useStore(notifications);
   const actions = useStore(pendingActions);

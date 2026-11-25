@@ -61,7 +61,6 @@ function Main() {
       <main class="main">
         <button class="icon-btn sidebar-toggle" title="会话列表" onClick={() => sidebarOpen.set(!sidebar)}>☰</button>
         {net.state !== "open" && <div class="net-banner" data-testid="net-banner">{net.state === "connecting" ? "正在连接…" : "连接已断开，正在重连…"}</div>}
-        <PluginToasts />
         {plugin ? <PluginSessionView /> : state?.model ? <ChatView /> : (
           <div class="placeholder">
             {state?.loading ? "加载中…" : state?.error ? <span class="error-text">{state.error}</span> : (
@@ -93,7 +92,11 @@ export function App() {
         <div class="pair-page"><div class="pair-card">{state.phase === "loading" ? "正在连接 pi-pane…" : <>
           <p class="error-text">{state.message}</p><button class="btn" onClick={() => void boot()}>重试</button></>}</div></div>
       )}
-      <Toasts />
+      {/* 普通提示与插件通知同在一列，从横幅下方开始。 */}
+      <div class="toast-column">
+        <Toasts />
+        {state.phase === "ready" && <PluginToasts />}
+      </div>
     </>
   );
 }
