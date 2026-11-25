@@ -70,6 +70,12 @@ export default function createPlugin() {
       emitSession(id, { type: "pane_entries", entries: [entry], leafId: entry.id });
     },
     resync(id) { emitSession(id, { type: "resync" }); },
+    /** 只改树节点的 send 能力和快照中的 readonly，不在会话流里推 pane_status（如接管后开放输入）。 */
+    setSend(nodeId, sessionId, on) {
+      session(sessionId).readonly = !on;
+      const current = nodes.get(nodeId);
+      return upsert({ ...current, capabilities: on ? [...new Set([...current.capabilities, "send"])] : current.capabilities.filter((c) => c !== "send") });
+    },
     setReadonly(id, readonly) { const s = session(id); s.readonly = readonly; emitSession(id, { type: "pane_status", status: s.status, phase: "idle", readonly }); },
     addForm(form) { const value = { source: "uitest", revision: 1, createdAt: now(), ...form }; forms.set(value.id, value); ctx.formAdded(structuredClone(value)); return value; },
     removeForm(id, reason = "withdrawn") { forms.delete(id); ctx.formRemoved(id, reason); },
@@ -217,6 +223,8 @@ export default function createPlugin() {
         return respond(req.idempotencyKey, JSON.stringify([req.formId, req.revision, req.outcome]), async () => {
           if (handled.has(req.formId)) return { status: "alreadyHandled", message: "已在别处处理" };
           handled.set(req.formId, req.revision);
+          // pending 表单：插件受理后仍在处理，之后用同一个键查询得到 finishPending 给出的结果。
+          if (form.pending) return { status: "pending", message: "等待处理" };
           if (form.presence) {
             try {
               await ctx.userPresence.confirm({ title: "确认答复", summary: "答复 **" + form.title + "**", payload: { formId: form.id, outcome: req.outcome }, origin, timeoutMs: form.presence });

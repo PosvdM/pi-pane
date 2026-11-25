@@ -12,6 +12,8 @@ export default function createPlugin() {
     node("uitest2:session:guest", { parentId: "uitest:group:tasks", title: "外来任务", status: "running" }),
     // 自己的根：有子节点但不提供数目。
     node("uitest2:group:root", { kind: "group", title: "第二插件根", hasChildren: true }),
+    // 资源节点：点击时打开适用的面板。
+    node("uitest2:resource:doc", { kind: "resource", parentId: "uitest2:group:root", title: "说明文档", resourceRef: { source: "uitest2", type: "doc", id: "doc" } }),
     // 父节点在 uitest 中不存在：归入“未归属”。
     node("uitest2:session:stray", { parentId: "uitest:group:gone", title: "走失的任务", status: "running" }),
   ];
@@ -34,8 +36,11 @@ export default function createPlugin() {
       subscribe(from, emit) { if (from.epoch !== EPOCH) emit({ type: "reset", epoch: EPOCH }); return () => {}; },
     },
     panels: {
-      list: () => [{ id: "uitest.board", source: "uitest2", title: "第二看板", placement: "sidebar", badgeCount: 7, revision: 1 }],
-      async content() { return { type: "markdown", markdown: "第二插件的看板" }; },
+      list: () => [
+        { id: "uitest.board", source: "uitest2", title: "第二看板", placement: "sidebar", badgeCount: 7, revision: 1 },
+        { id: "uitest2.doc", source: "uitest2", title: "文档内容", placement: "node", appliesTo: { kinds: ["resource"], resourceTypes: ["doc"] }, revision: 1 },
+      ],
+      async content(panelId) { return { type: "markdown", markdown: panelId === "uitest2.doc" ? "资源文档内容" : "第二插件的看板" }; },
     },
   };
 }
