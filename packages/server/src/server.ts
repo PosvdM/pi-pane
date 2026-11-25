@@ -13,6 +13,7 @@ import { AssetStore, MAX_IMAGE_BYTES } from "./assets.js";
 import { BridgeBroker } from "./bridge.js";
 import { assert, PaneError } from "./errors.js";
 import { Sessions, type SessionManagerOptions } from "./sessions.js";
+import type { PaneClaimResult, PaneSavedDraftsList } from "./web-api.js";
 import { PiStore } from "./store.js";
 import { TrustDecisions } from "./trust.js";
 import { observeHostkit } from "./hostkit-cleanup.js";
@@ -117,7 +118,11 @@ export class PaneServer {
       server.port = await listenAvoidingForbidden(server.http, "127.0.0.1", port);
       // 驱动延迟到第一次发送才启动，监听端口确定后设置回连地址。
       server.sessions.setBridgeUrl(server.origin);
-      server.sweep = setInterval(() => { server.auth.sweep(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); try { server.assets.sweep(); } catch { /* 清理故障不影响会话；下次清理重试。 */ } }, 60000); server.sweep.unref();
+      const sweepDrafts = () => { void server.sessions.inflight.run("drafts.sweep", () => server.sessions.outbox.sweep()).catch(() => {}); };
+      // 仍被服务端暂存的清出草稿引用的附件不清理；读不出引用时放弃本次附件清理。清理故障不影响会话，下次重试。
+      const sweepAssets = () => { void server.sessions.inflight.run("assets.sweep", async () => { server.assets.sweep(await server.sessions.outbox.assets()); }).catch(() => {}); };
+      sweepDrafts();
+      server.sweep = setInterval(() => { server.auth.sweep(); sweepDrafts(); void server.sessions.inflight.run("exports.sweep", () => server.sessions.exports.sweep()).catch(() => {}); sweepAssets(); }, 60000); server.sweep.unref();
       return server;
     } catch (error) { await server.close().catch(() => {}); throw error; }
   }
@@ -172,14 +177,25 @@ export class PaneServer {
       if (req.method === "POST" && pathname === "/api/sessions/open") {
         const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, () => { this.assertAccepting(); return this.sessions.open(body); })); return;
       }
-      const route = pathname.match(/^\/api\/sessions\/([^/]+)\/(snapshot|history|control|query|ui)$/);
+      const route = pathname.match(/^\/api\/sessions\/([^/]+)\/(snapshot|history|control|query|ui|drafts)$/);
       if (route) {
         const id = decodeURIComponent(route[1]); const operation = route[2];
         if (req.method === "GET" && operation === "snapshot") { sendJson(res, 200, this.sessions.snapshot(id)); return; }
         if (req.method === "GET" && operation === "history") { sendJson(res, 200, this.sessions.history(id, url.searchParams.get("before") ?? "", Number(url.searchParams.get("limit") ?? 50))); return; }
         if (req.method === "POST" && operation === "control") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.command(id, body)); return; }
         if (req.method === "POST" && operation === "query") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.query(id, body.type)); return; }
+        if (req.method === "GET" && operation === "drafts") { sendJson(res, 200, { records: await this.sessions.savedDrafts(id) } satisfies PaneSavedDraftsList); return; }
         if (req.method === "POST" && operation === "ui") { const body = await jsonBody(req); this.assertAccepting(); sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async () => { this.assertAccepting(); return this.sessions.respondUi(id, body); })); return; }
+      }
+      const claim = pathname.match(/^\/api\/sessions\/([^/]+)\/drafts\/([^/]+)\/claim$/);
+      if (req.method === "POST" && claim) {
+        const id = decodeURIComponent(claim[1]); const recordId = decodeURIComponent(claim[2]);
+        const body = await jsonBody(req); this.assertAccepting();
+        // 领取会删除记录：响应丢失时浏览器用同一 requestId 重试，由幂等记录返回同一份内容。
+        sendJson(res, 200, await this.sessions.ledger.execute(body.requestId, { path: pathname, body }, async (): Promise<PaneClaimResult> => {
+          this.assertAccepting(); const record = await this.sessions.claimSavedDrafts(id, recordId);
+          return record ? { status: "claimed", record } : { status: "gone" };
+        })); return;
       }
       if (req.method === "POST" && pathname === "/api/assets") {
         const parts = await upload(req); this.assertAccepting(); const id = req.headers["x-request-id"];
@@ -253,7 +269,14 @@ export class PaneServer {
           const emit = (event: any) => this.push(client, { type: "session", ...event });
           const ref = { source: message.ref.source, id: message.ref.id };
           // 重新订阅时，待回答的询问只补发给本连接，不广播给已订阅的其他标签页。
-          if (ref.source === "pane") client.subscriptions.set(key, this.sessions.subscribe(ref.id, message.after as StreamCursor, emit, (request) => this.push(client, { type: "ui_request", ref, request })));
+          if (ref.source === "pane") {
+            const off = this.sessions.subscribe(ref.id, message.after as StreamCursor, emit, (request) => this.push(client, { type: "ui_request", ref, request }));
+            // 该会话的清出草稿记录增删时通知，浏览器重新读取待取回列表。
+            const offDrafts = this.sessions.outbox.onChange((sessionId) => { if (sessionId === ref.id) this.push(client, { type: "drafts_changed", ref }); });
+            client.subscriptions.set(key, () => { offDrafts(); off(); });
+            // 订阅生效后补推一次：浏览器用 HTTP 读取列表与订阅生效之间的变更不会漏掉。
+            this.push(client, { type: "drafts_changed", ref });
+          }
           else this.pluginSubscription(client, ref.source, key, () => this.plugins.subscribe(message.ref, message.after, emit));
         } else if (message.type === "unsubscribe") { const key = subscriptionKey("session", message.ref?.source, message.ref?.id); client.subscriptions.get(key)?.(); client.subscriptions.delete(key); }
         else if (message.type === "treeSubscribe") {

@@ -27,6 +27,7 @@
 | `packages/server/src/auth.ts` | 配对码、内存凭证、一次性 WebSocket ticket 和规范源校验 |
 | `packages/server/src/server.ts` | 规范源 HTTP、WebSocket 首帧鉴权、订阅与背压、multipart 图片上传 |
 | `packages/server/src/sessions.ts` | 会话登记、控制队列、增量取条目、切换路由、只读文件监视和回收 |
+| `packages/server/src/draft-outbox.ts` | 停止、关闭或关停时清出、尚未领取的排队草稿的落盘存储、读取、原子领取和过期清理 |
 | `packages/server/src/web-api.ts`、`web-adapter.ts`、`exports.ts` | 浏览器协议类型、pi 数据转换与 HTML 导出下载存储 |
 | `packages/server/src/driver.ts` | hostkit 写锁、启动门闩、RPC、就绪超时、进程停止和运行身份记录 |
 | `packages/server/src/writer-recovery.ts`、`stop-report.ts` | 首次拉起与目标切换的共同恢复检查、不完整报告隔离和停止报告判定 |
@@ -59,7 +60,9 @@
 | `lib/session.ts`、`lib/session-model.ts` | 会话导航、快照、控制命令与状态查询；按游标投影会话事件 |
 | `lib/response-order.ts` | 并发请求的采用规则：响应比已采用的结果新才采用，失败不撤销已采用的结果 |
 | `lib/draft.ts`、`lib/images.ts`、`lib/blobs.ts` | 图文草稿运算、图片缩放与上传、鉴权取图及 blob URL 缓存 |
-| `lib/restored.ts` | 输入框草稿的保存（写入失败时暂存内存）、在途提交与页面关闭后的取回、归属不明提示；停止、关闭清出或没有送达的草稿按会话交给输入框，未挂载时存入待放回记录 |
+| `lib/tab.ts` | 标签页标识：`sessionStorage` 中的 tabId，页面存活期间持有 `pi-pane.tab.<tabId>`，复制标签页时换新；没有 Web Locks 时每次加载换新 |
+| `lib/restored.ts` | 按标签页分键的输入框草稿（写入失败时暂存内存）和已关闭标签页草稿的收养（含等待其他标签页关闭）、在途提交与页面关闭后的取回、归属不明提示；停止、关闭清出或没有送达的草稿按会话交给输入框，未挂载时存入待放回记录 |
+| `lib/saved-drafts.ts` | 服务端保存的清出草稿：读取各会话未领取的记录、领取（120 秒总期限，响应丢失时用同一 `requestId` 重试；结果未知的领取记在 `sessionStorage` 中，刷新后仍可重试，收到确定的错误时换新的 `requestId`）、按记录的领取中状态、放回和放弃按发起时的会话处理，以及本页等待停止结果期间隐藏对应记录 |
 | `lib/markdown.ts` | 不可信 Markdown 的链接过滤、远程图片替代和代码高亮 |
 | `lib/device-key.ts`、`lib/jcs.ts` | IndexedDB 设备密钥、签名与 RFC 8785 规范 JSON |
 | `lib/events.ts`、`lib/ui-state.ts` | 扩展 UI 与信任询问事件、对话框和提示状态 |
@@ -67,6 +70,7 @@
 | `lib/store.ts`、`lib/types.ts` | 可订阅状态容器、前端协议类型出口 |
 | `components/Sidebar.tsx`、`components/Chat.tsx` | 按项目分组的会话列表、聊天记录与会话状态布局 |
 | `components/Composer.tsx`、`components/Message.tsx` | 输入框、图片占位符与命令补全；消息、思考和工具卡片渲染 |
+| `components/SavedDrafts.tsx` | 输入框上方的待取回条：列出该会话未领取的清出草稿记录，“放回输入框”或“放弃”；本页结果未知的领取标“领取结果未知”，“重试” |
 | `components/Dialogs.tsx`、`components/Overlays.tsx` | 扩展对话框、信任询问和确认；设置、模型、思考级别及会话操作弹层 |
 
 前端只以 `import type` 引用 `web-api.ts` 与 `@pi-pane/plugin-api` 的类型，`lib/types.ts` 用 `export type` 汇总，不把服务端实现打入浏览器包，也不解析 pi 原始 RPC 信封或会话文件。`session-model.ts` 按 [plugin-api.md 的“事件流”](plugin-api.md#事件流)游标规则投影会话事件。
@@ -77,10 +81,10 @@
 
 - **快照与续订**：先取得快照，再从其游标订阅；断线按最后游标续订，收到 `resync`、游标跳号或 epoch 不符时重新取快照并重新订阅，避免增量重复或缺失。
 - **导航代次**：打开、重取快照及其事件屏障须绑定会话和导航代次；只有最后一次导航能提交视图、错误、订阅和最近会话记录，旧请求不能覆盖新选择或屏蔽新会话事件。
-- **控制重试**：`pending` 每秒用同一请求体查询结果；网络错误也复用原 `requestId` 和完整请求体，网络重试窗口为发起控制后的 120 秒。超出窗口提示用户先核对会话再决定是否重发，不能把响应丢失直接当成未执行。
+- **控制重试**：`pending` 每秒用同一请求体查询结果；网络错误也复用原 `requestId` 和完整请求体，网络重试窗口为发起控制后的 120 秒。超出窗口提示用户先核对会话再决定是否重发，不能把响应丢失直接当成未执行。停止和关闭清出的草稿在返回结果之前已保存为服务端记录，结果没有交到页面时记录出现在待取回条中，浏览器不另存请求体续取。
 - **并发冲突**：收到 409 `revisionChanged` 后重取快照，提交的内容放回输入框，由用户重新确认送达方式或重新执行命令；不能自动用新 revision 重发，以免把旧意图应用到已变化的状态。
 - **扩展对话框**：服务端保存权威待答记录，每次订阅前清空本地对话框副本并等待服务端重发，避免显示离线期间已被其他标签页回答的问题。HTTP 回答失败时保留问题，相同答案重试复用请求体和 `requestId`。
-- **草稿保存**：编辑时立即捕获节点，延迟 300 毫秒写入按会话区分的 `localStorage`，写入失败时暂存在页面内存并提示（见 [architecture.md 的“取回草稿的交付”](architecture.md#停止与控制队列)）；切换会话或卸载时同步提交捕获内容并取消计时器，不能把缺失的 DOM ref 当成空草稿。提交消息或命令时立即清空并同步写入，内容存为在途提交，没有送达时放回（见 [architecture.md 的“提交即清空”](architecture.md#停止与控制队列)）。恢复图片草稿先显示内容，异步 touch 仅标记仍在 DOM 中的过期图片，不覆盖等待期间的编辑。
+- **草稿保存**：编辑时立即捕获节点，延迟 300 毫秒写入按会话和标签页区分的 `localStorage` 键，每个键只由一个标签页写入，页面隐藏和 `pagehide` 时立即写入；写入失败时暂存在页面内存并提示（见 [architecture.md 的“取回草稿的交付”](architecture.md#停止与控制队列)）。切换会话或卸载时同步提交捕获内容并取消计时器，不能把缺失的 DOM ref 当成空草稿。挂载或切换会话时读出的草稿不写回；输入框挂载、页面回到前台和等到其他标签页关闭时收养已关闭标签页的草稿。输入框的 HTML 由 `Composer.tsx` 的 `editorHtml` 生成，与 `readNodes` 互逆：以换行结尾的内容另加一个占位 `<br>`，末尾换行、连续换行和图片前后的换行写入后读回不变。提交消息或命令时立即清空并同步写入，内容存为在途提交，没有送达时放回（见 [architecture.md 的“提交即清空”](architecture.md#停止与控制队列)）。恢复图片草稿先显示内容，异步 touch 仅标记仍在 DOM 中的过期图片，不覆盖等待期间的编辑。
 - **图片编辑**：图片节点通过 `execCommand` 插入、删除和移动，保留 Chrome 原生撤销与重做；插入时暂去节点 class，完成后恢复，避免 Chrome 复制计算样式并生成违反 CSP 的内联样式。
 - **设备密钥**：登录后的应用初始化读取或生成不可导出的私钥，不依赖打开设置页；生成和重置通过同源 Web Locks 串行化，避免多个标签页各自写入不同密钥。签名格式见 [plugin-api.md 的“签名格式”](plugin-api.md#签名格式)，`userPresence` 确认流程与插件运行时属于 M3。
 
@@ -123,6 +127,7 @@ node --test --test-concurrency=1 test/web-*.test.mjs test/ui-extension.test.mjs 
 | `GET /api/sessions/:id/history?before=<id>&limit=50` | 按父链读取更早的聊天分支条目 |
 | `POST /api/sessions/:id/control` | `{requestId,expectedEpoch,expectedRevision,command,draft?}`；普通控制串行、停止优先和幂等 |
 | `POST /api/sessions/:id/query` | `{type:PaneQueryType}`，`type` 为 `state`、`models`、`commands`、`stats` 或 `forkPoints`；响应为 `PaneQueryResults[type]`，不含 RPC 信封；pi 拒绝时返回 409 `rpcRejected` |
+| `GET /api/sessions/:id/drafts`、`POST /api/sessions/:id/drafts/:recordId/claim` | 服务端保存的清出草稿 `PaneSavedDraftsList`；`{requestId}` 领取一条记录，原子地删除并返回 `PaneClaimResult`，见 [architecture.md 的“服务端暂存的清出草稿”](architecture.md#服务端暂存的清出草稿) |
 | `POST /api/sessions/:id/ui` | `PaneUiAnswerRequest`：`{requestId,expectedEpoch,id,answer?}`；`answer` 为 `{value}` 或 `{confirmed}`，省略表示取消；种类或选项不匹配时返回 400 `invalidUiAnswer` |
 | `GET /api/exports/:id` | 下载本实例生成且未过期的 HTML；需要凭证；文件位于数据目录的 `tmp/exports/`，24 小时后清理 |
 | `GET /api/trust`、`POST /api/trust/:id` | 待答信任询问、`{requestId,decision?:{trusted,remember}}`；省略决定表示关闭询问 |
@@ -148,7 +153,7 @@ node --test --test-concurrency=1 test/web-*.test.mjs test/ui-extension.test.mjs 
 
 服务关闭先封闭实例共用的 Inflight 门禁，新的打开、控制、RPC、UI 回应及 bridge 事件返回 serverStopping。全部会话同步标记关闭，各写者并行请求停止。统一屏障覆盖已受理 open/probe、在途启动、取锁及 spawn、目标取锁、初始化、持久化、RPC 和 bridge 身份核查；`sessions.close.settle` 也登记停止本身、局部 drain、启动及 handle 收尾，不能先在屏障外无限等待。
 
-关闭一定有界完成或拒绝：停止与全部在途操作排空共用 `ceil(abortTimeoutMs + graceMs + termGraceMs + 7000)` 毫秒，默认 **25000 毫秒**。HTTP/WebSocket 关闭、实例锁释放再分别最多等待 **5000 毫秒**，默认总等待上限 **35000 毫秒**。配置必须可表示为合法 Node.js 定时器；异步期限以事件循环可以运行作为前提。停止失败时，handle 主动终结全部 pane 本地 RPC 等待，未确认的控制结果缓存 `rpcResultUnknown`，不假定远端执行结果，也不修改 hostkit 传输。正常停止仍由真实响应或管道关闭结束等待。
+关闭一定有界完成或拒绝：停止与全部在途操作排空共用 `ceil(abortTimeoutMs + graceMs + termGraceMs + 9000)` 毫秒，默认 **27000 毫秒**。HTTP/WebSocket 关闭、实例锁释放再分别最多等待 **5000 毫秒**，默认总等待上限 **37000 毫秒**。配置必须可表示为合法 Node.js 定时器；异步期限以事件循环可以运行作为前提。停止失败时，handle 主动终结全部 pane 本地 RPC 等待，未确认的控制结果缓存 `rpcResultUnknown`，不假定远端执行结果，也不修改 hostkit 传输。正常停止仍由真实响应或管道关闭结束等待。
 
 停止/排空超时返回含 `shutdownTimeout` 的关闭失败，错误消息和 `detail.pending` 列出剩余登记的 kind 和调用栈来源；超时不删除登记、不允许进入实例锁释放。成功或失败关闭均进入 HTTP/WebSocket 收尾。清理未确认时保留实例锁、尚未释放的写锁及运行/恢复记录；超时失败闩禁止迟到停止成功再进入写锁释放或记录删除，现场交给下一实例恢复或维护者。已经进入的原生操作不能撤销，实例锁释放超时只报告未确认。并发及重复 close 返回同一个 Promise 和失败，迟到成功不能改变结果。
 
@@ -221,6 +226,7 @@ CLI 的静态目录默认是相对 server dist 的 `../../web/dist`，可用配�
 | 审查回归 Q1–Q4 | `test/web-e2e-regressions-3.test.mjs`：参数模板与固定模板附图排队后停止，原 `assetId`、图片节点和顺序恢复，两条同文字按先进先出对应，重新发送后磁盘图片哈希一致（Q1）；两页打开同一会话，一页关闭后两页都显示未启动、不再查询 `notHosted`，再次发送正常启动（Q2）；重启与关闭确认期间导航到其他会话后不再提交（Q3）；两次信任快照乱序时已回答的询问不复活（Q4）；editor 对话框出现后立即填写的内容不被预填值覆盖。`test/web-protocol.test.mjs`：steer、follow-up 与带 `delivery` 的 prompt 四种路径的 `clearedDrafts` 含图片节点 |
 | 取回草稿的结束路径 | `test/web-e2e-stop-restore.test.mjs`：扩展改写的图片草稿与纯文字排队后停止，确定的与归属不明的草稿按顺序前置到现有草稿，立即写入草稿存储，不出现确认框；归属不明的提示显示在输入框上方，刷新后仍在，切到其他会话不显示，删除部分内容不改变，清空输入框后移除且不复活；A 的停止或关闭响应晚于导航到 B 时，B 正显示的确认框不被替换，B 的输入框和提示不受影响，A 的草稿存入 A 的待放回记录，回到 A 后放回并删除记录，点“知道了”后提示消失、刷新后也不出现；待放回记录在服务端同端口重启、重新配对后回到原会话输入框；有排队消息时执行 `/quit`，关闭后输入框只有取回的草稿（R9-3）；`localStorage` 写入抛出 `QuotaExceededError` 时草稿留在内存，回到原会话后放回并显示错误提示，B 不显示（R9-1） |
 | 提交即清空 | `test/web-e2e-stop-restore.test.mjs`：执行 `/quit`（含带尾换行）后输入框和原会话草稿存储立即清空，内容存为在途提交，关闭响应前切走、切回，原会话都只有清出的草稿；消息送达前重新输入同样的文字，迟到的成功响应不清掉新草稿；服务端拒绝时内容放回原会话、排在期间新写的内容之前，切走后失败则进入原会话的待放回记录，服务端内部错误时放回并提示无法确认；提交后、结果返回前刷新页面，内容回到原会话并提示。`test/restored-drafts.test.mjs`：送达丢弃、失败原样放回、结果无法确认时标记归属不明、输入框未挂载时进入待放回记录；页面关闭后遗留的在途记录按锁是否仍被持有取回，保护期内的稍后再查，没有 Web Locks 时只取超过时限的记录；提示的累加与按时间移除；挂载时直接放回、未挂载时每批独立保存、多批都含归属不明项时逐条标记（R9-5）、同一毫秒内存入的多批后到的在前、会话 id 互为前缀（`a` 与 `a.b`）及含孤立代理项时不串会话、不出错，取走旧批期间写入的新批不被删除（R9-6）、配额不足时内存暂存与写回、写入失败保留记录、损坏记录清除、注销旧输入框不影响新挂载。`test/queue-mirror.test.mjs`：停止快照后扩展追加消息时按最少追加项对齐，唯一认领、分组认领、保留或删除图片标记、窗口内消费与同文追加的归属 |
+| 清出草稿不丢（#10、#11、#17） | `test/web-e2e-durable-drafts.test.mjs`（Chrome）：排队的图片与文字草稿在服务端关停（`server.close()`，即 Ctrl+C 调用的路径）时以 `shutdown` 记录保存且未发送；同端口重启、重新配对后两个标签页打开该会话都显示待取回条（来源、文字预览、图片数），不自动放回，关停前的页面仍开着时不收养它的草稿；一页点“放回输入框”后草稿进入这一页，两页的条都消失，另一页的输入框不变，提示只在放回的一页；关闭关停前的页面后，另一页回到前台时收养它的草稿（接在本页内容之前、提示、删除原键），放回的一页不受影响；刷新、切换会话后各页草稿保留、不重复、不再出现条。停止已执行、结果返回前刷新发起页面：发起页等待期间不显示这条记录，另一独立浏览器配置显示；刷新后发起页显示待取回条、不自动放回；两边同时放回，服务端只给一边 `claimed`，另一边 `gone` 并提示，草稿只进入一边的输入框，领取后再刷新不重复。两页同一会话各写各的草稿，各存在自己的键中，互不覆盖，刷新沿用 tabId、草稿仍在；停止成功时发起页领取并直接放回、不显示条，另一页的输入框和草稿不变；复制标签页（`sessionStorage` 中的 tabId 与原页相同）换新 tabId，看不到也不覆盖原页的草稿；关闭另一页和复制页后，本页重新打开该会话时收养两者的草稿，被收养的键删除；末尾换行、连续换行和图片前后的换行写入输入框再读出不变。重启后两页先后打开会话，打字前断言输入框可编辑，不可编辑时输出输入框状态、tabId 和草稿键。输入后立即刷新，草稿仍在，另一页等到锁释放 3 秒后也不收走刷新页面的草稿；输入后立即关页，另一页不经切换会话或回到前台即收养，被收养的键删除。领取响应被扣住（服务端已领取、列表推送已去掉该条）时本页仍显示这一条，刷新后标“领取结果未知”，“重试”沿用原 `requestId` 拿到含图片的草稿，之后删除 `sessionStorage` 中的记录。一页停止、结果返回期间另一页连续打字（防抖期间一直有未保存的编辑）：放回的草稿留在发起页并写入它的键，另一页的输入和键不受影响；“放弃”先确认，取消时记录保留，确认后两页的条都消失、输入框不变，提示只在放弃的一页。`test/saved-drafts.test.mjs`：领取在网络中断时用同一 `requestId` 按 0.5、1、2、4 秒退避重试，退避截在 120 秒的总期限处、期限外不再发请求，抛出 `claimTimeout`；`pending` 时每秒查询、不超过期限；挂住的请求在总期限到时中止，再次领取同一记录沿用原 `requestId`、取回服务端迟到完成的结果，领到之后换新的 `requestId`；其他错误不重试，确定的错误响应（如 500）丢掉原 `requestId`、下次换新的，网络中断到期限后沿用；领取响应丢失、列表已去掉该条时，结果未知的领取仍在条目中，“重试”沿用原 `requestId` 放回草稿，放弃的重试不再确认；结果未知的领取按 tabId 存入 `sessionStorage`，刷新后恢复并能重试，其他 tabId 的项删除；领取中只有该记录忙碌，同一会话的其他记录和其他会话可以领取；乱序到达的旧列表丢弃，读取失败保留已显示的列表；放弃的确认期间切换会话不执行、取消不执行；放回、放弃、已被领取的结果迟到时不在其他会话提示，放回的草稿仍交给原会话。`test/restored-drafts.test.mjs`：草稿按标签页分键、两页各写各的，会话 id 形如 `A.<tabId>` 的旧键与会话 `A` 的新键不同；收养时锁被持有（标签页仍开着）跳过并返回它的 tabId，取得锁时放在本页内容之前、先写本页的键再删原键，锁内重读、已被收养走的不再收养，输入框已切换会话时不收养；本页写入失败时保留原键、不重复收养、之后写入成功时在原主的锁内删除原键，原主的锁被持有时不删、锁释放后再删，原键的值变化时不删并按新内容重新收养；旧版共用键在锁内收养，会话 `S.<tabId>` 的旧键不当作会话 `S` 的标签页键；没有 Web Locks 时不收养任何键；等待其他标签页关闭时锁释放即调用并立即释放锁，撤销后不再调用。`test/tab-identity.test.mjs`：新页面分配 tabId 并持有锁，刷新沿用（旧页面稍晚释放锁时同样沿用），复制标签页等待后换新；没有 Web Locks 时每次加载换新 tabId。`test/durable-drafts.test.mjs`：存储格式、哈希文件名、0600 权限（Windows 不检查 POSIX 权限位）、按会话隔离、损坏文件和非目录项跳过、保存和领取时通知所属会话、领取返回内容且只能领取一次、不能跨会话领取、过期记录与临时文件清理、领取中文件按名称中的时间清理；并发领取同一条只有一个拿到；清理、领取与保存并发 200 次保存都成功；被记录或领取中文件引用的图片 29 天后仍在，领取时刷新使用时间、之后按 7 天期限清理；草稿接口未鉴权 401、Host 或 Origin 不符 403、同一 `requestId` 领取不同记录 409；记录过期被清理时通知所属会话，损坏的过期文件删除但不通知；附件扫描在读取前记录被改名为领取中文件时重扫并计入，领取中文件已删除时领取已刷新使用时间、图片不被清理，目录持续变化 5 次后放弃本次附件清理；读到尚未写完的临时文件时重扫、从写完的记录计入，领取中文件改回记录时重扫并计入，无法解析的临时文件一直在时放弃本次附件清理；真实 pi 排队后关停保存原草稿（含图片节点，steering 在前），重启后未打开的会话可读取，订阅生效后补推一次 `drafts_changed`，订阅的连接在领取时再收到一次，领取后不再返回，其他请求领不到，同一 `requestId` 重试得到同一份内容；`stop`、`close` 以 `requestId` 保存且只保存一条，结果带 `draftsRecord`，返回前已推送 `drafts_changed`，同一请求续取得到原结果，重启后旧 epoch 被拒绝、不重新执行，记录仍可领取；关停时 `clear_queue` 响应迟到（pi 已清空队列），全部草稿作为归属不明保存；停止时第一次 `clear_queue` 失败、写者停止流程的第二次清出了仍在队列中的两条，只有停止请求的一条记录；保存挂起时停止在 2 至 8 秒内返回、结果不带 `draftsRecord`，同一会话的读取和领取在 1 秒内完成；保存挂起时关停在 2 至 8 秒内完成并停止 pi 进程；CLI 收到 SIGINT 后退出（Windows 跳过）。`test/restored-drafts.test.mjs`：其他页面持有锁的过期在途提交每秒重查，锁释放后取回（#17） |
 | 草稿初始化与信任快照 | `test/web-e2e-regressions-2.test.mjs`：连续五次新建后立即 fill 和 Enter，核对首次提交目标、provider 次数和磁盘消息；重连的旧空信任快照晚于新项目 `.pi/settings.json` 触发的实时询问，补取快照后保留信任框，回答后真实 pi 完成启动 |
 
 `test/web-api.test.mjs`、`test/web-protocol.test.mjs` 验证 pane 类型转换、查询、控制结果、导出鉴权和 UI 回答生命周期。`web-protocol` 还验证未托管终端命令被服务端拒绝且无运行记录和模型请求、已托管的同名 `debug` 扩展命令立即执行、隔离 agent 目录下 `prompts/*.md` 模板在运行中按两种 `delivery` 展开排队、缺少送达字段时由 pi 拒绝，以及字段校验与幂等内容冲突；`test/web-state-sync.test.mjs` 验证状态缓存提交、事件合并及代次隔离。这些接口测试不能替代对应的浏览器交互测试。

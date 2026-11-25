@@ -101,10 +101,12 @@ export class AssetStore {
     assert(meta && existsSync(file), "blobMissing", "图片缓存缺失，请重新读取会话", 404); meta.used = this.now();
     return { data: readFileSync(file), mimeType: meta.mimeType };
   }
-  sweep(): void {
+  /** 删除 7 天未使用的附件和超出容量的 blob 缓存。keep 中的附件仍被服务端暂存的清出草稿引用（DraftOutbox.assets），不删除。 */
+  sweep(keep: ReadonlySet<string> = new Set()): void {
     for (const prefix of readdirSync(path.join(this.home, "assets"))) {
       const dir = path.join(this.home, "assets", prefix); if (!statSync(dir).isDirectory()) continue;
       for (const name of readdirSync(dir).filter((f) => /^[a-f0-9]{64}\.json$/.test(f))) {
+        if (keep.has("sha256-" + name.slice(0, -5))) continue;
         const meta = JSON.parse(readFileSync(path.join(dir, name), "utf8")) as AssetMeta;
         if (meta.lastUsedAt + 7 * 86400000 >= this.now()) continue;
         for (const suffix of [".json", ".thumb.webp", "." + extensions[meta.mimeType]]) {

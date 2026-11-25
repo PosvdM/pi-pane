@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { readSession } from "../packages/server/dist/store.js";
 import { openPaired } from "./fixtures/browser.mjs";
 import { providerPath, uiExtensionPath, until } from "./fixtures/helpers.mjs";
-import { setup, byId, newSession, send, idle, sessionView, records, replyScript, secondTab, sessionItem } from "./fixtures/web-e2e.mjs";
+import { setup, byId, newSession, send, idle, sessionView, records, replyScript, secondTab, sessionItem, draftKey } from "./fixtures/web-e2e.mjs";
 
 const progressTool = fileURLToPath(new URL("./fixtures/progress-tool.ts", import.meta.url));
 const extensionOptions = {
@@ -64,7 +64,7 @@ test("R1 Chrome 已保存草稿在最后一次编辑后立即切换会话仍完�
   const a = await create(s, "草稿会话甲");
   const b = await create(s, "草稿会话乙");
   await choose(page, a);
-  const key = `pi-pane.draft.${a.ref.id}`;
+  const key = await draftKey(page, a.ref.id);
   await byId(page, "composer").fill("已保存草稿");
   await page.waitForFunction(key => localStorage.getItem(key) === JSON.stringify([{ type: "text", text: "已保存草稿" }]), key);
   // 编辑与点击发生在同一浏览器任务中，确定早于 300 毫秒保存计时器。
@@ -88,9 +88,9 @@ test("R1 Chrome 图片草稿先显示，慢 touch 只标记过期图片且保留
   const a = await create(s, "图片草稿甲");
   const b = await create(s, "图片草稿乙");
   const assetId = "sha256-" + "a".repeat(64);
-  await page.evaluate(({ id, assetId }) => localStorage.setItem(`pi-pane.draft.${id}`, JSON.stringify([
+  await page.evaluate(({ key, assetId }) => localStorage.setItem(key, JSON.stringify([
     { type: "text", text: "图片草稿" }, { type: "image", assetId },
-  ])), { id: a.ref.id, assetId });
+  ])), { key: await draftKey(page, a.ref.id), assetId });
   const gate = latch(); let captured = false;
   await page.route("**/api/assets/touch", async route => {
     const response = await route.fetch(); captured = true;
