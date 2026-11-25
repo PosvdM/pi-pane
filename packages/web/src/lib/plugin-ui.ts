@@ -38,6 +38,13 @@ export function panelRevision(state: PanelState | undefined, nodeId?: string): n
   if (!state) return 0;
   return nodeId ? Math.max(state.all, state.nodes[nodeId] ?? 0) : state.revision;
 }
+/**
+ * 面板内容的代数：每次连接建立时加一，显示中的面板据此重新拉取。断线期间错过的 panelChanged 不会重放，
+ * 丢掉修订号后有效修订号可能不变（如此前没收到过推送，前后都是 0），只看修订号就会一直显示断线前的内容。
+ * 插件启用或变为不可用（plugins 帧）时不加：插件目录重读完成前重新拉取会读到已停用的插件；插件目录里的
+ * PanelSpec.revision 变化时面板照常重新拉取（见 Panels.tsx）。
+ */
+export const panelGeneration = new Store<number>(0);
 /** 插件重启后修订号可能从小值重新开始：丢掉该来源（省略时全部）的面板状态，以重读的插件目录为准。 */
 function forgetPanels(source?: string): void {
   panelState.set((s) => source === undefined ? {} : Object.fromEntries(Object.entries(s).filter(([key]) => !key.startsWith(panelKey(source, "")))));
@@ -105,14 +112,17 @@ export async function registerDevice(): Promise<void> {
   try { sendDevice(await getOrCreateDevice()); } catch { /* 不支持 WebCrypto 或 IndexedDB：确认时回应 unsupported。 */ }
 }
 
+/** 设备密钥的版本：本标签页或其他标签页重置密钥后加一，打开着的在场确认框据此重新读取签名设备。 */
+export const deviceVersion = new Store<number>(0);
 /** 同一浏览器的标签页共用 IndexedDB 中的密钥：一个标签页重置后通知其他标签页按新密钥重新登记。 */
 const deviceChannel = typeof BroadcastChannel === "function" ? new BroadcastChannel("pi-pane-device") : null;
-deviceChannel?.addEventListener("message", () => { void registerDevice(); });
+deviceChannel?.addEventListener("message", () => { deviceVersion.set((n) => n + 1); void registerDevice(); });
 
 /** 设置页的“重置设备密钥”：生成新密钥，在本标签页和其他已打开的标签页重新登记。 */
 export async function resetDeviceKey(): Promise<DeviceInfo> {
   const device = await resetDevice();
   sendDevice(device);
+  deviceVersion.set((n) => n + 1);
   deviceChannel?.postMessage("reset");
   return device;
 }
@@ -127,7 +137,7 @@ export function installPluginHandlers(onConnected: () => void): void {
         // 连接建立：横幅以服务端列表为准；表单由服务端对齐后逐条重发并以 formsAligned 结束，期间保留旧列表；
         // 在场确认属于旧连接，全部作废。
         banners.set(message.banners ?? []);
-        aligning = new Set(); presence.set([]); registered = null; forgetPanels();
+        aligning = new Set(); presence.set([]); registered = null; forgetPanels(); panelGeneration.set((n) => n + 1);
         void registerDevice(); onConnected();
         break;
       case "banner": {
@@ -182,8 +192,12 @@ async function respondPresence(request: PanePresenceRequest, response: { proof: 
   }
 }
 
-/** 回应在场确认：确认时用设备密钥签名，拒绝时回 rejected，浏览器不支持时回 unsupported。 */
-export async function answerPresence(request: PanePresenceRequest, confirm: boolean): Promise<void> {
+/**
+ * 回应在场确认：确认时用设备密钥签名，拒绝时回 rejected，浏览器不支持时回 unsupported。
+ * shownDeviceId 是确认框上显示的签名设备：签名用的密钥与它不同（确认框打开后其他标签页重置了密钥）时不发送，
+ * 返回 "deviceChanged"，确认框刷新为新设备后由用户重新确认。
+ */
+export async function answerPresence(request: PanePresenceRequest, confirm: boolean, shownDeviceId?: string): Promise<void | "deviceChanged"> {
   if (!confirm) return respondPresence(request, { error: "rejected" });
   let proof: PresenceProof;
   try {
@@ -196,6 +210,10 @@ export async function answerPresence(request: PanePresenceRequest, confirm: bool
   } catch {
     toast("本浏览器无法签名（不支持 WebCrypto 或 IndexedDB）", "error");
     return respondPresence(request, { error: "unsupported" });
+  }
+  if (shownDeviceId !== undefined && proof.deviceId !== shownDeviceId) {
+    deviceVersion.set((n) => n + 1);
+    return "deviceChanged";
   }
   // 服务端按本连接登记的设备核对签名设备；密钥已被其他标签页重置时先按签名用的密钥重新登记（同一连接上按序送达）。
   if (registered?.deviceId !== proof.deviceId || registered.connectionId !== ws.link.get().connectionId) {
@@ -230,10 +248,18 @@ export async function submitForm(form: FormSpec, outcome: FormOutcome, retry?: F
   }
 }
 
-/** 用同一个幂等键查询一次已提交表单的当前状态。 */
+/** 用同一个幂等键查询一次已提交表单的当前状态；同一表单的查询进行中时共用它。 */
+const formQueries = new Map<string, Promise<boolean>>();
 export function queryForm(form: FormSpec): Promise<boolean> | undefined {
-  const busy = formBusy.get()[formKey(form.source, form.id)];
-  return busy ? submitForm(form, busy.outcome, busy).catch((error) => { toast((error as Error).message, "error"); return true; }) : undefined;
+  const key = formKey(form.source, form.id);
+  const running = formQueries.get(key);
+  if (running) return running;
+  const busy = formBusy.get()[key];
+  if (!busy) return undefined;
+  const query = submitForm(form, busy.outcome, busy).catch((error) => { toast((error as Error).message, "error"); return true; })
+    .finally(() => { formQueries.delete(key); });
+  formQueries.set(key, query);
+  return query;
 }
 
 /**
@@ -244,6 +270,20 @@ export interface PendingOp { key: string; source: string; state: "pending" | "un
 export const pendingOps = new Store<PendingOp[]>([]);
 export function trackOp(op: PendingOp): void { pendingOps.set((list) => [...list.filter((a) => a.key !== op.key), op]); }
 export function settleOp(key: string): void { pendingOps.set((list) => list.filter((a) => a.key !== key)); }
+
+/**
+ * 同一操作（同一幂等键）同时只进行一次查询：连续点击“查询结果”时后来的点击共用进行中的那次。
+ * 否则两条查询各自等待同一个后续表单，用户提交后，另一条把弹窗消失当成放弃，放回已经执行了的内容。
+ */
+const querying = new Map<string, Promise<unknown>>();
+export function queryOp(op: PendingOp): Promise<unknown> {
+  let running = querying.get(op.key);
+  if (!running) {
+    running = op.query().finally(() => { querying.delete(op.key); });
+    querying.set(op.key, running);
+  }
+  return running;
+}
 
 /**
  * 一次动作调用的最终去向：ok 已执行；pending 已受理仍在处理；unknown 结果未知；

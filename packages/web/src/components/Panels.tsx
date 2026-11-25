@@ -1,7 +1,7 @@
 // 插件面板：按 PanelContent 的类型用内置组件渲染，内容按需拉取，收到 panelChanged 后重新拉取（plugin-api.md“面板”）。
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api } from "../lib/api.ts";
-import { panelKey, panelRevision, panelState, runAction } from "../lib/plugin-ui.ts";
+import { panelGeneration, panelKey, panelRevision, panelState, runAction } from "../lib/plugin-ui.ts";
 import { actionSpec, pluginName, plugins } from "../lib/plugins.ts";
 import { Store, useStore } from "../lib/store.ts";
 import type { PanelContent, PanelSpec, TreeNode } from "../lib/types.ts";
@@ -62,7 +62,8 @@ export function PanelBody({ panel, content, onOpenNode }: { panel: PanelSpec; co
 }
 
 /**
- * 拉取并显示一个面板；面板修订号变化且影响本节点（或全部）时重新拉取。
+ * 拉取并显示一个面板；面板修订号变化且影响本节点（或全部）、插件目录里的 PanelSpec.revision 变化，
+ * 或连接重建（panelGeneration）时重新拉取。
  * 内容记下它属于哪个面板和节点：切换面板后、新内容到达前不显示旧面板的行，行动作也就不会带着新面板的 id 提交旧行。
  */
 export function PanelView({ panel, nodeId, onOpenNode }: { panel: PanelSpec; nodeId?: string; onOpenNode: (id: string) => void }) {
@@ -73,6 +74,7 @@ export function PanelView({ panel, nodeId, onOpenNode }: { panel: PanelSpec; nod
   const [error, setError] = useState<{ target: string; message: string } | null>(null);
   // 只影响其他节点的变更不改变本节点的修订号，不触发重新拉取。
   const revision = panelRevision(state, nodeId);
+  const generation = useStore(panelGeneration);
   useEffect(() => {
     let live = true;
     const query = nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : "";
@@ -80,7 +82,7 @@ export function PanelView({ panel, nodeId, onOpenNode }: { panel: PanelSpec; nod
       .then((value) => { if (live) { setContent({ target, value }); setError(null); } })
       .catch((e) => { if (live) setError({ target, message: (e as Error).message }); });
     return () => { live = false; };
-  }, [target, revision]);
+  }, [target, revision, panel.revision, generation]);
   if (error?.target === target) return <div class="error-text" data-testid="panel-error">{error.message}</div>;
   if (content?.target !== target) return <div class="muted" data-testid="panel-loading">加载中…</div>;
   return <PanelBody panel={panel} content={content.value} onOpenNode={onOpenNode} />;

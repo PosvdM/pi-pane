@@ -4,10 +4,11 @@ import { getOrCreateDevice, type DeviceInfo } from "../lib/device-key.ts";
 import { openNodeById } from "../lib/navigate.ts";
 import { sortBanners, visibleBanners } from "../lib/plugin-state.ts";
 import {
-  answerPresence, banners, dismissNotification, formBusy, notifications, openForm, pendingOps, presence, queryForm, runAction, settleOp, submitForm,
+  answerPresence, banners, deviceVersion, dismissNotification, formBusy, notifications, openForm, pendingOps, presence, queryForm, queryOp, runAction, settleOp, submitForm,
 } from "../lib/plugin-ui.ts";
 import { actionSpec, pluginName, plugins } from "../lib/plugins.ts";
 import { useStore } from "../lib/store.ts";
+import { toast } from "../lib/ui-state.ts";
 import type { BannerState, FieldGroupValue, FieldValue, FormAnswers, FormField, FormQuestion, FormSpec } from "../lib/types.ts";
 import { Markdown } from "./Message.tsx";
 import { expiresIn, nodeTitle, when } from "./Sidebar.tsx";
@@ -212,12 +213,24 @@ export function PresenceDialog() {
   const [raw, setRaw] = useState(false);
   const [busy, setBusy] = useState(false);
   const [, tick] = useState(0);
-  useEffect(() => { getOrCreateDevice().then(setDevice, () => setDevice(null)); }, [request?.id]);
+  // 密钥在确认框打开后被重置（本标签页或其他标签页）时重新读取，显示的设备与签名用的设备一致。
+  const version = useStore(deviceVersion);
+  useEffect(() => {
+    let live = true;
+    getOrCreateDevice().then((value) => { if (live) setDevice(value); }, () => { if (live) setDevice(null); });
+    return () => { live = false; };
+  }, [request?.id, version]);
   useEffect(() => { setRaw(false); setBusy(false); }, [request?.id]);
   useEffect(() => { if (!request?.expiresAt) return; const timer = setInterval(() => tick((n) => n + 1), 1000); return () => clearInterval(timer); }, [request?.id]);
   if (!request) return null;
   const left = request.expiresAt ? Math.max(0, Math.round((Date.parse(request.expiresAt) - Date.now()) / 1000)) : null;
-  const answer = async (confirm: boolean) => { setBusy(true); await answerPresence(request, confirm); };
+  const answer = async (confirm: boolean) => {
+    setBusy(true);
+    if (await answerPresence(request, confirm, device?.deviceId) === "deviceChanged") {
+      setBusy(false);
+      toast("签名设备已变化（密钥在其他标签页被重置），请核对新设备后重新确认", "error");
+    }
+  };
   return (
     <Shell testid="presence-dialog" extra="presence" title={<span class="presence-title"><span class="lock">🔐</span>需要你确认：{request.title}</span>}>
       <div class="form-meta muted small">
@@ -227,14 +240,14 @@ export function PresenceDialog() {
       </div>
       <Markdown text={request.summary} />
       <table class="kv presence-kv"><tbody>
-        <tr><th>签名设备</th><td>{device ? <>{device.label}（本设备） · <code title={device.deviceId}>{device.deviceId.length > 16 ? device.deviceId.slice(0, 8) + "…" + device.deviceId.slice(-4) : device.deviceId}</code></> : "正在读取设备密钥…"}</td></tr>
+        <tr><th>签名设备</th><td>{device ? <>{device.label}（本设备） · <code data-testid="presence-device" title={device.deviceId}>{device.deviceId.length > 16 ? device.deviceId.slice(0, 8) + "…" + device.deviceId.slice(-4) : device.deviceId}</code></> : "正在读取设备密钥…"}</td></tr>
         {device && <tr><th>算法</th><td>{device.alg}</td></tr>}
       </tbody></table>
       <button class="link small" onClick={() => setRaw(!raw)}>{raw ? "▾" : "▸"} 签名内容（payload 原文）</button>
       {raw && <pre class="plain payload" data-testid="presence-payload">{JSON.stringify(request.payload, null, 2)}</pre>}
       <div class="modal-actions">
         <button class="btn" data-testid="presence-reject" disabled={busy} onClick={() => void answer(false)}>拒绝</button>
-        <button class="btn primary" data-testid="presence-confirm" disabled={busy} onClick={() => void answer(true)}>确认并签名</button>
+        <button class="btn primary" data-testid="presence-confirm" disabled={busy || !device} onClick={() => void answer(true)}>确认并签名</button>
       </div>
     </Shell>
   );
@@ -309,7 +322,7 @@ export function PluginToasts() {
           <div class="toast-main">
             <div class="toast-title">{a.message}</div>
             <div class="toast-actions">
-              <button class="btn small-btn" data-testid="action-query" onClick={() => void a.query()}>查询结果</button>
+              <button class="btn small-btn" data-testid="action-query" onClick={() => void queryOp(a)}>查询结果</button>
               <span class="muted small">{pluginName(a.source)}</span>
             </div>
           </div>
