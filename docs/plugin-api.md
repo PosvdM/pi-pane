@@ -298,7 +298,7 @@ export interface TreeNode {
 
 - `tree.snapshot(req)` 只返回“热节点”及其全部祖先。热节点是：`req.openNodeIds` 中的节点（浏览器里打开着的）、`status` 为 `running`、`waiting`、`paused` 的节点、`lastActivityAt` 晚于 `req.recentSince` 的节点。
 - 其余节点按需加载：用户展开某个节点时，pi-pane 调 `tree.children(parentId, page)` 分页取子节点。
-- 每个父节点下，已加载的子节点正常显示，没有加载的折叠为一行“历史（N）”（N 取自父节点的 `childCount`，未知时不显示数字），展开后分页加载。
+- 每个父节点下，已加载的子节点正常显示，没有加载的折叠为一行“历史（N）”（N 为父节点的 `childCount` 减去已加载的子节点数；`hasChildren` 为 true 而没有 `childCount` 时不显示数字），展开后分页加载。因此插件节点的 `childCount` 应是当前的子节点总数，子节点增减时随父节点的 `upsert` 更新。
 - 插件不能为其他来源的节点填写 `childCount` 和 `hasChildren`（例如 pi-pane 的主会话节点），因此在快照的 `foreignChildCounts` 中报告：键为其他来源的父节点 id，值为该插件挂在它下面的子节点总数，没有子节点的父节点不列出。pi-pane 把各来源的数目相加，决定主会话是否显示展开箭头和“历史（N）”，展开时对报告了数目的来源调用 `tree.children(parentId, page)`。数目以最近一次快照为准，订阅推来的新节点照常显示，总数在下一次快照（含 `reset` 之后的快照）时更新。不提供该字段的插件，其挂在其他来源节点下的冷节点只能在变为热节点后显示。
 
 ```ts
@@ -480,7 +480,7 @@ export interface PaneStatusEvent {
 ### 显示规则
 
 - 打开时调 `sessions.snapshot(ref)`，再以快照的 `cursor` 调 `sessions.subscribe`（节点带 `subscribe` 能力时）。
-- `readonly: true` 或节点没有 `send` 能力时不显示输入框；`readonlyReason = externalWriter` 时显示“该会话可能正在别处运行”和“Fork 为新会话”按钮。
+- `readonly: true` 或节点没有 `send` 能力时不显示输入框；`readonlyReason = externalWriter` 时显示“该会话可能正在别处运行”。pi-pane 自己的主会话另有“Fork 为新会话”按钮；插件会话没有会话文件，协议也没有 fork 方法，所以不显示该按钮，插件需要时可以声明一个节点动作。
 - `unfinishedPartials` 显示在对话末尾，标注“中断时正在生成的内容”，按块类型分别显示思考、文字和工具调用。
 - 节点的 `action:*` 能力显示为视图顶部的按钮。
 
@@ -610,6 +610,7 @@ export interface StepItem {            // 有先后顺序的阶段，如会议�
 }
 ```
 
+- pi-pane 按 `(source, id)` 区分面板，不同插件的同名面板各自记录修订号和角标；服务端推给浏览器的 `panel` 帧带来源（M3 的 pane v1 兼容扩展，不改变 `ctx.panelChanged()` 的签名）。
 - `sidebar` 面板显示在侧栏树下方，标题带角标；`node` 面板在打开符合 `appliesTo` 的节点时显示在会话视图右侧（group 和 resource 节点时代替会话视图）。没有 `appliesTo` 的 `node` 面板适用于该插件自己的全部节点。
 - 内容按需拉取：显示时调用 `panels.content()`。插件调用 `ctx.panelChanged()` 推送变化：带 `badgeCount` 时立即更新角标；正在显示且受影响的面板重新拉取。
 - 每种 `type` 由 pi-pane 内置组件渲染；`timeline` 支持向上加载更多。不认识的 `type` 显示“此面板需要更新的 pi-pane”。
