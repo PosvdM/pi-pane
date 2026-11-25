@@ -333,4 +333,5 @@ body.resizing { cursor: col-resize; user-select: none; }
 @media (max-width: 760px) {
   .layout { grid-template-columns: 0 1fr; }
   .layout:not(.no-sidebar) .sidebar { position: fixed; z-index: 25; width: 280px; height: 100%; visibility: visible; }
+  .sidebar-resizer { display: none; }
 }

@@ -104,21 +104,25 @@ function visibleMain(node: TreeNode, activeId: string | null): boolean {
   return node.kind === "session" && (!info || info.stored || (node.messageCount ?? 0) > 0 || node.id === activeId);
 }
 
+/**
+ * 项目分组：主会话和插件挂在该分组下的节点合并，按 sortKey 统一排序。未加载的部分合成一行“历史（N）”：
+ * 主会话按分组的 childCount 扣除已加载的会话，插件按快照报告的 foreignChildCounts（见 hiddenChildren）。
+ */
 function Project({ group, ctx }: { group: TreeNode; ctx: Ctx }) {
-  const pane = ctx.allTrees.get("pane")!;
-  const sessions = pane.children(group.id).filter((n) => visibleMain(n, ctx.activeId));
-  const listed = pane.listed.get(group.id)?.done;
-  const hidden = listed ? 0 : Math.max(0, (group.childCount ?? 0) - pane.children(group.id).length);
+  const rows = childrenAcross(ctx.allTrees, group.id)
+    .filter((n) => n.source === "pane" ? visibleMain(n, ctx.activeId) : !unassigned(ctx.allTrees, n, awaitingParent));
+  const history = hiddenChildren(ctx.allTrees, group);
   const name = group.title.split(/[\\/]/).filter(Boolean).pop() ?? group.title;
-  if (!sessions.length && !hidden) return null;
+  if (!rows.length && !history.count && !history.unknown) return null;
   return (
-    <div class="project" data-testid="project">
+    <div class="project" data-testid="project" data-project-id={group.id}>
       <div class="project-head" title={group.title}>
         <span class="project-name">{name}</span>
         <button class="icon-btn" title="在此项目新建会话" data-testid="new-in-project" onClick={() => { closePluginView(); void openFile(group.title); }}>＋</button>
       </div>
-      {sessions.map((node) => <NodeRow key={node.id} node={node} depth={0} ctx={ctx} />)}
-      {hidden > 0 && <button class="link history" data-testid="project-history" onClick={() => void loadChildren("pane", group.id)}>历史（{hidden}）</button>}
+      {rows.map((node) => <NodeRow key={node.id} node={node} depth={0} ctx={ctx} />)}
+      {(history.count > 0 || history.unknown) && <button class="link history" data-testid="project-history"
+        onClick={() => { for (const source of history.sources) void loadChildren(source, group.id); }}>{history.unknown ? "历史" : `历史（${history.count}）`}</button>}
     </div>
   );
 }
@@ -224,6 +228,8 @@ function AddMenu({ onClose }: { onClose: () => void }) {
 }
 
 const WIDTH_KEY = "pi-pane.sidebarWidth";
+/** 与 style.css 中侧栏变为浮层的断点一致。 */
+const NARROW_SIDEBAR = "(max-width: 760px)";
 /** 侧栏宽度按浏览器记住，范围 240–480px，默认 280px。 */
 export function sidebarWidth(): number {
   const stored = localStorage.getItem(WIDTH_KEY);
@@ -235,6 +241,8 @@ function Resizer() {
     document.documentElement.style.setProperty("--sidebar-w", sidebarWidth() + "px");
     const move = (e: PointerEvent) => {
       if (!dragging.current) return;
+      // 窄屏下侧栏是固定 280px 的浮层，拖动不改变宽度，也不改保存值（手柄在窄屏隐藏）。
+      if (matchMedia(NARROW_SIDEBAR).matches) return;
       const width = clampSidebar(e.clientX);
       document.documentElement.style.setProperty("--sidebar-w", width + "px");
       localStorage.setItem(WIDTH_KEY, String(width));
@@ -286,7 +294,7 @@ export function Sidebar() {
   const loadOrphans = () => { for (const [source, parent] of orphanParents) void loadChildren(source, parent); };
   const errors = Object.entries(status).filter(([, s]) => s.error);
   const loading = Object.values(status).some((s) => s.loading);
-  const empty = !projects.some((g) => (pane?.children(g.id).length ?? 0) > 0 || (g.childCount ?? 0) > 0) && !roots.size && !orphans.length;
+  const empty = !projects.some((g) => childrenAcross(allTrees, g.id).length > 0 || (g.childCount ?? 0) > 0) && !roots.size && !orphans.length;
   return (
     <aside class={"sidebar" + (sidebar ? "" : " closed")} data-testid="sidebar">
       <div class="sidebar-head">

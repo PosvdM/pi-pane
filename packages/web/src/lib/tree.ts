@@ -3,7 +3,7 @@
 import { api, ApiError } from "./api.ts";
 import { activeSources } from "./plugins.ts";
 import { Store } from "./store.ts";
-import { findIn, isHot, RECENT_MS, SourceTree } from "./tree-state.ts";
+import { findIn, isHot, RECENT_MS, SourceTree, TreePins } from "./tree-state.ts";
 import type { TreeChange, TreeChildrenPage, TreeNode, TreeSnapshot } from "./types.ts";
 import { toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
@@ -13,7 +13,7 @@ export interface TreeStatus { loading: boolean; error?: string }
 export const trees = new Store<Map<string, SourceTree>>(new Map());
 export const treeStatus = new Store<Record<string, TreeStatus>>({});
 
-const pinned = new Map<string, Set<string>>();
+const pinned = new Map<string, TreePins>();
 const generation = new Map<string, number>();
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const unsubscribers = new Map<string, () => void>();
@@ -27,11 +27,13 @@ function tree(source: string): SourceTree {
   if (!value) { value = new SourceTree(source); trees.get().set(source, value); }
   return value;
 }
-function pins(source: string): Set<string> {
-  let set = pinned.get(source); if (!set) { set = new Set(); pinned.set(source, set); } return set;
+function pins(source: string): TreePins {
+  let value = pinned.get(source); if (!value) { value = new TreePins(); pinned.set(source, value); } return value;
 }
+/** 浏览器打开的节点和为补取父节点请求的节点；isHot 用它判断“打开着的”节点。 */
+const pinnedIds = (source: string): ReadonlySet<string> => new Set(pins(source).request());
 const base = (source: string) => source === "pane" ? "/api/tree" : `/api/plugins/${encodeURIComponent(source)}/tree`;
-const hot = (source: string) => (node: TreeNode) => isHot(node, recentSince, pins(source));
+const hot = (source: string) => (node: TreeNode) => isHot(node, recentSince, pinnedIds(source));
 
 /**
  * 取快照并从它的游标订阅。并发调用时只有最后一次能提交。
@@ -44,9 +46,12 @@ export async function loadTree(source: string): Promise<void> {
   recentSince = Date.now() - RECENT_MS;
   treeStatus.set((s) => ({ ...s, [source]: { loading: true, ...(s[source]?.error ? { error: s[source]!.error } : {}) } }));
   try {
-    const snapshot = await api<TreeSnapshot>(base(source) + "/snapshot", { openNodeIds: [...pins(source)], recentSince: new Date(recentSince).toISOString() });
+    const openNodeIds = pins(source).request();
+    const snapshot = await api<TreeSnapshot>(base(source) + "/snapshot", { openNodeIds, recentSince: new Date(recentSince).toISOString() });
     if (generation.get(source) !== mine) return;
     tree(source).load(snapshot); retries.delete(source); awaiting.delete(source);
+    const present = new Set(snapshot.nodes.map((node) => node.id));
+    pins(source).loaded(openNodeIds, (id) => present.has(id));
     unsubscribers.get(source)?.();
     unsubscribers.set(source, ws.subscribeTree(source, () => { const t = trees.get().get(source); return t?.epoch ? { epoch: t.epoch, revision: t.revision } : null; }, (change) => onChange(source, change)));
     treeStatus.set((s) => ({ ...s, [source]: { loading: false } }));
@@ -74,27 +79,31 @@ function scheduleLoad(source: string, delay = 50): void {
 
 function onChange(source: string, change: TreeChange): void {
   const result = tree(source).apply(change, hot(source));
-  if (result === "reset") { scheduleLoad(source); return; }
-  if (result === "needsAncestors" && change.type === "upsert") { pins(source).add(change.node.id); scheduleLoad(source, 300); return; }
+  if (result === "reset") { pins(source).retryMissing(); scheduleLoad(source); return; }
+  if (result === "needsAncestors" && change.type === "upsert") { pins(source).open(change.node.id); scheduleLoad(source, 300); return; }
   if (result === "applied") { trees.touch(); if (change.type === "upsert") pinMissingParents(); }
 }
 
 /**
  * 插件节点挂在其他来源（主会话或另一个插件）未加载的节点下时，把该父节点加入其来源快照的打开列表并重取；
- * 来源仍给不出该节点时才归入“未归属”。
+ * 来源仍给不出该节点时才归入“未归属”，之后不再为它重取（见 TreePins）。不再被引用的父节点从打开列表移除。
  */
 function pinMissingParents(): void {
   const all = trees.get(); const reload = new Set<string>();
+  const referenced = new Map<string, Set<string>>();
   for (const [source, t] of all) {
     if (source === "pane") continue;
     for (const node of t.nodes.values()) {
       const parentId = node.parentId; if (!parentId) continue;
       const parentSource = parentId.slice(0, parentId.indexOf(":"));
-      if (parentSource === source || !all.get(parentSource)?.epoch || findIn(all, parentId) || pins(parentSource).has(parentId)) continue;
-      pins(parentSource).add(parentId); reload.add(parentSource);
+      if (parentSource === source) continue;
+      let refs = referenced.get(parentSource); if (!refs) { refs = new Set(); referenced.set(parentSource, refs); } refs.add(parentId);
+      if (!all.get(parentSource)?.epoch || findIn(all, parentId) || !pins(parentSource).wantParent(parentId)) continue;
+      reload.add(parentSource);
       let set = awaiting.get(parentSource); if (!set) { set = new Set(); awaiting.set(parentSource, set); } set.add(parentId);
     }
   }
+  for (const [source, value] of pinned) value.prune(referenced.get(source) ?? new Set());
   for (const source of reload) scheduleLoad(source, 100);
 }
 
@@ -104,7 +113,7 @@ export function awaitingParent(parentId: string): boolean {
 }
 
 /** 浏览器打开的节点加入该来源的打开列表，下次快照时保证它和它的祖先都在。 */
-export function pinNode(source: string, nodeId: string): void { pins(source).add(nodeId); }
+export function pinNode(source: string, nodeId: string): void { pins(source).open(nodeId); }
 
 /** 展开“历史”：分页加载某个父节点的子节点。页的修订号超前于订阅时，等订阅追上，超过 5 秒按 reset 处理。 */
 export async function loadChildren(source: string, parentId: string): Promise<void> {
@@ -144,7 +153,9 @@ export function syncSources(): void {
 }
 
 /** 侧栏的刷新按钮：重新读取存储目录（终端里新建的会话）并重取全部来源。 */
-export function reloadAll(): void { for (const source of new Set(["pane", ...activeSources()])) void loadTree(source); }
+export function reloadAll(): void {
+  for (const source of new Set(["pane", ...activeSources()])) { pins(source).retryMissing(); void loadTree(source); }
+}
 
 /** 按 id 找节点。节点 id 以来源为前缀。 */
 export function findNode(id: string): TreeNode | undefined { return findIn(trees.get(), id); }

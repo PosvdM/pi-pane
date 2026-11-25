@@ -91,8 +91,54 @@ export class SourceTree {
   children(parentId: string | null): TreeNode[] {
     const list: TreeNode[] = [];
     for (const node of this.nodes.values()) if (node.parentId === parentId) list.push(node);
-    return list.sort((a, b) => a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : a.id < b.id ? -1 : 1);
+    return list.sort(bySortKey);
   }
+}
+
+/** 快照请求的 openNodeIds 上限，与服务端一致。 */
+export const MAX_OPEN_NODE_IDS = 1000;
+
+/**
+ * 一个来源快照请求里的 openNodeIds（plugin-api.md“按需加载”）。分两部分，合计不超过 MAX_OPEN_NODE_IDS：
+ * - opened：浏览器打开过的节点，按最近使用保留最多 openLimit 个；
+ * - parents：其他来源的节点挂在本来源未加载的节点下时，为补取该父节点加入的 id。没有节点再引用时移除；
+ *   请求过一次、快照仍没有给出的移入 notFound，不再请求（这些子节点归入“未归属”），直到来源 reset 或用户刷新。
+ *   数量达到上限后不再补取新的父节点。
+ */
+export class TreePins {
+  readonly opened = new Set<string>();
+  readonly parents = new Set<string>();
+  readonly notFound = new Set<string>();
+  readonly openLimit: number;
+  readonly parentLimit: number;
+  constructor(openLimit = 200, parentLimit = MAX_OPEN_NODE_IDS - openLimit) { this.openLimit = openLimit; this.parentLimit = parentLimit; }
+  open(id: string): void {
+    this.opened.delete(id); this.opened.add(id);
+    while (this.opened.size > this.openLimit) this.opened.delete(this.opened.values().next().value!);
+  }
+  /** 快照请求的 openNodeIds。 */
+  request(): string[] { return [...new Set([...this.opened, ...this.parents])]; }
+  /** 请求补取父节点；已在请求中、已确认不存在或已达上限时返回 false。 */
+  wantParent(id: string): boolean {
+    if (this.parents.has(id) || this.notFound.has(id) || this.parents.size >= this.parentLimit) return false;
+    this.parents.add(id); return true;
+  }
+  /** 快照到达：请求过的父节点不在快照里，说明来源给不出，移入 notFound。 */
+  loaded(requested: readonly string[], present: (id: string) => boolean): void {
+    for (const id of requested) if (this.parents.has(id) && !present(id)) { this.parents.delete(id); this.notFound.add(id); }
+  }
+  /** 移除不再被任何节点引用的父节点。 */
+  prune(referenced: ReadonlySet<string>): void {
+    for (const id of [...this.parents]) if (!referenced.has(id)) this.parents.delete(id);
+    for (const id of [...this.notFound]) if (!referenced.has(id)) this.notFound.delete(id);
+  }
+  /** 来源 reset 或用户刷新：之前给不出的父节点可以再请求一次。 */
+  retryMissing(): void { this.notFound.clear(); }
+}
+
+/** 同一父节点下按 sortKey 升序，相同时按 id，跨来源也用同一规则（plugin-api.md“渲染”）。 */
+export function bySortKey(a: TreeNode, b: TreeNode): number {
+  return a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 const sourceOf = (id: string) => id.slice(0, Math.max(0, id.indexOf(":")));
@@ -104,11 +150,11 @@ export function findIn(trees: ReadonlyMap<string, SourceTree>, id: string): Tree
   return undefined;
 }
 
-/** 某个节点在各来源下的子节点：父节点可以属于其他来源（如插件节点挂在主会话或另一个插件的节点下）。 */
+/** 某个节点在各来源下的子节点：父节点可以属于其他来源（如插件节点挂在主会话、项目分组或另一个插件的节点下），全部同级节点统一按 sortKey 排序。 */
 export function childrenAcross(trees: ReadonlyMap<string, SourceTree>, parentId: string): TreeNode[] {
   const list: TreeNode[] = [];
   for (const t of trees.values()) list.push(...t.children(parentId));
-  return list;
+  return list.sort(bySortKey);
 }
 
 export interface HiddenChildren {
