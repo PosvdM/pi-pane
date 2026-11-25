@@ -2,8 +2,9 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { getOrCreateDevice, type DeviceInfo } from "../lib/device-key.ts";
 import { openNodeById } from "../lib/navigate.ts";
+import { sortBanners, visibleBanners } from "../lib/plugin-state.ts";
 import {
-  answerPresence, banners, dismissNotification, formBusy, notifications, openForm, pendingActions, presence, queryAction, queryForm, runAction, submitForm,
+  answerPresence, banners, dismissNotification, formBusy, notifications, openForm, pendingOps, presence, queryForm, runAction, settleOp, submitForm,
 } from "../lib/plugin-ui.ts";
 import { actionSpec, pluginName, plugins } from "../lib/plugins.ts";
 import { useStore } from "../lib/store.ts";
@@ -220,20 +221,18 @@ export function PresenceDialog() {
       </div>
       <Markdown text={request.summary} />
       <table class="kv presence-kv"><tbody>
-        <tr><th>签名设备</th><td>{device ? <>{device.label}（本设备） · <code>{device.deviceId}</code></> : "本浏览器无法签名（不支持 WebCrypto 或 IndexedDB）"}</td></tr>
+        <tr><th>签名设备</th><td>{device ? <>{device.label}（本设备） · <code>{device.deviceId}</code></> : "正在读取设备密钥…"}</td></tr>
         {device && <tr><th>算法</th><td>{device.alg}</td></tr>}
       </tbody></table>
       <button class="link small" onClick={() => setRaw(!raw)}>{raw ? "▾" : "▸"} 签名内容（payload 原文）</button>
       {raw && <pre class="plain payload" data-testid="presence-payload">{JSON.stringify(request.payload, null, 2)}</pre>}
       <div class="modal-actions">
         <button class="btn" data-testid="presence-reject" disabled={busy} onClick={() => void answer(false)}>拒绝</button>
-        <button class="btn primary" data-testid="presence-confirm" disabled={busy || !device} onClick={() => void answer(true)}>确认并签名</button>
+        <button class="btn primary" data-testid="presence-confirm" disabled={busy} onClick={() => void answer(true)}>确认并签名</button>
       </div>
     </Shell>
   );
 }
-
-const LEVEL: Record<BannerState["level"], number> = { error: 0, warning: 1, info: 2 };
 
 function Banner({ banner }: { banner: BannerState }) {
   useStore(plugins);
@@ -261,9 +260,13 @@ function Banner({ banner }: { banner: BannerState }) {
   );
 }
 
-/** 页面顶部的横幅：按级别（error 在前）排列，同级保持服务端给出的顺序；用户不能关闭，只能展开或收起。 */
+/**
+ * 页面顶部的横幅：按级别（error 在前）排列，同级保持服务端给出的顺序；用户不能关闭，只能展开或收起，默认全部紧凑。
+ * 超过 3 条时只显示前 2 条，其余合并为一行“另有 N 条横幅”，点开后全部列出。
+ */
 export function BannerStack() {
   const list = useStore(banners);
+  const [showAll, setShowAll] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const shown = list.length > 0;
   // 横幅区的高度写入 --banners-h，右上角的提示从横幅下方开始，不遮住横幅的来源标记和动作。
@@ -276,14 +279,21 @@ export function BannerStack() {
     return () => { observer.disconnect(); root.setProperty("--banners-h", "0px"); };
   }, [shown]);
   if (!shown) return null;
-  const sorted = list.map((b, i) => ({ b, i })).sort((x, y) => LEVEL[x.b.level] - LEVEL[y.b.level] || x.i - y.i).map((x) => x.b);
-  return <div class="g-banners" data-testid="banners" ref={ref}>{sorted.map((b) => <Banner key={b.source + "\u0000" + b.id} banner={b} />)}</div>;
+  const sorted = sortBanners(list);
+  const { shown: visible, folded } = visibleBanners(sorted, showAll);
+  return (
+    <div class="g-banners" data-testid="banners" ref={ref}>
+      {visible.map((b) => <Banner key={b.source + "\u0000" + b.id} banner={b} />)}
+      {folded > 0 && <button class="g-banner g-more" data-testid="banners-more" onClick={() => setShowAll(true)}>另有 {folded} 条横幅</button>}
+      {showAll && sorted.length > 3 && <button class="g-banner g-more" data-testid="banners-less" onClick={() => setShowAll(false)}>收起横幅</button>}
+    </div>
+  );
 }
 
 /** 通知与结果未知的动作，与普通提示同在页面右上角的提示列中。 */
 export function PluginToasts() {
   const list = useStore(notifications);
-  const actions = useStore(pendingActions);
+  const actions = useStore(pendingOps);
   useStore(plugins);
   if (!list.length && !actions.length) return null;
   return (
@@ -293,11 +303,11 @@ export function PluginToasts() {
           <div class="toast-main">
             <div class="toast-title">{a.message}</div>
             <div class="toast-actions">
-              <button class="btn small-btn" data-testid="action-query" onClick={() => void queryAction(a, openNodeById)}>查询结果</button>
-              <span class="muted small">{pluginName(a.spec.source)}</span>
+              <button class="btn small-btn" data-testid="action-query" onClick={() => void a.query()}>查询结果</button>
+              <span class="muted small">{pluginName(a.source)}</span>
             </div>
           </div>
-          <button class="icon-btn" aria-label="关闭" onClick={() => pendingActions.set((l) => l.filter((x) => x.key !== a.key))}>✕</button>
+          <button class="icon-btn" aria-label="关闭" onClick={() => settleOp(a.key)}>✕</button>
         </div>
       ))}
       {list.map((n) => (

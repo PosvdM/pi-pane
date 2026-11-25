@@ -2,10 +2,10 @@
 import { useEffect, useState } from "preact/hooks";
 import { api } from "../lib/api.ts";
 import { logout } from "../lib/auth.ts";
-import { detectSupport, getOrCreateDevice, resetDevice, setDeviceLabel, type DeviceInfo } from "../lib/device-key.ts";
+import { detectSupport, getOrCreateDevice, setDeviceLabel, type DeviceInfo } from "../lib/device-key.ts";
 import { control, current, openFile, query } from "../lib/session.ts";
 import { trees } from "../lib/tree.ts";
-import { registerDevice, removableBanners, removeBanner } from "../lib/plugin-ui.ts";
+import { registerDevice, removableBanners, removeBanner, resetDeviceKey } from "../lib/plugin-ui.ts";
 import { plugins } from "../lib/plugins.ts";
 import type { BannerState } from "../lib/types.ts";
 import { settings, updateSettings } from "../lib/settings.ts";
@@ -190,10 +190,10 @@ function Settings() {
             </tbody></table>
             <div class="row">
               <input class="text-input" value={label} onInput={(e) => setLabel(e.currentTarget.value)} aria-label="设备名称" />
-              <button class="btn" onClick={() => { setDeviceLabel(label); toast("已保存设备名称"); }}>保存名称</button>
+              <button class="btn" onClick={() => { setDeviceLabel(label); void registerDevice(); toast("已保存设备名称"); }}>保存名称</button>
               <button class="btn danger" onClick={async () => {
                 const answer = await ask("重置设备密钥", "重置后会生成新的密钥，插件后台服务会把本浏览器当作新设备，需要重新批准。", [{ label: "取消", value: "no" }, { label: "重置", value: "yes", danger: true }]);
-                if (answer === "yes") { const d = await resetDevice(); setDevice(d); void registerDevice(); toast("已重置设备密钥"); }
+                if (answer === "yes") { setDevice(await resetDeviceKey()); toast("已重置设备密钥"); }
               }}>重置设备密钥</button>
             </div>
             <p class="muted small">私钥不可导出，只用于用户在场确认的签名。清除浏览器数据、换端口或换浏览器都等于一台新设备。</p>

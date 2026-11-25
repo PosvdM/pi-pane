@@ -28,14 +28,17 @@ export function prependHistory(state: ModelState, entries: Entry[], historyBefor
 
 const idle = (): InFlightState => ({ phase: "idle", tools: [], queue: { steering: [], followUp: [] } });
 
-/** 应用一条事件。游标不连续或 epoch 变化时返回 resync，调用方重新取快照。 */
+/**
+ * 应用一条事件。游标不连续或 epoch 变化时返回 resync，调用方重新取快照。
+ * resync 事件不按游标去重：提供方（包括服务端在插件事件出错时的兜底）可能用订阅起点作为它的游标。
+ */
 export function apply(state: ModelState, record: SessionStreamEvent): ApplyResult {
   const cursor = state.view.cursor;
+  const event = record.event as any;
+  if (event?.type === "resync") return "resync";
   if (record.cursor.epoch !== cursor.epoch) return "resync";
   if (record.cursor.seq <= cursor.seq) return "duplicate";
   if (record.cursor.seq !== cursor.seq + 1) return "resync";
-  const event = record.event as any;
-  if (event.type === "resync") return "resync";
   state.view.cursor = { ...record.cursor };
   const inFlight = state.view.inFlight ??= idle();
   switch (event.type) {

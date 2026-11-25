@@ -5,7 +5,11 @@ import { closeSession, current, loadOlder, open, openFile, restart } from "../li
 import { extensionUi, emptyUi, overlay } from "../lib/ui-state.ts";
 import { settings } from "../lib/settings.ts";
 import { formKey, forms, openForm, sortedForms } from "../lib/plugin-ui.ts";
+import { openNodeById } from "../lib/navigate.ts";
+import { findNode, trees } from "../lib/tree.ts";
+import type { TreeNode } from "../lib/types.ts";
 import { Composer } from "./Composer.tsx";
+import { DetailsButton, NodePanels, useDetails, useNodePanels } from "./Panels.tsx";
 import { EntryView, MessageView, StreamingBlocks, toolKey, type ToolContext } from "./Message.tsx";
 
 const STATUS_TEXT: Record<string, string> = {
@@ -27,7 +31,7 @@ function firstUserText(entries: { type: string; message?: any }[]): string {
   return "";
 }
 
-function Header() {
+function Header({ details }: { details?: ReturnType<typeof useDetails> }) {
   const state = useStore(current)!;
   const view = state.model!.view;
   const model = view.state?.model;
@@ -54,6 +58,7 @@ function Header() {
           </button>
         )}
         {view.hosted && <button class="chip-btn" onClick={() => void closeSession()} title="停止 pi 进程并关闭会话">关闭</button>}
+        {details && <DetailsButton details={details} />}
       </div>
     </div>
   );
@@ -102,8 +107,19 @@ function Statuses({ id }: { id: string }) {
   return <div class="statusbar" data-testid="statusbar">{detail && <span>{detail}</span>}{entries.map(([key, text]) => <span key={key}>{text}</span>)}</div>;
 }
 
+/** 主会话在会话树中的节点；树还没加载到它时按协议的形状补一个，用于匹配 sources 含 "pane" 的节点面板。 */
+function mainNode(id: string): TreeNode {
+  return findNode("pane:session:" + id) ?? { id: "pane:session:" + id, source: "pane", kind: "session", parentId: null, title: id, status: "idle",
+    availability: "online", hasChildren: false, sortKey: "", revision: 0, capabilities: [], sessionRef: { source: "pane", id } };
+}
+
 export function ChatView() {
   const state = useStore(current)!;
+  useStore(trees);
+  const node = mainNode(state.id);
+  // 插件为主会话定义的节点面板（placement = node，appliesTo.sources 含 "pane"）显示在右侧，与插件会话视图相同。
+  const panels = useNodePanels(node);
+  const details = useDetails(node.id);
   const prefs = useStore(settings);
   const model = state.model!;
   const view = model.view;
@@ -136,8 +152,9 @@ export function ChatView() {
 
   const visible = (message: any) => !(message?.role === "toolResult" && called.has(message.toolCallId));
   return (
+    <div class="main-split">
     <div class="chat" data-testid="chat" data-session-id={state.id}>
-      <Header />
+      <Header {...(panels.length ? { details } : {})} />
       <Banners />
       <div class="messages" ref={scroller} onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
         {view.historyBefore && <button class="btn ghost load-older" onClick={() => void loadOlder()}>加载更早的消息</button>}
@@ -156,6 +173,8 @@ export function ChatView() {
       <Composer sessionId={state.id} model={model} commands={state.commands} />
       <Widgets id={state.id} placement="belowEditor" />
       <Statuses id={state.id} />
+    </div>
+    {panels.length > 0 && details.shown && <NodePanels node={node} panels={panels} onClose={details.close} drawer={details.narrow} onOpenNode={openNodeById} />}
     </div>
   );
 }

@@ -41,8 +41,10 @@ async function transaction<T>(mode: IDBTransactionMode, fn: (store: IDBObjectSto
   } finally { db.close(); }
 }
 
+export function deviceLabel(): string { return localStorage.getItem(LABEL_KEY) ?? "本机 Chrome"; }
+
 function describe(record: KeyRecord): DeviceInfo {
-  return { deviceId: record.deviceId, publicKey: record.publicKey, alg: ALG, createdAt: record.createdAt, label: localStorage.getItem(LABEL_KEY) ?? "本机 Chrome" };
+  return { deviceId: record.deviceId, publicKey: record.publicKey, alg: ALG, createdAt: record.createdAt, label: deviceLabel() };
 }
 
 async function generate(): Promise<KeyRecord> {
@@ -90,7 +92,7 @@ export function resetDevice(): Promise<DeviceInfo> {
 
 export function setDeviceLabel(label: string): void { localStorage.setItem(LABEL_KEY, label.trim() || "本机 Chrome"); }
 
-/** 对 {domain, payload} 的规范 JSON 签名，签名为 IEEE P1363（r‖s）格式的 base64url。 */
+/** 对 {domain, payload} 的规范 JSON 签名，签名为 IEEE P1363（r‖s）格式的 base64url。用 IndexedDB 中当前的密钥签名。 */
 export async function signPresence(payload: unknown, domain = PRESENCE_DOMAIN): Promise<PresenceProof> {
   const bytes = presenceSigningBytes(payload, domain);
   let record: KeyRecord | undefined;

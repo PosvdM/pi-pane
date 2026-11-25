@@ -3,7 +3,7 @@
 import { api, ApiError } from "./api.ts";
 import { activeSources } from "./plugins.ts";
 import { Store } from "./store.ts";
-import { isHot, RECENT_MS, SourceTree } from "./tree-state.ts";
+import { findIn, isHot, RECENT_MS, SourceTree } from "./tree-state.ts";
 import type { TreeChange, TreeChildrenPage, TreeNode, TreeSnapshot } from "./types.ts";
 import * as ws from "./ws.ts";
 
@@ -16,6 +16,9 @@ const pinned = new Map<string, Set<string>>();
 const generation = new Map<string, number>();
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const unsubscribers = new Map<string, () => void>();
+const retries = new Map<string, number>();
+/** 为补取父节点而重取快照的来源及其父节点；快照到达前这些父节点下的节点不归入“未归属”。 */
+const awaiting = new Map<string, Set<string>>();
 let recentSince = Date.now() - RECENT_MS;
 
 function tree(source: string): SourceTree {
@@ -29,27 +32,36 @@ function pins(source: string): Set<string> {
 const base = (source: string) => source === "pane" ? "/api/tree" : `/api/plugins/${encodeURIComponent(source)}/tree`;
 const hot = (source: string) => (node: TreeNode) => isHot(node, recentSince, pins(source));
 
-/** 取快照并从它的游标订阅。并发调用时只有最后一次能提交。 */
+/**
+ * 取快照并从它的游标订阅。并发调用时只有最后一次能提交。
+ * 失败时（如插件的后台服务正在重启）按退避间隔重试，直到成功、来源被移除或有新的取快照请求；
+ * reset 之后原订阅已经结束，不重试就会停在旧树上。
+ */
 export async function loadTree(source: string): Promise<void> {
   const mine = (generation.get(source) ?? 0) + 1; generation.set(source, mine);
+  clearTimeout(timers.get(source)); timers.delete(source);
   recentSince = Date.now() - RECENT_MS;
-  treeStatus.set((s) => ({ ...s, [source]: { loading: true } }));
+  treeStatus.set((s) => ({ ...s, [source]: { loading: true, ...(s[source]?.error ? { error: s[source]!.error } : {}) } }));
   try {
     const snapshot = await api<TreeSnapshot>(base(source) + "/snapshot", { openNodeIds: [...pins(source)], recentSince: new Date(recentSince).toISOString() });
     if (generation.get(source) !== mine) return;
-    tree(source).load(snapshot);
+    tree(source).load(snapshot); retries.delete(source); awaiting.delete(source);
     unsubscribers.get(source)?.();
     unsubscribers.set(source, ws.subscribeTree(source, () => { const t = trees.get().get(source); return t?.epoch ? { epoch: t.epoch, revision: t.revision } : null; }, (change) => onChange(source, change)));
     treeStatus.set((s) => ({ ...s, [source]: { loading: false } }));
     trees.touch();
-    if (source !== "pane") pinMissingParents();
+    pinMissingParents();
   } catch (error) {
     if (generation.get(source) !== mine) return;
     // 不提供会话树的插件没有节点，不算错误。
     const missing = error instanceof ApiError && error.status === 404;
-    if (missing) tree(source).clear();
-    treeStatus.set((s) => ({ ...s, [source]: { loading: false, ...(missing ? {} : { error: (error as Error).message }) } }));
+    if (missing) { tree(source).clear(); awaiting.delete(source); }
+    treeStatus.set((s) => ({ ...s, [source]: { loading: false, ...(missing ? {} : { error: `${(error as Error).message}（正在重试）` }) } }));
     trees.touch();
+    if (!missing && (source === "pane" || activeSources().includes(source))) {
+      const attempt = retries.get(source) ?? 0; retries.set(source, attempt + 1);
+      scheduleLoad(source, Math.min(10000, 1000 * 2 ** attempt));
+    }
   }
 }
 
@@ -63,20 +75,31 @@ function onChange(source: string, change: TreeChange): void {
   const result = tree(source).apply(change, hot(source));
   if (result === "reset") { scheduleLoad(source); return; }
   if (result === "needsAncestors" && change.type === "upsert") { pins(source).add(change.node.id); scheduleLoad(source, 300); return; }
-  if (result === "applied") { trees.touch(); if (source !== "pane" && change.type === "upsert") pinMissingParents(); }
+  if (result === "applied") { trees.touch(); if (change.type === "upsert") pinMissingParents(); }
 }
 
-/** 插件节点挂在没有加载的主会话下时，把该主会话加入 pane 快照的打开列表；pane 仍列不出的才归入“未归属”。 */
+/**
+ * 插件节点挂在其他来源（主会话或另一个插件）未加载的节点下时，把该父节点加入其来源快照的打开列表并重取；
+ * 来源仍给不出该节点时才归入“未归属”。
+ */
 function pinMissingParents(): void {
-  const pane = trees.get().get("pane"); if (!pane?.epoch) return;
-  let added = false;
-  for (const [source, t] of trees.get()) {
+  const all = trees.get(); const reload = new Set<string>();
+  for (const [source, t] of all) {
     if (source === "pane") continue;
     for (const node of t.nodes.values()) {
-      if (node.parentId?.startsWith("pane:") && !pane.nodes.has(node.parentId) && !pins("pane").has(node.parentId)) { pins("pane").add(node.parentId); added = true; }
+      const parentId = node.parentId; if (!parentId) continue;
+      const parentSource = parentId.slice(0, parentId.indexOf(":"));
+      if (parentSource === source || !all.get(parentSource)?.epoch || findIn(all, parentId) || pins(parentSource).has(parentId)) continue;
+      pins(parentSource).add(parentId); reload.add(parentSource);
+      let set = awaiting.get(parentSource); if (!set) { set = new Set(); awaiting.set(parentSource, set); } set.add(parentId);
     }
   }
-  if (added) scheduleLoad("pane", 100);
+  for (const source of reload) scheduleLoad(source, 100);
+}
+
+/** 父节点所在来源已为它重取快照、结果还没到。 */
+export function awaitingParent(parentId: string): boolean {
+  return awaiting.get(parentId.slice(0, parentId.indexOf(":")))?.has(parentId) ?? false;
 }
 
 /** 浏览器打开的节点加入该来源的打开列表，下次快照时保证它和它的祖先都在。 */
@@ -84,18 +107,23 @@ export function pinNode(source: string, nodeId: string): void { pins(source).add
 
 /** 展开“历史”：分页加载某个父节点的子节点。页的修订号超前于订阅时，等订阅追上，超过 5 秒按 reset 处理。 */
 export async function loadChildren(source: string, parentId: string): Promise<void> {
-  const t = tree(source); const epoch = t.epoch; if (!epoch) return;
+  const t = tree(source); const epoch = t.epoch; if (!epoch || t.stale) return;
   const cursor = t.listed.get(parentId)?.cursor;
   if (t.listed.get(parentId)?.done) return;
+  // 请求发出后树被 reset 或重新加载过（即使 epoch 相同），这一页按旧状态取得，丢弃。
+  const loaded = t.generation;
+  const current = () => trees.get().get(source) === t && t.generation === loaded && !t.stale && t.epoch === epoch;
   const query = new URLSearchParams({ parentId, epoch, limit: "50", ...(cursor ? { cursor } : {}) });
   const page = await api<TreeChildrenPage>(`${base(source)}/children?${query}`);
-  if (t.epoch !== epoch) return;
+  if (!current()) return;
   if ("reset" in page) { scheduleLoad(source); return; }
   const deadline = Date.now() + 5000;
   while (page.revision > t.revision) {
-    if (Date.now() > deadline || t.epoch !== epoch) { scheduleLoad(source); return; }
+    if (!current()) return;
+    if (Date.now() > deadline) { scheduleLoad(source); return; }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  if (!current()) return;
   t.mergePage(parentId, page.nodes, page.revision, page.nextCursor);
   trees.touch();
 }
@@ -106,6 +134,7 @@ export function syncSources(): void {
   for (const source of [...trees.get().keys()]) if (!sources.has(source)) {
     unsubscribers.get(source)?.(); unsubscribers.delete(source); trees.get().delete(source);
     generation.set(source, (generation.get(source) ?? 0) + 1);
+    clearTimeout(timers.get(source)); timers.delete(source); retries.delete(source); awaiting.delete(source);
   }
   for (const source of sources) if (!trees.get().get(source)?.epoch && !treeStatus.get()[source]?.loading) void loadTree(source);
   trees.touch();
@@ -115,10 +144,7 @@ export function syncSources(): void {
 export function reloadAll(): void { for (const source of new Set(["pane", ...activeSources()])) void loadTree(source); }
 
 /** 按 id 找节点。节点 id 以来源为前缀。 */
-export function findNode(id: string): TreeNode | undefined {
-  for (const t of trees.get().values()) { const node = t.nodes.get(id); if (node) return node; }
-  return undefined;
-}
+export function findNode(id: string): TreeNode | undefined { return findIn(trees.get(), id); }
 
 /** 插件节点中 originToolCall 指向该会话工具调用的节点。 */
 export function nodeForToolCall(source: string, sessionId: string, toolCallId: string): TreeNode | undefined {

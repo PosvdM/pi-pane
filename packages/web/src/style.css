@@ -245,7 +245,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 .menu-item:hover { background: var(--accent-soft); }
 .menu-item.danger { color: var(--danger); }
 
-.main-split { flex: 1; display: flex; min-height: 0; min-width: 0; }
+.main-split { position: relative; flex: 1; display: flex; min-height: 0; min-width: 0; }
 .main-split > .chat { flex: 1; min-width: 0; }
 .crumbs { font-size: 12px; line-height: 1.3; }
 .composer-hint { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
@@ -258,6 +258,11 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 .node-panel { width: 300px; flex: none; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
 .node-panel.full { width: auto; flex: 1; border-left: none; }
+/* 视口小于 1100px：面板是从右侧滑出、覆盖在会话视图上的抽屉。 */
+.node-panel.drawer { position: absolute; top: 0; right: 0; bottom: 0; z-index: 20; width: min(340px, 90%); box-shadow: -6px 0 20px rgba(0,0,0,.18); animation: drawer-in .18s ease-out; }
+@keyframes drawer-in { from { transform: translateX(100%); } to { transform: none; } }
+.head-more { position: relative; }
+.head-menu { position: absolute; top: 100%; right: 0; margin-top: 4px; }
 .panel-head { display: flex; align-items: center; gap: 4px; padding: 8px 8px 0 12px; border-bottom: 1px solid var(--line); }
 .panel-tab { border: none; background: none; padding: 6px 4px 7px; font-size: 13px; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; color: inherit; }
 .panel-tab.on { border-bottom-color: var(--accent); }
@@ -280,6 +285,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 .g-unavail { font-size: 12px; color: var(--muted); border: 1px dashed var(--muted); border-radius: 4px; padding: 0 6px; }
 .g-banner.unavailable .g-title { color: var(--muted); }
 .g-banner-body { padding: 0 16px 8px 40px; }
+.g-more { display: block; width: 100%; border: none; border-bottom: 1px solid var(--line); background: var(--panel); color: var(--muted); text-align: left; padding: 4px 16px 4px 40px; font-size: 12.5px; cursor: pointer; }
+.g-more:hover { color: var(--accent); }
 .g-banner-body .md p, .g-banner-body .md ul { margin: 2px 0; }
 .g-banner-body .row { margin: 6px 0 0; }
 
@@ -326,5 +333,4 @@ body.resizing { cursor: col-resize; user-select: none; }
 @media (max-width: 760px) {
   .layout { grid-template-columns: 0 1fr; }
   .layout:not(.no-sidebar) .sidebar { position: fixed; z-index: 25; width: 280px; height: 100%; visibility: visible; }
-  .node-panel:not(.full) { display: none; }
 }

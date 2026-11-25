@@ -4,11 +4,13 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { sidebarOpen } from "../lib/actions.ts";
 import { openNode, openNodeById } from "../lib/navigate.ts";
 import { closePluginView, pluginView } from "../lib/plugin-session.ts";
-import { formBusy, formKey, forms, openForm, panelState, runAction, sortedForms } from "../lib/plugin-ui.ts";
+import { clampSidebar, SIDEBAR_MAX, SIDEBAR_MIN } from "../lib/plugin-state.ts";
+import { formBusy, formKey, forms, openForm, panelKey, panelState, runAction, sortedForms } from "../lib/plugin-ui.ts";
 import { actionSpec, pluginName, plugins } from "../lib/plugins.ts";
 import { current, openFile } from "../lib/session.ts";
 import { useStore } from "../lib/store.ts";
-import { findNode, loadChildren, reloadAll, treeStatus, trees } from "../lib/tree.ts";
+import { awaitingParent, findNode, loadChildren, reloadAll, treeStatus, trees } from "../lib/tree.ts";
+import { childrenAcross, hiddenChildren, unassigned } from "../lib/tree-state.ts";
 import { overlay } from "../lib/ui-state.ts";
 import type { SourceTree } from "../lib/tree-state.ts";
 import type { FormSpec, NodeStatus, PaneSessionNodeInfo, TreeNode } from "../lib/types.ts";
@@ -51,29 +53,13 @@ interface Ctx {
   setMenu: (menu: Menu | null) => void;
 }
 
-/** 某个节点下所有插件来源的子节点（主会话节点的子节点来自其他来源）。 */
-function childrenOf(ctx: Ctx, node: TreeNode): TreeNode[] {
-  if (node.source !== "pane") return ctx.allTrees.get(node.source)?.children(node.id) ?? [];
-  const list: TreeNode[] = [];
-  for (const [source, t] of ctx.allTrees) if (source !== "pane") list.push(...t.children(node.id));
-  return list;
-}
-/** 节点下尚未加载的子节点数；主会话节点按各插件的 foreignChildCounts 相加。 */
-function hiddenCount(ctx: Ctx, node: TreeNode, loaded: number): number {
-  if (node.source !== "pane") return node.hasChildren && !ctx.allTrees.get(node.source)?.listed.get(node.id)?.done ? Math.max(0, (node.childCount ?? 0) - loaded) : 0;
-  let total = 0;
-  for (const [source, t] of ctx.allTrees) if (source !== "pane" && !t.listed.get(node.id)?.done) total += t.foreign[node.id] ?? 0;
-  return Math.max(0, total - loaded);
-}
-function loadHistory(ctx: Ctx, node: TreeNode): void {
-  if (node.source !== "pane") { void loadChildren(node.source, node.id); return; }
-  for (const [source, t] of ctx.allTrees) if (source !== "pane" && (t.foreign[node.id] ?? 0) > 0) void loadChildren(source, node.id);
-}
-
-function NodeRow({ node, depth, ctx }: { node: TreeNode; depth: number; ctx: Ctx }) {
-  const kids = childrenOf(ctx, node);
-  const hidden = hiddenCount(ctx, node, kids.length);
-  const expandable = kids.length > 0 || hidden > 0;
+/** 节点下的子节点（来自所有来源）与未加载的“历史”。ancestors 防止循环引用导致无限展开。 */
+function NodeRow({ node, depth, ctx, ancestors = new Set() }: { node: TreeNode; depth: number; ctx: Ctx; ancestors?: Set<string> }) {
+  const kids = childrenAcross(ctx.allTrees, node.id).filter((child) => !ancestors.has(child.id) && child.id !== node.id && !unassigned(ctx.allTrees, child, awaitingParent));
+  const history = hiddenChildren(ctx.allTrees, node);
+  const hidden = history.count;
+  const expandable = kids.length > 0 || hidden > 0 || history.unknown;
+  const path = new Set(ancestors).add(node.id);
   const [open, setOpen] = useState(node.source !== "pane" || kids.some((k) => ["running", "waiting", "paused"].includes(k.status)));
   const pending = ctx.pending.get(node.id) ?? 0;
   const info = (node as TreeNode & { paneSession?: PaneSessionNodeInfo }).paneSession;
@@ -92,14 +78,14 @@ function NodeRow({ node, depth, ctx }: { node: TreeNode; depth: number; ctx: Ctx
         {main ? <span class={"status-dot s-" + (node.availability === "online" ? node.status : "none")} /> : <StatusIcon status={node.status} />}
         <span class="session-label">{node.title}</span>
         {node.badge && <span class="node-badge">{node.badge}</span>}
-        {main && !open && expandable && <span class="node-badge" data-testid="child-count">{kids.length + hidden} 个子节点</span>}
+        {main && !open && expandable && <span class="node-badge" data-testid="child-count">{history.unknown ? "有子节点" : `${kids.length + hidden} 个子节点`}</span>}
         {pending > 0 && <span class="pending-dot" data-testid="node-pending" title={`${pending} 项待处理`}>{pending}</span>}
         {main ? <span class="session-meta">{when(info?.modifiedAt)} · {node.messageCount ?? 0}</span>
           : node.messageCount != null && node.messageCount > 0 && <span class="session-meta">{node.messageCount}</span>}
       </div>
-      {open && kids.map((child) => <NodeRow key={child.id} node={child} depth={depth + 1} ctx={ctx} />)}
-      {open && hidden > 0 && <button class="link history tree-history" data-testid="node-history" style={{ marginLeft: `${26 + (depth + 1) * 14}px` }}
-        onClick={() => loadHistory(ctx, node)}>历史（{hidden}）</button>}
+      {open && kids.map((child) => <NodeRow key={child.id} node={child} depth={depth + 1} ctx={ctx} ancestors={path} />)}
+      {open && (hidden > 0 || history.unknown) && <button class="link history tree-history" data-testid="node-history" style={{ marginLeft: `${26 + (depth + 1) * 14}px` }}
+        onClick={() => { for (const source of history.sources) void loadChildren(source, node.id); }}>{history.unknown ? "历史" : `历史（${hidden}）`}</button>}
     </>
   );
 }
@@ -180,10 +166,10 @@ function SidebarPanels() {
   return (
     <div class="side-panels">
       {panels.map((panel) => {
-        const badge = panelBadge(panel, badges); const shown = open[panel.id];
+        const key = panelKey(panel.source, panel.id); const badge = panelBadge(panel, badges); const shown = open[key];
         return (
-          <section key={panel.source + panel.id} class="side-panel" data-testid="side-panel">
-            <button class="pending-head" onClick={() => setOpen({ ...open, [panel.id]: !shown })}>
+          <section key={key} class="side-panel" data-testid="side-panel">
+            <button class="pending-head" onClick={() => setOpen({ ...open, [key]: !shown })}>
               <span class="twisty-static">{shown ? "▾" : "▸"}</span><span>{panel.title}</span>
               {badge ? <span class="count-badge">{badge}</span> : null}
             </button>
@@ -230,9 +216,10 @@ function AddMenu({ onClose }: { onClose: () => void }) {
 }
 
 const WIDTH_KEY = "pi-pane.sidebarWidth";
+/** 侧栏宽度按浏览器记住，范围 240–480px，默认 280px。 */
 export function sidebarWidth(): number {
-  const value = Number(localStorage.getItem(WIDTH_KEY));
-  return Number.isFinite(value) && value >= 220 && value <= 560 ? value : 280;
+  const stored = localStorage.getItem(WIDTH_KEY);
+  return clampSidebar(stored === null ? NaN : Number(stored));
 }
 function Resizer() {
   const dragging = useRef(false);
@@ -240,7 +227,7 @@ function Resizer() {
     document.documentElement.style.setProperty("--sidebar-w", sidebarWidth() + "px");
     const move = (e: PointerEvent) => {
       if (!dragging.current) return;
-      const width = Math.min(560, Math.max(220, e.clientX));
+      const width = clampSidebar(e.clientX);
       document.documentElement.style.setProperty("--sidebar-w", width + "px");
       localStorage.setItem(WIDTH_KEY, String(width));
     };
@@ -248,7 +235,7 @@ function Resizer() {
     addEventListener("pointermove", move); addEventListener("pointerup", up);
     return () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); };
   }, []);
-  return <div class="sidebar-resizer" data-testid="sidebar-resizer" title="拖动调整宽度" onPointerDown={(e) => { e.preventDefault(); dragging.current = true; document.body.classList.add("resizing"); }} />;
+  return <div class="sidebar-resizer" data-testid="sidebar-resizer" title={`拖动调整宽度（${SIDEBAR_MIN}–${SIDEBAR_MAX}px）`} onPointerDown={(e) => { e.preventDefault(); dragging.current = true; document.body.classList.add("resizing"); }} />;
 }
 
 export function Sidebar() {
@@ -272,17 +259,23 @@ export function Sidebar() {
     const top = (g: TreeNode) => pane.children(g.id)[0]?.sortKey ?? "~";
     return top(a) < top(b) ? -1 : top(a) > top(b) ? 1 : 0;
   }) : [];
-  // 插件节点挂在主会话下、但主会话树里没有该节点时归入“未归属”。
+  // 父节点不存在（所在来源已加载却没有它，或来源不在）、指向“未归属”或形成循环的插件节点归入“未归属”。
   const orphans: TreeNode[] = []; const roots = new Map<string, TreeNode[]>();
-  let orphanHidden = 0;
+  let orphanHidden = 0; const orphanParents: [string, string][] = [];
   for (const [source, t] of allTrees) {
     if (source === "pane") continue;
     for (const node of t.children(null)) roots.set(source, [...(roots.get(source) ?? []), node]);
-    for (const node of t.nodes.values()) if (node.parentId?.startsWith("pane:") && (!pane?.nodes.has(node.parentId) || node.parentId === "pane:group:unassigned")) orphans.push(node);
-    for (const [parent, count] of Object.entries(t.foreign)) if (!pane?.nodes.has(parent) && !t.listed.get(parent)?.done) orphanHidden += count;
+    for (const node of t.nodes.values()) if (unassigned(allTrees, node, awaitingParent)) orphans.push(node);
+    // 报告了子节点数、但父节点不在任何来源里：这些冷节点也属于“未归属”，按来源扣除已显示的快照节点。
+    for (const [parent, count] of Object.entries(t.foreign)) {
+      if (findNode(parent) || t.listed.get(parent)?.done || awaitingParent(parent)) continue;
+      const parentTree = allTrees.get(parent.slice(0, parent.indexOf(":")));
+      if (parentTree && !parentTree.epoch) continue;
+      orphanHidden += Math.max(0, count - t.children(parent).filter((n) => t.baseline.has(n.id)).length);
+      orphanParents.push([source, parent]);
+    }
   }
-  orphanHidden = Math.max(0, orphanHidden - orphans.length);
-  const loadOrphans = () => { for (const [source, t] of allTrees) if (source !== "pane") for (const parent of Object.keys(t.foreign)) if (!pane?.nodes.has(parent)) void loadChildren(source, parent); };
+  const loadOrphans = () => { for (const [source, parent] of orphanParents) void loadChildren(source, parent); };
   const errors = Object.entries(status).filter(([, s]) => s.error);
   const loading = Object.values(status).some((s) => s.loading);
   const empty = !projects.some((g) => (pane?.children(g.id).length ?? 0) > 0 || (g.childCount ?? 0) > 0) && !roots.size && !orphans.length;
@@ -312,7 +305,7 @@ export function Sidebar() {
           <div class="project" data-testid="unassigned">
             <div class="project-head" title="所属主会话已不在列表中的插件节点"><span class="project-name">未归属</span></div>
             {orphans.map((node) => <NodeRow key={node.id} node={node} depth={0} ctx={ctx} />)}
-            {orphanHidden > 0 && <button class="link history" onClick={loadOrphans}>历史（{orphanHidden}）</button>}
+            {orphanHidden > 0 && <button class="link history" data-testid="unassigned-history" onClick={loadOrphans}>历史（{orphanHidden}）</button>}
           </div>
         )}
       </div>
