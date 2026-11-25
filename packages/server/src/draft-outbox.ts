@@ -1,7 +1,8 @@
 // 服务端暂存的清出草稿（architecture.md“服务端暂存的清出草稿”）：停止、关闭、服务端关停或写者停止时从 pi 队列清出的草稿，
 // 按会话保存在数据目录的 drafts/ 下。记录是这些草稿唯一的权威副本，浏览器领取（claim）时原子地删除记录并取得内容。
 // 每条记录一个文件：drafts/<会话 id 的 SHA-256>/<记录 id 的 SHA-256>.json，写临时文件后原子替换。
-// 进程内不加锁：保存、领取和清理之间只依赖文件系统的原子 rename，一个挂起的文件操作不会拖住其他操作。
+// 保存、领取和清理之间不加锁，只依赖文件系统的原子 rename，一个挂起的文件操作不会拖住其他操作。
+// 只有同一条记录的领取在进程内串行，见 claim。
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -36,6 +37,8 @@ function imageIds(drafts: readonly { nodes?: unknown }[]): string[] {
 export class DraftOutbox {
   readonly root: string;
   private readonly listeners = new Set<(sessionId: string) => void>();
+  /** 每条记录上进行中的领取，键为记录文件路径。 */
+  private readonly claims = new Map<string, Promise<unknown>>();
   constructor(home: string, private readonly now = Date.now) { this.root = path.join(home, "drafts"); }
   private directory(sessionId: string): string { return path.join(this.root, digest(sessionId)); }
   private file(sessionId: string, id: string): string { return path.join(this.directory(sessionId), digest(id) + ".json"); }
@@ -85,13 +88,23 @@ export class DraftOutbox {
   }
 
   /**
-   * 领取一条记录：把记录文件原子地改名为领取中文件，再读出内容并删除。并发领取同一条时只有一个改名成功，
+   * 领取一条记录：把记录文件改名为领取中文件，再读出内容并删除。只有一个领取者拿到内容，
    * 其他调用以及记录已被领取、清理或不存在时返回 undefined。
+   * Windows 上 rename 经已打开的句柄执行，同一文件的两次并发改名都会成功（第二次改走第一次的目标），
+   * 不能靠 rename 区分领取者，因此同一条记录的领取在进程内串行；数据目录只由持有实例锁的一个服务端进程使用。
    * 删除领取中文件之前调用 touch（记录中图片的 assetId）：领取中文件仍算作图片引用（见 assets），
    * touch 刷新使用时间后，附件从领取时起按普通期限计算。
    */
-  async claim(sessionId: string, id: string, touch?: (assetIds: string[]) => void): Promise<SavedDrafts | undefined> {
-    const file = this.file(sessionId, id); const claiming = `${file}.${this.now()}-${randomUUID()}.claiming`;
+  claim(sessionId: string, id: string, touch?: (assetIds: string[]) => void): Promise<SavedDrafts | undefined> {
+    const file = this.file(sessionId, id);
+    const result = (this.claims.get(file) ?? Promise.resolve()).then(() => this.take(sessionId, file, touch), () => this.take(sessionId, file, touch));
+    const tail = result.catch(() => {});
+    this.claims.set(file, tail);
+    void tail.then(() => { if (this.claims.get(file) === tail) this.claims.delete(file); });
+    return result;
+  }
+  private async take(sessionId: string, file: string, touch?: (assetIds: string[]) => void): Promise<SavedDrafts | undefined> {
+    const claiming = `${file}.${this.now()}-${randomUUID()}.claiming`;
     try { await rename(file, claiming); } catch (error) { if (missing(error)) return undefined; throw error; }
     let record: SavedDrafts | undefined;
     try { record = parseRecord(JSON.parse(await readFile(claiming, "utf8")), sessionId); }
