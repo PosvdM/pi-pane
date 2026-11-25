@@ -2,7 +2,7 @@
 // 列表由服务端推送的会话树驱动：主会话树（source = "pane"）的变更经 WebSocket 推来，不依赖当前会话的事件。
 import { useEffect, useRef, useState } from "preact/hooks";
 import { sidebarOpen } from "../lib/actions.ts";
-import { openNode, openNodeById } from "../lib/navigate.ts";
+import { nodeLabel, openNode, openNodeById } from "../lib/navigate.ts";
 import { closePluginView, pluginView } from "../lib/plugin-session.ts";
 import { clampSidebar, SIDEBAR_MAX, SIDEBAR_MIN } from "../lib/plugin-state.ts";
 import { formBusy, formKey, forms, openForm, panelKey, panelState, runAction, sortedForms } from "../lib/plugin-ui.ts";
@@ -14,7 +14,7 @@ import { childrenAcross, hiddenChildren, unassigned } from "../lib/tree-state.ts
 import { overlay } from "../lib/ui-state.ts";
 import type { SourceTree } from "../lib/tree-state.ts";
 import type { FormSpec, NodeStatus, PaneSessionNodeInfo, TreeNode } from "../lib/types.ts";
-import { panelBadge, PanelView } from "./Panels.tsx";
+import { panelBadge, PanelView, useNodePanels } from "./Panels.tsx";
 
 export function when(iso: string | undefined): string {
   const time = iso ? Date.parse(iso) : NaN; if (!Number.isFinite(time)) return "";
@@ -38,7 +38,7 @@ export function StatusIcon({ status }: { status: NodeStatus }) {
   return <span class={"node-status ns-" + status} aria-label={STATUS_TEXT[status]}>{STATUS_ICON[status]}</span>;
 }
 
-export function nodeTitle(id: string): string { return findNode(id)?.title ?? id; }
+export function nodeTitle(id: string): string { const node = findNode(id); return node ? nodeLabel(node) : id; }
 
 /** 节点右键菜单：节点 capabilities 中列出、scope 含 node 的动作。 */
 interface Menu { x: number; y: number; node: TreeNode }
@@ -64,19 +64,27 @@ function NodeRow({ node, depth, ctx, ancestors = new Set() }: { node: TreeNode; 
   const pending = ctx.pending.get(node.id) ?? 0;
   const info = (node as TreeNode & { paneSession?: PaneSessionNodeInfo }).paneSession;
   const main = node.source === "pane";
-  const tip = [node.title, `${STATUS_TEXT[node.status]}${node.statusDetail ? "：" + node.statusDetail : ""}`,
+  const tip = [nodeLabel(node), `${STATUS_TEXT[node.status]}${node.statusDetail ? "：" + node.statusDetail : ""}`,
     node.availability === "archived" && !main ? "已存档，只能查看" : "", info?.sessionFile ?? ""].filter(Boolean).join("\n");
   const indent = main ? 6 : 6 + depth * 14;
+  // 点击：会话打开会话视图；分组展开或折叠，有适用的节点面板时同时打开；资源打开适用的面板（plugin-api.md“显示规则”）。
+  const nodePanels = useNodePanels(main ? undefined : node);
+  const click = () => {
+    if (node.kind === "session") { openNode(node); return; }
+    if (node.kind === "group") setOpen(!open);
+    if (node.kind === "resource" || nodePanels.length) openNode(node);
+  };
   return (
     <>
       <div class={"tree-row" + (main ? " main-row session-item" : "") + (ctx.activeId === node.id ? " active" : "") + " av-" + node.availability}
         style={{ paddingLeft: `${indent}px` }} title={tip} data-testid={main ? "session-item" : "tree-node"} data-node-id={node.id}
         {...(info ? { "data-session-file": info.sessionFile } : {})}
-        onClick={() => node.kind === "session" ? openNode(node) : setOpen(!open)}
+        onClick={click}
         onContextMenu={(e) => { if (main) return; e.preventDefault(); ctx.setMenu({ x: e.clientX, y: e.clientY, node }); }}>
         <button class="twisty" data-testid="twisty" style={{ visibility: expandable ? "visible" : "hidden" }} onClick={(e) => { e.stopPropagation(); setOpen(!open); }}>{open ? "▾" : "▸"}</button>
         {main ? <span class={"status-dot s-" + (node.availability === "online" ? node.status : "none")} /> : <StatusIcon status={node.status} />}
-        <span class="session-label">{node.title}</span>
+        <span class="session-label">{nodeLabel(node)}</span>
+        {node.availability === "missing" && <span class="muted small" data-testid="node-missing">存档缺失</span>}
         {node.badge && <span class="node-badge">{node.badge}</span>}
         {main && !open && expandable && <span class="node-badge" data-testid="child-count">{history.unknown ? "有子节点" : `${kids.length + hidden} 个子节点`}</span>}
         {pending > 0 && <span class="pending-dot" data-testid="node-pending" title={`${pending} 项待处理`}>{pending}</span>}
@@ -142,7 +150,7 @@ function Pending() {
                 onClick={() => openForm.set({ key, persistent: true, form })}>
                 <span class="pending-title">{form.title}</span>
                 <span class="pending-meta">
-                  {state ? <span class="busy">{state.state === "unknown" ? "结果未知" : state.message ?? "处理中"}</span> : <>
+                  {state ? <span class="busy">{state.state === "unknown" ? "结果未知" : state.state === "submitting" ? "提交中" : state.message ?? "处理中"}</span> : <>
                     {when(form.createdAt)}
                     {expiresIn(form.expiresAt) && <> · <span class="expiry">{expiresIn(form.expiresAt)}</span></>}
                     {form.nodeId && <> · {nodeTitle(form.nodeId)}</>}
@@ -232,8 +240,8 @@ function Resizer() {
       localStorage.setItem(WIDTH_KEY, String(width));
     };
     const up = () => { dragging.current = false; document.body.classList.remove("resizing"); };
-    addEventListener("pointermove", move); addEventListener("pointerup", up);
-    return () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); };
+    addEventListener("pointermove", move); addEventListener("pointerup", up); addEventListener("pointercancel", up);
+    return () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); removeEventListener("pointercancel", up); };
   }, []);
   return <div class="sidebar-resizer" data-testid="sidebar-resizer" title={`拖动调整宽度（${SIDEBAR_MIN}–${SIDEBAR_MAX}px）`} onPointerDown={(e) => { e.preventDefault(); dragging.current = true; document.body.classList.add("resizing"); }} />;
 }

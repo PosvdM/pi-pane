@@ -7,6 +7,11 @@ import type { PaneSessionNodeInfo, TreeNode } from "./types.ts";
 
 export type PaneTreeNode = TreeNode & { paneSession?: PaneSessionNodeInfo };
 
+/** 节点的显示名称：没有名称、也没有首条用户文本的主会话显示“（空会话）”，不显示会话 ID。 */
+export function nodeLabel(node: TreeNode): string {
+  return (node as PaneTreeNode).paneSession?.untitled ? "（空会话）" : node.title;
+}
+
 export function openNode(node: TreeNode): void {
   const info = (node as PaneTreeNode).paneSession;
   if (node.source === "pane") {

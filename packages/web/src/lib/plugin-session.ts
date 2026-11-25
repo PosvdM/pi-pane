@@ -4,7 +4,7 @@ import { settleOp, trackOp } from "./plugin-ui.ts";
 import { apply, fromSnapshot, prependHistory, type ModelState } from "./session-model.ts";
 import { Store } from "./store.ts";
 import { pinNode } from "./tree.ts";
-import { toast } from "./ui-state.ts";
+import { confirmInApp, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
 import type { AbortResult, PaneSessionView, SendResult, SessionRef, SessionSnapshot, TreeNode, UnfinishedPartial } from "./types.ts";
 
@@ -29,6 +29,7 @@ export const pluginView = new Store<PluginView | null>(null);
 interface Opened {
   ref?: SessionRef;
   live: boolean;           // 是否订阅实时流（节点有 subscribe 能力）
+  send: boolean;           // 节点有 send 能力；变化时快照中的 readonly 可能已过时
   unsubscribe: (() => void) | null;
   reloading: Promise<void> | null;
   retries: number;
@@ -55,21 +56,27 @@ export async function openPluginNode(node: TreeNode): Promise<void> {
   pinNode(node.source, node.id);
   const session = node.kind === "session" && !!node.sessionRef;
   const canOpen = session && node.capabilities.includes("open");
-  const o: Opened = { ...(canOpen ? { ref: node.sessionRef } : {}), live: canOpen && node.capabilities.includes("subscribe"), unsubscribe: null, reloading: null, retries: 0 };
+  const o: Opened = { ...(canOpen ? { ref: node.sessionRef } : {}), live: canOpen && node.capabilities.includes("subscribe"), send: node.capabilities.includes("send"), unsubscribe: null, reloading: null, retries: 0 };
   opened = o;
   pluginView.set({ nodeId: node.id, source: node.source, ...(canOpen ? { ref: node.sessionRef } : {}), model: null, partials: [], loading: canOpen, ...(session && !canOpen ? { closed: true } : {}) });
   if (canOpen) await refresh(o);
 }
 
-/** 节点能力变化（如任务结束后不再提供实时流）时调整订阅。 */
+/**
+ * 节点能力变化时调整：不再提供实时流（如任务结束）就取消订阅；开始提供实时流，或 send 能力有变化（如接管后
+ * 开放输入），重取快照。插件可能只通过树节点改能力、不在会话流里推 pane_status，快照中的 readonly 随之更新。
+ */
 export function syncCapabilities(node: TreeNode): void {
   const o = opened; const view = pluginView.get();
   if (!o?.ref || view?.nodeId !== node.id) return;
   const live = node.capabilities.includes("subscribe");
-  if (live === o.live) return;
-  o.live = live;
-  if (!live) { o.unsubscribe?.(); o.unsubscribe = null; return; }
-  if (view.model) void reload(o);
+  const send = node.capabilities.includes("send");
+  const sendChanged = send !== o.send; o.send = send;
+  if (live !== o.live) {
+    o.live = live;
+    if (!live) { o.unsubscribe?.(); o.unsubscribe = null; }
+  } else if (!sendChanged) return;
+  if (view.model && (live || sendChanged)) void reload(o);
 }
 
 function retry(o: Opened, error: unknown): void {
@@ -168,7 +175,7 @@ async function abortOpened(o: Opened): Promise<string[] | null> {
     const result = await api<AbortResult>(sessionPath(ref, "abort"), { clearQueue: true, connectionId: ws.link.get().connectionId, ...(expectedRevision === undefined ? {} : { expectedRevision }) });
     if (result.status === "conflict") {
       await reload(o);
-      if (!isCurrent(o) || !confirm("会话状态已变化，仍要停止吗？") || !isCurrent(o)) return null;
+      if (!isCurrent(o) || !(await confirmInApp("会话状态已变化，仍要停止吗？", true)) || !isCurrent(o)) return null;
       return abortOpened(o);
     }
     if (result.status === "nothingToStop") toast("没有正在运行的任务");

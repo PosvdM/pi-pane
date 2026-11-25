@@ -5,6 +5,7 @@ import { activeSources } from "./plugins.ts";
 import { Store } from "./store.ts";
 import { findIn, isHot, RECENT_MS, SourceTree } from "./tree-state.ts";
 import type { TreeChange, TreeChildrenPage, TreeNode, TreeSnapshot } from "./types.ts";
+import { toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
 
 export interface TreeStatus { loading: boolean; error?: string }
@@ -114,7 +115,9 @@ export async function loadChildren(source: string, parentId: string): Promise<vo
   const loaded = t.generation;
   const current = () => trees.get().get(source) === t && t.generation === loaded && !t.stale && t.epoch === epoch;
   const query = new URLSearchParams({ parentId, epoch, limit: "50", ...(cursor ? { cursor } : {}) });
-  const page = await api<TreeChildrenPage>(`${base(source)}/children?${query}`);
+  let page: TreeChildrenPage;
+  try { page = await api<TreeChildrenPage>(`${base(source)}/children?${query}`); }
+  catch (error) { if (current()) toast(`加载历史失败：${(error as Error).message}`, "error"); return; }
   if (!current()) return;
   if ("reset" in page) { scheduleLoad(source); return; }
   const deadline = Date.now() + 5000;

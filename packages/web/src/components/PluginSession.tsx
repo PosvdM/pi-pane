@@ -1,6 +1,6 @@
 // 插件节点视图：会话节点显示聊天记录、动作、输入框或只读条；group 和 resource 节点只显示面板（plugin-api.md“会话视图”“向会话发消息与停止”“面板”）。
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import { openNodeById } from "../lib/navigate.ts";
+import { nodeLabel, openNodeById } from "../lib/navigate.ts";
 import { abortPlugin, loadOlder, pluginView, sendToPlugin, syncCapabilities } from "../lib/plugin-session.ts";
 import { restoreText, splitActions } from "../lib/plugin-state.ts";
 import { formKey, forms, invokeAction, openForm, runAction, sortedForms } from "../lib/plugin-ui.ts";
@@ -27,7 +27,7 @@ function Crumbs({ node }: { node: TreeNode }) {
     <div class="crumbs" data-testid="crumbs">
       {chain.map((n) => {
         // 主会话树的项目分组以目录为标题，只显示最后一级。
-        const title = n.source === "pane" && n.kind === "group" ? n.title.split(/[\\/]/).filter(Boolean).pop() ?? n.title : n.title;
+        const title = n.source === "pane" && n.kind === "group" ? n.title.split(/[\\/]/).filter(Boolean).pop() ?? n.title : nodeLabel(n);
         return <span key={n.id}><button class="link" title={n.title} onClick={() => n.kind === "session" && openNodeById(n.id)}>{title}</button><span class="muted"> › </span></span>;
       })}
     </div>
@@ -102,7 +102,7 @@ function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: 
   };
   return (
     <div class="composer-wrap" data-testid="plugin-composer">
-      {action && <div class="composer-hint">发送的文字作为“{action.title}”提交给 {pluginName(node.source)}{running ? "，不中断当前运行" : ""}</div>}
+      {action && <div class="composer-hint">发送的文字作为“{action.title}”提交给 {pluginName(node.source)}</div>}
       <div class="composer">
         <textarea class="editor plain-editor" data-testid="plugin-editor" rows={2} value={text} placeholder={composer?.placeholder ?? "输入消息，Enter 发送，Shift+Enter 换行"}
           aria-busy={busy ? "true" : undefined}
@@ -209,7 +209,7 @@ export function PluginSessionView() {
             {canAbort && !view.closed && <button class="btn danger small-btn" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stop()}>停止</button>}
           </div>
         )}
-        <div class="statusbar">{node.statusDetail && <span>{node.statusDetail}</span>}<span>来源：{pluginName(node.source)}</span></div>
+        <div class="statusbar" data-testid="plugin-statusbar">{(model?.detail ?? node.statusDetail) && <span>{model?.detail ?? node.statusDetail}</span>}<span>来源：{pluginName(node.source)}</span></div>
       </div>
       {details.shown && <NodePanels node={node} panels={panels} onClose={details.close} drawer={details.narrow} onOpenNode={openNodeById} />}
     </div>

@@ -1,7 +1,7 @@
 // 插件面板：按 PanelContent 的类型用内置组件渲染，内容按需拉取，收到 panelChanged 后重新拉取（plugin-api.md“面板”）。
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api } from "../lib/api.ts";
-import { panelKey, panelState, runAction } from "../lib/plugin-ui.ts";
+import { panelKey, panelRevision, panelState, runAction } from "../lib/plugin-ui.ts";
 import { actionSpec, pluginName, plugins } from "../lib/plugins.ts";
 import { Store, useStore } from "../lib/store.ts";
 import type { PanelContent, PanelSpec, TreeNode } from "../lib/types.ts";
@@ -71,12 +71,9 @@ export function PanelView({ panel, nodeId, onOpenNode }: { panel: PanelSpec; nod
   const target = key + "\u0000" + (nodeId ?? "");
   const [content, setContent] = useState<{ target: string; value: PanelContent } | null>(null);
   const [error, setError] = useState<{ target: string; message: string } | null>(null);
-  // 只影响其他节点的变更不触发重新拉取：沿用上次拉取时的修订号。
-  const fetched = useRef(0);
-  const affects = !state?.nodeId || !nodeId || state.nodeId === nodeId;
-  const revision = affects ? state?.revision ?? 0 : fetched.current;
+  // 只影响其他节点的变更不改变本节点的修订号，不触发重新拉取。
+  const revision = panelRevision(state, nodeId);
   useEffect(() => {
-    fetched.current = revision;
     let live = true;
     const query = nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : "";
     api<PanelContent>(`/api/plugins/${encodeURIComponent(panel.source)}/panels/${encodeURIComponent(panel.id)}${query}`)

@@ -4,7 +4,7 @@ import { deviceLabel, getOrCreateDevice, PresenceError, resetDevice, signPresenc
 import { addNotificationTo, manualClose, NOTIFY_MS } from "./plugin-state.ts";
 import { actionSpec, pluginName } from "./plugins.ts";
 import { Store } from "./store.ts";
-import { toast } from "./ui-state.ts";
+import { confirmInApp, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
 import type {
   ActionResult, ActionSpec, ActionTarget, BannerState, FormAnswers, FormOutcome, FormSpec, FormSubmitResult, PaneNotification,
@@ -18,14 +18,30 @@ export const panelKey = (source: string, panelId: string) => source + "\u0000" +
 /** 待处理区的持久表单，键为 formKey(source, id)。 */
 export const forms = new Store<Map<string, FormSpec>>(new Map());
 /** 已提交、结果尚未确定的持久表单：pending 为插件已受理仍在处理，unknown 为请求超时或断网、结果未知。 */
-export interface FormBusy { idempotencyKey: string; outcome: FormOutcome; revision: number; state: "pending" | "unknown"; message?: string }
+/** 已提交、结果未定的持久表单：submitting 请求在途，pending 插件已受理仍在处理，unknown 结果未知。弹窗关闭后重开仍按同一幂等键查询，不能再填一次。 */
+export interface FormBusy { idempotencyKey: string; outcome: FormOutcome; revision: number; state: "submitting" | "pending" | "unknown"; message?: string }
 export const formBusy = new Store<Record<string, FormBusy>>({});
 export const banners = new Store<BannerState[]>([]);
 export const notifications = new Store<PaneNotification[]>([]);
 /** 发到本标签页、尚未关闭的在场确认，按到达顺序排队，一次显示一个。 */
 export const presence = new Store<PanePresenceRequest[]>([]);
 /** 面板的最新修订号与角标；显示中的面板据此重新拉取。键为 panelKey(source, panelId)。 */
-export const panelState = new Store<Record<string, { revision: number; nodeId?: string; badgeCount?: number | null }>>({});
+export interface PanelState {
+  revision: number;                 // 最近一次更新的修订号
+  all: number;                      // 最近一次不带 nodeId（影响全部节点）的修订号
+  nodes: Record<string, number>;    // 各节点最近一次更新的修订号；相邻两次更新指向不同节点时都要刷新
+  badgeCount?: number | null;
+}
+export const panelState = new Store<Record<string, PanelState>>({});
+/** 某个节点（或侧栏面板，nodeId 省略）应显示的面板修订号。 */
+export function panelRevision(state: PanelState | undefined, nodeId?: string): number {
+  if (!state) return 0;
+  return nodeId ? Math.max(state.all, state.nodes[nodeId] ?? 0) : state.revision;
+}
+/** 插件重启后修订号可能从小值重新开始：丢掉该来源（省略时全部）的面板状态，以重读的插件目录为准。 */
+function forgetPanels(source?: string): void {
+  panelState.set((s) => source === undefined ? {} : Object.fromEntries(Object.entries(s).filter(([key]) => !key.startsWith(panelKey(source, "")))));
+}
 
 /** 待处理区中打开的表单；附带表单（动作的 resolveForm 和 followUpForm）不进待处理区，单独记录。 */
 export interface OpenForm { key: string; persistent: boolean; form: FormSpec; updated?: boolean; error?: string; submitting?: boolean; onSubmit?: (outcome: FormOutcome) => Promise<void> }
@@ -33,7 +49,9 @@ export const openForm = new Store<OpenForm | null>(null);
 
 /** 待处理区排序：组内按 (createdAt, id) 升序。 */
 export function sortedForms(list: Iterable<FormSpec>): FormSpec[] {
-  return [...list].sort((a, b) => a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  // createdAt 可能带不同的时区或小数位，按时间值比较。
+  const at = (form: FormSpec) => Date.parse(form.createdAt) || 0;
+  return [...list].sort((a, b) => at(a) - at(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 /** 连接建立后服务端重发的表单，收到 formsAligned 时以它为准替换待处理区；为 null 表示不在对齐中。 */
@@ -109,7 +127,7 @@ export function installPluginHandlers(onConnected: () => void): void {
         // 连接建立：横幅以服务端列表为准；表单由服务端对齐后逐条重发并以 formsAligned 结束，期间保留旧列表；
         // 在场确认属于旧连接，全部作废。
         banners.set(message.banners ?? []);
-        aligning = new Set(); presence.set([]); registered = null;
+        aligning = new Set(); presence.set([]); registered = null; forgetPanels();
         void registerDevice(); onConnected();
         break;
       case "banner": {
@@ -130,6 +148,8 @@ export function installPluginHandlers(onConnected: () => void): void {
         break;
       case "presenceClosed": presence.set((list) => list.filter((p) => p.id !== message.id)); break;
       case "panel": applyPanel(message.source, message.update); break;
+      // 插件启用或变为不可用：重读插件列表、目录和各来源的树（没有横幅变化时也要刷新）。
+      case "plugins": forgetPanels(message.source); onConnected(); break;
     }
   });
 }
@@ -140,7 +160,9 @@ function applyPanel(source: string, update: PanelUpdate): void {
     const old = s[key];
     if (old && old.revision >= update.revision) return s;
     const badgeCount = update.badgeCount === undefined ? old?.badgeCount : update.badgeCount;
-    return { ...s, [key]: { revision: update.revision, ...(update.nodeId ? { nodeId: update.nodeId } : {}), ...(badgeCount === undefined ? {} : { badgeCount }) } };
+    const nodes = update.nodeId ? { ...old?.nodes, [update.nodeId]: update.revision } : old?.nodes ?? {};
+    const all = update.nodeId ? old?.all ?? 0 : update.revision;
+    return { ...s, [key]: { revision: update.revision, all, nodes, ...(badgeCount === undefined ? {} : { badgeCount }) } };
   });
 }
 
@@ -193,6 +215,7 @@ export async function submitForm(form: FormSpec, outcome: FormOutcome, retry?: F
   const busy = (state: FormBusy["state"], message?: string) => formBusy.set((s) => ({ ...s, [key]: { idempotencyKey, outcome: body.outcome, revision, state, ...(message ? { message } : {}) } }));
   const clear = () => formBusy.set((s) => { const next = { ...s }; delete next[key]; return next; });
   let result: FormSubmitResult;
+  if (!retry) busy("submitting");
   try { result = await api<FormSubmitResult>(pluginPath(form.source, `forms/${encodeURIComponent(form.id)}`), body); }
   catch (error) {
     if (unknownResult(error)) { busy("unknown", "结果未知"); return true; }
@@ -290,7 +313,7 @@ export function invokeAction(spec: ActionSpec, target: ActionTarget | undefined,
 export async function runAction(source: string, actionId: string, target: ActionTarget | undefined, onOpenNode?: (nodeId: string) => void): Promise<ActionOutcome> {
   const spec = actionSpec(source, actionId);
   if (!spec) { toast("插件没有声明这个动作", "error"); return "failed"; }
-  if (spec.confirm && !confirm(spec.confirm)) return "abandoned";
+  if (spec.confirm && !(await confirmInApp(spec.confirm, spec.danger))) return "abandoned";
   const key = newId();
   if (spec.hasForm) {
     let form: FormSpec | null;

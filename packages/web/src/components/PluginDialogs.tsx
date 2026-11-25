@@ -69,7 +69,7 @@ function Question({ q, value, onChange }: { q: FormQuestion; value: Answer; onCh
 }
 
 function initialField(field: FormField): FieldValue {
-  if (field.type === "group") return Array.from({ length: Math.max(field.min ?? 0, (field.max ?? 1) === 1 ? 1 : field.min ?? 0) }, () => initialGroup(field.fields ?? []));
+  if (field.type === "group") return Array.from({ length: field.min ?? 0 }, () => initialGroup(field.fields ?? []));
   if (field.type === "checkbox") return field.default === "true" ? "true" : "false";
   return field.default ?? (field.type === "select" ? field.options?.[0] ?? "" : "");
 }
@@ -86,10 +86,10 @@ function Field({ field, value, onChange }: { field: FormField; value: FieldValue
         {groups.map((group, i) => (
           <div key={i} class="field-group-item">
             {(field.fields ?? []).map((sub) => <Field key={sub.id} field={sub} value={group[sub.id] ?? initialField(sub)} onChange={(v) => onChange(groups.map((g, j) => j === i ? { ...g, [sub.id]: v } : g))} />)}
-            {groups.length > (field.min ?? 0) && max !== 1 && <button type="button" class="link small" onClick={() => onChange(groups.filter((_, j) => j !== i))}>删除此组</button>}
+            {groups.length > (field.min ?? 0) && <button type="button" class="link small" onClick={() => onChange(groups.filter((_, j) => j !== i))}>删除此组</button>}
           </div>
         ))}
-        {groups.length < max && max !== 1 && <button type="button" class="btn small-btn" onClick={() => onChange([...groups, initialGroup(field.fields ?? [])])}>添加</button>}
+        {groups.length < max && <button type="button" class="btn small-btn" onClick={() => onChange([...groups, initialGroup(field.fields ?? [])])}>添加</button>}
       </fieldset>
     );
   }
@@ -174,11 +174,17 @@ export function FormDialog() {
   }
   const state = busy[open.key];
   const later = <button class="btn ghost later" data-testid="form-later" title="关闭弹窗，事项留在待处理区" onClick={() => openForm.set(null)}>稍后处理</button>;
-  if (state) {
+  // 本弹窗发出的提交在途时保留表单内容（失败时可以改了再交）；关闭后重开的弹窗只显示进度，不能用新的幂等键再交一次。
+  if (state && !(state.state === "submitting" && open.submitting)) {
+    const query = async () => {
+      const close = await queryForm(form);
+      if (close && openForm.get()?.key === open.key) openForm.set(null);
+    };
     return (
       <Shell testid="form-dialog" title={form.title} aside={later}>
-        <p data-testid="form-busy">{state.state === "unknown" ? "提交结果未知：请求超时或连接中断，操作可能仍在进行。" : state.message ?? "已提交，正在处理（可能在等待确认）。"}</p>
-        <div class="modal-actions"><button class="btn" data-testid="form-query" onClick={() => void queryForm(form)}>查询结果</button></div>
+        <p data-testid="form-busy">{state.state === "unknown" ? "提交结果未知：请求超时或连接中断，操作可能仍在进行。"
+          : state.state === "submitting" ? "正在提交，请稍候。" : state.message ?? "已提交，正在处理（可能在等待确认）。"}</p>
+        {state.state !== "submitting" && <div class="modal-actions"><button class="btn" data-testid="form-query" onClick={() => void query()}>查询结果</button></div>}
       </Shell>
     );
   }
@@ -221,7 +227,7 @@ export function PresenceDialog() {
       </div>
       <Markdown text={request.summary} />
       <table class="kv presence-kv"><tbody>
-        <tr><th>签名设备</th><td>{device ? <>{device.label}（本设备） · <code>{device.deviceId}</code></> : "正在读取设备密钥…"}</td></tr>
+        <tr><th>签名设备</th><td>{device ? <>{device.label}（本设备） · <code title={device.deviceId}>{device.deviceId.length > 16 ? device.deviceId.slice(0, 8) + "…" + device.deviceId.slice(-4) : device.deviceId}</code></> : "正在读取设备密钥…"}</td></tr>
         {device && <tr><th>算法</th><td>{device.alg}</td></tr>}
       </tbody></table>
       <button class="link small" onClick={() => setRaw(!raw)}>{raw ? "▾" : "▸"} 签名内容（payload 原文）</button>
