@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fromSnapshot, apply, prependHistory } from "../packages/web/src/lib/session-model.ts";
-import { normalize, plainText, prependDrafts, displayQueued, parseSlash, isEmpty, imageIds, startsWith } from "../packages/web/src/lib/draft.ts";
+import { normalize, plainText, prependDrafts, displayQueued, parseSlash, isEmpty, imageIds } from "../packages/web/src/lib/draft.ts";
 import { canonicalize, JcsError } from "../packages/web/src/lib/jcs.ts";
 import { ResponseOrder } from "../packages/web/src/lib/response-order.ts";
 import { SessionModel } from "../packages/server/dist/model.js";
@@ -138,15 +138,6 @@ test("草稿 normalize 合并文本、去空节点并保留图片，plainText �
   assert.equal(plainText(nodes, 3), "甲乙[Image #3]丙[Image #4]");
   assert.deepEqual(imageIds(nodes), ["a", "b"]);
   assert.equal(isEmpty([text(" \n")]), true); assert.equal(isEmpty([image("a")]), false);
-});
-
-test("startsWith 按合并后的节点判断草稿开头，用于另一标签页放回时避免重复加入", () => {
-  assert.equal(startsWith([text("甲"), image("a"), text("乙丙")], [text("甲"), image("a"), text("乙")]), true);
-  assert.equal(startsWith([text("甲"), image("a")], [text("甲"), image("b")]), false);
-  assert.equal(startsWith([text("甲乙")], [text("甲"), image("a")]), false);
-  assert.equal(startsWith([{ type: "text", text: "甲" }, { type: "text", text: "乙" }], [text("甲乙")]), true);
-  assert.equal(startsWith([text("甲")], []), true);
-  assert.equal(startsWith([], [text("甲")]), false);
 });
 
 test("prependDrafts 按恢复顺序前置，以空行分隔并忽略空白草稿", () => {

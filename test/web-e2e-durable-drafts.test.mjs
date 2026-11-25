@@ -1,5 +1,6 @@
-// 清出的草稿在“可能丢失”的路径上不丢：服务端正常关停（#10），停止或关闭的结果没有交到发起的页面（#11：刷新、关闭、
-// 断网超过重试期限、服务端重启），两个标签页、取回后又刷新都只放回一次。草稿放回原会话的输入框，服务端副本取回后删除。
+// 服务端保存的清出草稿在 Chrome 中的取回（#10、#11）：服务端记录是唯一的权威副本。发起停止的页面收到结果后领取并直接放回；
+// 结果没有交到页面、服务端关停等异步路径上，记录显示在该会话所有标签页的待取回条中，由用户点“放回输入框”领取，只有一个领取者拿到。
+// 另一标签页没有未保存的编辑时，从草稿存储重新读取并显示，不写回，不会用旧内容覆盖放回的草稿。
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -7,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { png } from "../experiments/p0/b-bridge/images.mjs";
 import { prependDrafts } from "../packages/web/src/lib/draft.ts";
 import { providerPath, until } from "./fixtures/helpers.mjs";
-import { startWebServer } from "./fixtures/browser.mjs";
+import { openPaired, startWebServer } from "./fixtures/browser.mjs";
 import { setup, byId, newSession, idle, sessionView, records, replyScript, sessionItem, observePage } from "./fixtures/web-e2e.mjs";
 
 const webUi = fileURLToPath(new URL("./fixtures/web-ui.ts", import.meta.url));
@@ -54,13 +55,24 @@ async function draftNodes(page) {
     return JSON.parse(data.getData("application/x-pi-pane-draft") || "[]");
   });
 }
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const toasts = async page => (await byId(page, "toast").allTextContents()).join("\n");
-const keysWith = (page, prefix) => page.evaluate(prefix => Object.keys(localStorage).filter(key => key.startsWith(prefix)), prefix);
 const saved = (s, id) => s.server.sessions.outbox.list(id);
+const stored = (page, id) => page.evaluate(key => JSON.parse(localStorage.getItem(key) ?? "[]"), `pi-pane.draft.${id}`);
+const rows = page => byId(page, "saved-draft");
+async function typeAtEnd(page, value) {
+  await byId(page, "composer").evaluate(el => { el.focus(); const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection().removeAllRanges(); getSelection().addRange(range); });
+  await page.keyboard.insertText(value);
+}
+async function tab(s, context = s.context) {
+  const page = observePage(await context.newPage()); s.pages.push(page); page.setDefaultTimeout(15_000);
+  await page.goto(s.server.origin); await byId(page, "sidebar").waitFor();
+  return page;
+}
 
 /** 开始一轮挂起的回复，排入一条带图片的 follow-up 和一条纯文字 follow-up；返回两条草稿。 */
-async function queueDrafts(s) {
-  const { page, fixture } = s;
+async function queueDrafts(s, page = s.page) {
+  const { fixture } = s;
   await fixture.setScript({ fallback: { segments: [{ type: "text", text: "等待停止" }, { type: "hang" }] } });
   const hangs = (await records(fixture.env.FAKE_REQUEST_LOG)).filter(row => row.kind === "hang").length;
   await dispatch(page, "挂起的回合");
@@ -71,8 +83,7 @@ async function queueDrafts(s) {
   await editor.fill("图片之前 ");
   await byId(page, "image-input").setInputFiles({ name: "queued.png", mimeType: "image/png", buffer: original });
   await editor.locator(".chip[data-asset-id]").waitFor();
-  await editor.evaluate(el => { el.focus(); const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection().removeAllRanges(); getSelection().addRange(range); });
-  await page.keyboard.insertText(" 图片之后");
+  await typeAtEnd(page, " 图片之后");
   const image = await draftNodes(page);
   assert.deepEqual(image.map(node => node.type), ["text", "image", "text"]);
   assert.equal(image[1].assetId, assetId);
@@ -83,8 +94,6 @@ async function queueDrafts(s) {
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="queue"] .queued').length === 2);
   return [image, text("排队的纯文字")];
 }
-/** 放回后输入框中的内容：放回的草稿按顺序放在现有内容之前。 */
-const joined = (drafts, existing = []) => prependDrafts(drafts, existing);
 
 async function restart(s) {
   const origin = s.server.origin;
@@ -97,7 +106,7 @@ async function restart(s) {
   await byId(paired, "sidebar").waitFor();
   return paired;
 }
-/** 扣住某会话的停止或关闭响应：服务端照常执行，结果不交给页面。之后同一 requestId 的续取放行。 */
+/** 扣住某会话的停止或关闭响应：服务端照常执行，结果不交给页面。 */
 async function holdFirst(page, id, kind) {
   const state = { body: null, result: null };
   await page.route(`**/api/sessions/${id}/control`, async route => {
@@ -110,13 +119,13 @@ async function holdFirst(page, id, kind) {
   return state;
 }
 
-test("#10 Chrome 服务端关停（Ctrl+C 调用的 server.close()）时排队的草稿（含图片）保存，重启并重新配对后放回原会话并提示；双标签页只取回一次、另一页同步且编辑不覆盖，刷新不重复", { timeout: 150_000 }, async t => {
+test("#10 Chrome 服务端关停时排队的草稿（含图片）保存，重启后两个标签页都显示待取回条；一页放回后另一页的条消失、草稿同步显示且不被覆盖，刷新不重复", { timeout: 150_000 }, async t => {
   const s = await setup(t, replyScript("预热完成"), { serverOptions, allowedErrors: restartErrors }); if (!s) return;
   const b = await create(s, "关停乙");
   const a = await create(s, "关停甲");
   const drafts = await queueDrafts(s);
   await byId(s.page, "composer").fill("关停前的输入");
-  await page_wait(s.page, a.ref.id);
+  await s.page.waitForFunction(key => localStorage.getItem(key) !== null, `pi-pane.draft.${a.ref.id}`);
   const before = (await records(s.fixture.env.FAKE_REQUEST_LOG)).filter(row => row.kind === "request").length;
 
   const paired = await restart(s);
@@ -125,145 +134,124 @@ test("#10 Chrome 服务端关停（Ctrl+C 调用的 server.close()）时排队�
   assert.deepEqual(record.drafts, drafts.map(nodes => ({ nodes, uncertain: false })), "关停时清出的原草稿（含图片节点）保存在服务端");
   assert.equal((await records(s.fixture.env.FAKE_REQUEST_LOG)).filter(row => row.kind === "request").length, before, "排队的消息没有发送");
 
-  // 第二个标签页同时打开同一会话：两页串行取回，只有一页放回；另一页的输入框同步加入同样的草稿，不重复。
-  const other = observePage(await s.context.newPage()); s.pages.push(other); other.setDefaultTimeout(15_000);
-  await other.goto(s.server.origin); await byId(other, "sidebar").waitFor();
-  // 扣住两页读取服务端记录的请求，直到两页的输入框都显示关停前的输入，确保另一页是在已挂载、显示旧内容时收到同步。
-  let open; const gate = new Promise(resolve => { open = resolve; });
-  for (const page of [paired, other]) await page.route(`**/api/sessions/${a.ref.id}/drafts`, async route => { if (route.request().method() === "GET") await gate; await route.continue(); });
+  const other = await tab(s);
   await Promise.all([choose(paired, a), choose(other, a)]);
-  await until(async () => (await Promise.all([draftNodes(paired), draftNodes(other)])).every(nodes => JSON.stringify(nodes) === JSON.stringify(text("关停前的输入"))));
-  open();
-  const want = joined(drafts, text("关停前的输入"));
-  await until(async () => {
-    const [mine, theirs] = await Promise.all([draftNodes(paired), draftNodes(other)]);
-    return JSON.stringify(mine) === JSON.stringify(want) && JSON.stringify(theirs) === JSON.stringify(want);
-  });
+  for (const page of [paired, other]) {
+    await until(async () => await rows(page).count() === 1);
+    const row = rows(page).first();
+    assert.equal(await row.getAttribute("data-record-id"), record.id);
+    assert.match(await row.textContent(), /服务端关闭前排队.*图片之前 \[Image #1\] 图片之后 \/ 排队的纯文字（1 张图片）/);
+    assert.deepEqual(await draftNodes(page), text("关停前的输入"), "异步路径不自动放回");
+  }
+  await rows(paired).first().getByTestId("saved-draft-restore").click();
+  const want = prependDrafts(drafts, text("关停前的输入"));
+  await until(async () => same(await draftNodes(paired), want));
+  assert.match(await toasts(paired), /排队中的消息已放回输入框/);
   await until(async () => (await saved(s, a.ref.id)).length === 0);
-  const notices = await Promise.all([toasts(paired), toasts(other)]);
-  assert.equal(notices.filter(value => /服务端关闭前排队的消息已放回输入框/.test(value)).length, 1, "只有一页取回");
-  const holder = /服务端关闭前/.test(notices[0]) ? paired : other; const peer = holder === paired ? other : paired;
-  assert.match(await toasts(peer), /另一标签页放回的消息已加入输入框/);
-  assert.deepEqual(await keysWith(holder, "pi-pane.ack."), [], "服务端副本删除后移除待删除登记");
-  const draftKey = `pi-pane.draft.${a.ref.id}`;
-  const stored = () => holder.evaluate(key => JSON.parse(localStorage.getItem(key) ?? "[]"), draftKey);
-  assert.deepEqual(await stored(), want, "放回的草稿在关停前的输入之前，草稿存储只有一份");
-  // 另一页在放回之后编辑：保存的内容包含放回的草稿，不会用放回前的旧内容覆盖（服务端副本已删除）。
-  await byId(peer, "composer").evaluate(el => { el.focus(); const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection().removeAllRanges(); getSelection().addRange(range); });
-  await peer.keyboard.insertText("，另一页补充");
-  const edited = joined(drafts, text("关停前的输入，另一页补充"));
-  await until(async () => JSON.stringify(await stored()) === JSON.stringify(edited));
-  await holder.waitForTimeout(500);
-  assert.deepEqual(await stored(), edited);
+  // 另一页：收到变更通知后条消失；没有未保存的编辑，从草稿存储重新读取并显示，不写回。
+  await until(async () => await rows(other).count() === 0 && await rows(paired).count() === 0);
+  await until(async () => same(await draftNodes(other), want));
+  await other.waitForTimeout(800);
+  assert.deepEqual(await stored(paired, a.ref.id), want, "另一页没有用放回前的旧内容覆盖草稿存储");
+  assert.doesNotMatch(await toasts(other), /已放回输入框/, "提示只出现在放回的一页");
 
-  // 取回后刷新、切换会话：草稿保留，不再放回第二次。
-  for (const page of [paired, other]) { await page.unrouteAll({ behavior: "ignoreErrors" }); await page.reload(); await choose(page, a); }
-  await until(async () => JSON.stringify(await draftNodes(paired)) === JSON.stringify(edited));
+  // 另一页随后编辑：编辑基于同步后的内容，放回的草稿保留，并同步回放回的一页。
+  await typeAtEnd(other, "，另一页补充");
+  const edited = prependDrafts(drafts, text("关停前的输入，另一页补充"));
+  await until(async () => same(await stored(paired, a.ref.id), edited));
+  await until(async () => same(await draftNodes(paired), edited));
+
+  // 刷新、切换会话：草稿保留，没有待取回条，也不会再放回一次。
+  for (const page of [paired, other]) { await page.reload(); await choose(page, a); }
+  await until(async () => same(await draftNodes(paired), edited));
   assert.deepEqual(await draftNodes(other), edited);
   await choose(paired, b); await choose(paired, a);
   assert.deepEqual(await draftNodes(paired), edited);
-  assert.doesNotMatch(await toasts(paired), /服务端关闭前/);
+  assert.equal(await rows(paired).count(), 0);
 });
 
-/** 输入框的现有内容写入草稿存储后再继续。 */
-async function page_wait(page, id) {
-  await page.waitForFunction(key => localStorage.getItem(key) !== null, `pi-pane.draft.${id}`);
-}
-
-test("#11 Chrome 停止已执行、结果返回前刷新发起页面：新页面用同一 requestId 续取，放回后删除服务端副本，再刷新不重复", { timeout: 120_000 }, async t => {
+test("#11 Chrome 停止已执行、结果返回前刷新发起页面：记录显示在待取回条中；另一独立浏览器配置也显示，两边同时放回只有一边拿到", { timeout: 150_000 }, async t => {
   const s = await setup(t, replyScript("预热完成"), { serverOptions }); if (!s) return;
   const { page } = s;
   const a = await create(s, "刷新甲");
   const drafts = await queueDrafts(s);
+  // 另一个浏览器配置：不共享 localStorage 和 Web Lock。
+  const { context: profile, page: elsewhere } = await openPaired(s.browser, s.server); s.pages.push(elsewhere); elsewhere.setDefaultTimeout(15_000);
+  t.after(() => profile.close().catch(() => {}));
+  await choose(elsewhere, a);
   const held = await holdFirst(page, a.ref.id, "stop");
   await byId(page, "stop").click();
   await until(() => held.result);
   assert.equal(held.result.status, "done");
-  assert.equal((await saved(s, a.ref.id))[0].id, held.body.requestId, "清出时即以 requestId 保存");
-  assert.equal((await keysWith(page, "pi-pane.stopflight.")).length, 1, "发起前记下在途请求");
-  const resumed = page.waitForRequest(request => request.url().endsWith(`/${a.ref.id}/control`) && request.postDataJSON().requestId === held.body.requestId);
+  assert.equal(held.result.draftsRecord, held.body.requestId, "清出时即以 requestId 保存");
+  assert.equal(await rows(page).count(), 0, "发起页等待结果期间不在待取回条中显示这条记录");
+  await until(async () => await rows(elsewhere).count() === 1);
+  assert.match(await rows(elsewhere).first().textContent(), /停止时清出/);
+
   await page.reload();
-  await resumed;
-  await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
-  await byId(page, "composer").locator(".chip[data-asset-id]").waitFor();
-  assert.deepEqual(await draftNodes(page), joined(drafts));
-  assert.match(await toasts(page), /排队中的消息已放回输入框/);
-  await until(async () => (await saved(s, a.ref.id)).length === 0);
-  await until(async () => (await keysWith(page, "pi-pane.stopflight.")).length + (await keysWith(page, "pi-pane.ack.")).length === 0);
+  // 刷新后再撤销拦截：撤销会放行仍挂起的原请求，页面就会收到结果。
   await page.unrouteAll({ behavior: "ignoreErrors" });
-  await page.reload();
-  await byId(page, "composer").locator(".chip[data-asset-id]").waitFor();
-  assert.deepEqual(await draftNodes(page), joined(drafts), "取回后又刷新：草稿只有一份");
+  await page.waitForFunction(id => document.querySelector('[data-testid="chat"]')?.dataset.sessionId === id, a.ref.id);
+  await until(async () => await rows(page).count() === 1);
+  assert.deepEqual(await draftNodes(page), [], "刷新后不自动放回");
+
+  // 两边的领取请求都放行到同一时刻，服务端只把内容交给一个。
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  for (const p of [page, elsewhere]) await p.route(`**/drafts/*/claim`, async route => { await gate; await route.continue(); });
+  const claims = [page, elsewhere].map(p => p.waitForResponse(response => response.url().endsWith("/claim")));
+  await Promise.all([rows(page).first().getByTestId("saved-draft-restore").click(), rows(elsewhere).first().getByTestId("saved-draft-restore").click()]);
+  release();
+  const results = await Promise.all(claims.map(async response => (await response).json()));
+  assert.deepEqual(results.map(result => result.status).sort(), ["claimed", "gone"]);
+  const [winner, loser] = results[0].status === "claimed" ? [page, elsewhere] : [elsewhere, page];
+  await winner.locator('[data-testid="composer"] .chip[data-asset-id]').waitFor();
+  assert.deepEqual(await draftNodes(winner), prependDrafts(drafts, []));
+  await until(async () => /已在其他页面放回或放弃/.test(await toasts(loser)));
+  assert.deepEqual(await draftNodes(loser), []);
+  await until(async () => await rows(page).count() === 0 && await rows(elsewhere).count() === 0);
+  assert.deepEqual(await saved(s, a.ref.id), []);
+
+  // 领取后又刷新：草稿只有一份，不再出现待取回条。
+  await winner.unrouteAll({ behavior: "ignoreErrors" });
+  await winner.reload();
+  await winner.locator('[data-testid="composer"] .chip[data-asset-id]').waitFor();
+  assert.deepEqual(await draftNodes(winner), prependDrafts(drafts, []));
+  await winner.waitForTimeout(500);
+  assert.equal(await rows(winner).count(), 0);
 });
 
-test("#11 Chrome 两个标签页打开同一会话，发起关闭的页面在结果返回前关闭：另一页取回并删除服务端副本", { timeout: 120_000 }, async t => {
-  const s = await setup(t, replyScript("预热完成"), { serverOptions, allowedErrors: [/status of 409 \(Conflict\)/] }); if (!s) return;
-  const { page, context } = s;
-  const a = await create(s, "双页甲");
-  const drafts = await queueDrafts(s);
-  const other = observePage(await context.newPage()); s.pages.push(other); other.setDefaultTimeout(15_000);
-  await other.goto(s.server.origin); await byId(other, "sidebar").waitFor();
+test("Chrome 停止成功时发起页领取并直接放回，同一会话的另一页同步显示；普通草稿在未编辑的另一页同步且不被旧内容覆盖", { timeout: 120_000 }, async t => {
+  const s = await setup(t, replyScript("预热完成"), { serverOptions }); if (!s) return;
+  const { page } = s;
+  const a = await create(s, "同步甲");
+  const other = await tab(s);
   await choose(other, a);
-  const held = await holdFirst(page, a.ref.id, "close");
-  await page.getByTitle("停止 pi 进程并关闭会话", { exact: true }).click();
-  await until(() => held.result);
-  assert.equal(held.result.status, "done");
-  await other.waitForTimeout(2500);
-  assert.deepEqual(await draftNodes(other), [], "发起的页面仍在等待时不取走");
-  s.pages.splice(s.pages.indexOf(page), 1);
-  await page.close({ runBeforeUnload: false });
-  await byId(other, "composer").locator(".chip[data-asset-id]").waitFor({ timeout: 15_000 });
-  assert.deepEqual(await draftNodes(other), joined(drafts));
-  await until(async () => (await saved(s, a.ref.id)).length === 0);
-  assert.deepEqual(await keysWith(other, "pi-pane.stopflight."), []);
-});
 
-test("#11 Chrome 停止的响应因断网超过重试期限而放弃，网络恢复后续取原结果并放回", { timeout: 120_000 }, async t => {
-  const s = await setup(t, replyScript("预热完成"), { serverOptions, allowedErrors: [/net::ERR_INTERNET_DISCONNECTED/] }); if (!s) return;
-  const { page } = s;
-  // 页面计时使用可快进的时钟，跳过 120 秒的网络重试期限。
-  await page.clock.install();
-  await page.reload(); await byId(page, "sidebar").waitFor();
-  const a = await create(s, "断网甲");
-  const drafts = await queueDrafts(s);
-  let offline = true; let attempts = 0; let result;
-  await page.route(`**/api/sessions/${a.ref.id}/control`, async route => {
-    if (route.request().postDataJSON().command.type !== "stop" || !offline) return route.continue();
-    attempts++;
-    // 服务端执行并返回结果，响应在网络上丢失。
-    result ??= await (await route.fetch()).json();
-    await route.abort("internetdisconnected");
-  });
-  await byId(page, "stop").click();
-  await until(() => result && attempts >= 1);
-  assert.equal(result.status, "done");
-  await page.clock.fastForward("02:05");
-  await until(async () => /这次操作可能已经执行/.test(await toasts(page)), 15_000);
-  assert.deepEqual(await draftNodes(page), [], "放弃重试时结果未知，不放回");
-  assert.equal((await keysWith(page, "pi-pane.stopflight.")).length, 1, "保留在途请求");
-  offline = false;
-  await page.clock.fastForward("00:06");
-  await byId(page, "composer").locator(".chip[data-asset-id]").waitFor();
-  assert.deepEqual(await draftNodes(page), joined(drafts));
-  await until(async () => (await saved(s, a.ref.id)).length === 0);
-  assert.deepEqual(await keysWith(page, "pi-pane.stopflight."), []);
-});
+  // 普通草稿：一页编辑后，另一页（没有未保存的编辑）重新读取并显示，不写回。
+  await byId(page, "composer").fill("第一页的草稿");
+  await until(async () => same(await draftNodes(other), text("第一页的草稿")));
+  await typeAtEnd(other, "，第二页补充");
+  await until(async () => same(await draftNodes(page), text("第一页的草稿，第二页补充")));
+  await page.waitForTimeout(800);
+  assert.deepEqual(await stored(page, a.ref.id), text("第一页的草稿，第二页补充"));
+  await byId(page, "composer").fill("");
+  await until(async () => same(await draftNodes(other), []));
 
-test("#11 Chrome 停止已执行、发起页面关闭后服务端重启：重新打开会话时按 requestId 取回服务端保存的草稿", { timeout: 150_000 }, async t => {
-  const s = await setup(t, replyScript("预热完成"), { serverOptions, allowedErrors: [...restartErrors, /status of 409 \(Conflict\)/] }); if (!s) return;
-  const { page } = s;
-  const a = await create(s, "重启甲");
   const drafts = await queueDrafts(s);
-  const held = await holdFirst(page, a.ref.id, "stop");
+  await byId(other, "composer").fill("另一页的输入");
+  await until(async () => same(await draftNodes(page), text("另一页的输入")));
+  let shown = false;
+  const watch = setInterval(() => { void rows(other).count().then(n => { if (n) shown = true; }, () => {}); }, 20);
   await byId(page, "stop").click();
-  await until(() => held.result);
-  s.pages.splice(s.pages.indexOf(page), 1);
-  await page.close({ runBeforeUnload: false });
-  const paired = await restart(s);
-  assert.equal((await saved(s, a.ref.id))[0].id, held.body.requestId);
-  await choose(paired, a);
-  await byId(paired, "composer").locator(".chip[data-asset-id]").waitFor();
-  assert.deepEqual(await draftNodes(paired), joined(drafts));
+  const want = prependDrafts(drafts, text("另一页的输入"));
+  await until(async () => same(await draftNodes(page), want));
+  assert.match(await toasts(page), /排队中的消息已放回输入框/);
+  assert.equal(await rows(page).count(), 0, "发起页直接放回，不显示待取回条");
+  await until(async () => same(await draftNodes(other), want));
   await until(async () => (await saved(s, a.ref.id)).length === 0);
-  assert.deepEqual(await keysWith(paired, "pi-pane.stopflight."), []);
+  await until(async () => await rows(other).count() === 0);
+  clearInterval(watch);
+  t.diagnostic(`另一页短暂显示过待取回条：${shown}`);
+  await other.waitForTimeout(800);
+  assert.deepEqual(await stored(page, a.ref.id), want, "另一页没有写回旧内容");
 });

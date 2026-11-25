@@ -4,15 +4,16 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { api, newId } from "../lib/api.ts";
 import { blobUrl } from "../lib/blobs.ts";
-import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts, startsWith } from "../lib/draft.ts";
+import { displayQueued, imageIds, isEmpty, normalize, parseSlash, plainText, prependDrafts } from "../lib/draft.ts";
 import { checkImages, uploadImage } from "../lib/images.ts";
-import { addNotice, attachComposer, batchPrefix, FLIGHT_GRACE_MS, beginSubmit, clearNotice, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, stopPrefix, takePending, unsavedSessions } from "../lib/restored.ts";
-import { closeSession, control, current, editorText, navigation, outcomeUnknown, recoverDrafts, stopRun, type ControlOutcome } from "../lib/session.ts";
+import { addNotice, attachComposer, batchPrefix, beginSubmit, clearNotice, draftKey, finishSubmit, loadDraft, loadNotice, noticeChanged, noticeKey, recoverFlights, saveDraft, takePending, unsavedSessions } from "../lib/restored.ts";
+import { closeSession, control, current, editorText, navigation, outcomeUnknown, stopRun, type ControlOutcome } from "../lib/session.ts";
 import type { ModelState } from "../lib/session-model.ts";
 import { useStore } from "../lib/store.ts";
 import { ask, overlay, toast } from "../lib/ui-state.ts";
 import type { DraftNode, PaneCommand, PaneControlCommand, PaneThinkingLevel } from "../lib/types.ts";
 import { downloadExport, sidebarOpen } from "../lib/actions.ts";
+import { SavedDrafts } from "./SavedDrafts.tsx";
 
 const DRAFT_MIME = "application/x-pi-pane-draft";
 
@@ -86,12 +87,11 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
 
   // 待写入 localStorage 的草稿：编辑时立即捕获内容，延迟写入；切换会话或卸载时同步写入。
   const pendingSave = useRef<{ sessionId: string; nodes: DraftNode[] } | null>(null);
-  /** 同步写入尚未保存的编辑；返回是否已写入 localStorage（没有待写入内容时为 true）。 */
-  const flush = (): boolean => {
+  const flush = () => {
     clearTimeout(saveTimer.current);
     const pending = pendingSave.current; pendingSave.current = null;
-    if (!pending) return true;
-    return saveDraft(localStorage, pending.sessionId, pending.nodes);
+    if (!pending) return;
+    saveDraft(localStorage, pending.sessionId, pending.nodes);
   };
   /** 读取输入框内容并安排保存。byUser：由用户编辑引起，此时清空输入框即移除归属不明提示。 */
   const refresh = (byUser = true) => {
@@ -123,27 +123,25 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
   useLayoutEffect(() => {
     const el = editor.current!;
     let alive = true; let timer: ReturnType<typeof setTimeout> | undefined;
-    setNodes(loadDraft(localStorage, sessionId));
-    // 刚读出的草稿不必写回。另一标签页可能随后放回取回的草稿并写入草稿存储，延迟写回会用旧内容覆盖它。
-    clearTimeout(saveTimer.current); pendingSave.current = null;
+    /**
+     * 读出草稿存储中的内容，不写回：刚读出的内容与存储一致。另一标签页可能随后放回草稿或编辑并写入同一个键，
+     * 延迟写回会用旧内容覆盖它。焦点在输入框中时光标移到末尾。
+     */
+    const reload = () => {
+      const focused = document.activeElement === el;
+      setNodes(loadDraft(localStorage, sessionId));
+      clearTimeout(saveTimer.current); pendingSave.current = null;
+      if (focused) { const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); getSelection()?.removeAllRanges(); getSelection()?.addRange(range); }
+    };
+    reload();
     const detach = attachComposer(sessionId, {
       // 取回的草稿放在现有草稿之前，并立即保存，之后才删除待放回记录。
       deliver: (drafts, message) => {
         setNodes(prependDrafts(drafts.map((draft) => draft.nodes), readNodes(el)));
-        const saved = flush();
+        flush();
         const uncertain = drafts.filter((draft) => draft.uncertain).length;
         if (uncertain) addNotice(localStorage, sessionId, uncertain);
         if (message) toast(message, uncertain ? "warning" : undefined);
-        return saved;
-      },
-      // 另一标签页放进同一会话输入框的草稿：同样放在本页内容之前并保存，本页之后的保存不会覆盖掉它。提示已由那一页记录。
-      // 本页内容已经以这些草稿开头时不再加入（例如本页读入草稿后，另一页提交同样的内容失败并放回）。
-      mirror: (drafts) => {
-        const head = prependDrafts(drafts.map((draft) => draft.nodes), []); const existing = readNodes(el);
-        if (startsWith(existing, head)) return;
-        setNodes(prependDrafts([head], existing));
-        flush();
-        toast("另一标签页放回的消息已加入输入框");
       },
     });
     // 同一会话可能在多个标签页挂载：用 Web Lock 串行取走待放回记录，避免同一批放回两次。
@@ -156,18 +154,17 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
       void recoverFlights(localStorage, sessionId).then((wait) => { if (alive && wait !== null) timer = setTimeout(recover, wait + 50); });
     };
     take(); recover();
-    // 其他标签页存入的待放回草稿、发起的停止或关闭（该页关闭后由本页续取），以及其他标签页对提示的修改。
+    // 其他标签页存入的待放回草稿、对该会话草稿的修改，以及对提示的修改。
     const onStorage = (event: StorageEvent) => {
       if (event.key?.startsWith(batchPrefix(sessionId)) && event.newValue) take();
-      if (event.key?.startsWith(stopPrefix(sessionId)) && event.newValue) recoverDrafts(sessionId, false, FLIGHT_GRACE_MS);
+      // 另一标签页保存了该会话的草稿（编辑、放回或提交时清空）：本页没有未保存的编辑时重新读取并显示，不写回；
+      // 有未保存的编辑时不动，之后保存的一方生效。
+      if (event.key === draftKey(sessionId) && !pendingSave.current) reload();
       if (event.key === noticeKey(sessionId)) noticeChanged.set((n) => n + 1);
     };
     addEventListener("storage", onStorage);
     return () => { alive = false; clearTimeout(timer); removeEventListener("storage", onStorage); detach(); flush(); };
   }, [sessionId]);
-  // 服务端保存的清出草稿（服务端关停、写者停止、结果未交到页面的停止或关闭）：挂载时取回；
-  // 写者停止或更换（托管状态、epoch 变化）时可能刚保存了新的记录，再取一次。
-  useEffect(() => { recoverDrafts(sessionId, true); }, [sessionId, view.hosted, view.cursor.epoch]);
   useEffect(() => {
     if (!external || external.sessionId !== sessionId || !editor.current) return;
     editorText.set(null);
@@ -427,6 +424,7 @@ export function Composer({ sessionId, model, commands }: { sessionId: string; mo
           ))}
         </div>
       )}
+      <SavedDrafts sessionId={sessionId} />
       {unsaved && <div class="composer-notice error" data-testid="unsaved-notice" role="alert">浏览器存储空间不足，这个会话的草稿只保存到页面关闭前。请先发送或复制草稿，或清理浏览器存储。</div>}
       {notice > 0 && (
         <div class="composer-notice warn" data-testid="restored-notice">

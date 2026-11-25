@@ -1,8 +1,8 @@
 // 当前打开的会话：取快照、订阅事件、发送控制命令、处理冲突与会话替换。
 import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
-import { beginStop, finalizeStop, releaseStop, sessionsWithServerWork, settleServerDrafts, type StopFlight } from "./restored.ts";
-import { clearedDrafts, recoverServerDrafts, RESTORED_MESSAGE, UNAVAILABLE_RECHECK_MS, type RecoveryNext } from "./server-drafts.ts";
+import { deliverRestored } from "./restored.ts";
+import { awaitSaved, claimSaved, recordDrafts } from "./saved-drafts.ts";
 import { ResponseOrder } from "./response-order.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
@@ -254,7 +254,7 @@ export function outcomeUnknown(error: ApiError): boolean {
  * 发送一条控制命令。等待到期返回 pending 时，用同一 requestId 和同一内容重复提交，直到得到最终结果。
  * onBody 在第一次提交之前收到完整请求体。
  */
-export async function control(command: PaneControlCommand, draft?: DraftNode[], onBody?: (body: { requestId: string } & Record<string, unknown>) => void): Promise<ControlOutcome> {
+export async function control(command: PaneControlCommand, draft?: DraftNode[], onBody?: (body: { requestId: string }) => void): Promise<ControlOutcome> {
   const state = current.get(); const model = state?.model;
   if (!state || !model) return { ok: false, error: new ApiError(0, "noSession", "没有打开的会话") };
   const id = state.id; const mine = nav;
@@ -309,64 +309,6 @@ export async function control(command: PaneControlCommand, draft?: DraftNode[], 
   }
 }
 
-/** 同一会话的续取在本页面内串行；运行期间再次请求时，结束后按请求的时间再执行。 */
-const recovery = new Map<string, { timer?: ReturnType<typeof setTimeout>; due: number; saved: boolean; running: boolean }>();
-const serverDraftsDeps = () => ({ storage: localStorage, locks: navigator.locks ?? null, call: api, newId });
-
-/**
- * 续取并放回该会话的服务端草稿（server-drafts.ts）：delay 毫秒后执行，saved 为 true 时也读取服务端保存的记录。
- * 结果不看当前导航：输入框未挂载时进入该会话的待放回记录。
- */
-export function recoverDrafts(sessionId: string, saved = false, delay = 0): void {
-  let state = recovery.get(sessionId);
-  if (!state) { state = { due: Infinity, saved: false, running: false }; recovery.set(sessionId, state); }
-  state.saved ||= saved;
-  const due = Date.now() + delay;
-  if (due >= state.due) return;
-  state.due = due;
-  if (state.running) return;
-  clearTimeout(state.timer);
-  state.timer = setTimeout(() => { void runRecovery(sessionId); }, delay);
-}
-async function runRecovery(sessionId: string): Promise<void> {
-  const state = recovery.get(sessionId)!;
-  state.timer = undefined; state.running = true; state.due = Infinity;
-  const saved = state.saved; state.saved = false;
-  let next: RecoveryNext | null;
-  try { next = await recoverServerDrafts(serverDraftsDeps(), sessionId, saved); }
-  catch { next = { delay: UNAVAILABLE_RECHECK_MS, saved }; }
-  state.running = false;
-  const requested = state.due; state.due = Infinity;
-  // 运行期间的新请求带来的 saved 仍在 state.saved 中，由下面的调度合并。
-  if (requested !== Infinity) recoverDrafts(sessionId, false, Math.max(0, requested - Date.now()));
-  if (next) recoverDrafts(sessionId, next.saved, next.delay);
-  if (!state.timer) recovery.delete(sessionId);
-}
-/** 连接建立或恢复时，续取当前会话和本浏览器有未完成停止、关闭请求或待删除登记的会话。 */
-export function recoverAllDrafts(): void {
-  const id = current.get()?.id;
-  for (const sessionId of new Set([...(id ? [id] : []), ...sessionsWithServerWork(localStorage)])) recoverDrafts(sessionId, true);
-}
-
-/**
- * 发送停止或关闭。请求体先存为该会话的在途请求（restored.ts），得到结果后把清出的草稿放回所属会话的输入框，
- * 并请服务端删除它保存的副本；结果未知时保留在途请求，由 recoverDrafts 用同一 requestId 续取。
- * 服务端明确拒绝（如 409 holdsConfirmation、revisionChanged）时请求确定没有执行，在途请求标为已结束，
- * 续取只核对服务端记录、不再重新提交，用户取消的关闭不会在之后被执行。
- */
-async function clearing(sessionId: string, command: Extract<PaneControlCommand, { type: "stop" | "close" }>): Promise<ControlOutcome> {
-  let flight: StopFlight | undefined;
-  const outcome = await control(command, undefined, (body) => { flight = beginStop(localStorage, sessionId, body); });
-  if (!flight) return outcome;
-  if (outcome.ok) {
-    const drafts = outcome.result.status === "done" ? clearedDrafts(outcome.result) : [];
-    settleServerDrafts(localStorage, sessionId, drafts.length ? [flight.body.requestId] : [], drafts, RESTORED_MESSAGE.stop, flight.key);
-  } else if (outcomeUnknown(outcome.error)) releaseStop(flight.key);
-  else finalizeStop(localStorage, flight);
-  recoverDrafts(sessionId);
-  return outcome;
-}
-
 /** 停止：clear_queue + abort，清出的消息回到输入框。 */
 export async function stopRun(): Promise<void> {
   const state = current.get(); if (!state?.model) return;
@@ -377,6 +319,40 @@ export async function stopRun(): Promise<void> {
       toast(phase === "idle" ? "这次运行已经结束" : phase === "stopping" ? "正在停止" : "会话状态已变化，请再次确认是否停止", "warning");
     } else toast(outcome.error.message, "error");
   }
+}
+
+/**
+ * 发送停止或关闭，得到结果后把清出的排队消息放回发起请求时所在会话的输入框（restoreCleared）。
+ * 等待结果期间，这次请求对应的服务端记录不在本页的待取回条中显示。
+ */
+async function clearing(sessionId: string, command: Extract<PaneControlCommand, { type: "stop" | "close" }>): Promise<ControlOutcome> {
+  let release = () => {};
+  try {
+    const outcome = await control(command, undefined, (body) => { release = awaitSaved(body.requestId); });
+    if (outcome.ok && outcome.result.status === "done") await restoreCleared(sessionId, outcome.result);
+    return outcome;
+  } finally { release(); }
+}
+
+/**
+ * 把清出的排队消息放回原会话的输入框：确定的草稿在前，归属不明、可能已发送的草稿在后，由输入框提示用户检查。
+ * 不弹确认框，也不看当前导航：用户已切换到其他会话时存入原会话的待放回记录。
+ * 结果带 draftsRecord 时草稿已保存为服务端记录，按该 id 领取，领到才放回：其他页面可能已在待取回条中领走。
+ * 没有 draftsRecord（没有草稿或服务端保存失败）时直接放回结果中的草稿。
+ */
+async function restoreCleared(sessionId: string, result: Extract<PaneControlResult, { status: "done" }>): Promise<void> {
+  if (!result.draftsRecord) {
+    deliverRestored(localStorage, sessionId, [
+      ...result.clearedDrafts.map((nodes) => ({ nodes, uncertain: false })),
+      ...(result.uncertainDrafts ?? []).map((nodes) => ({ nodes, uncertain: true })),
+    ]);
+    return;
+  }
+  let record;
+  try { record = await claimSaved(sessionId, result.draftsRecord); }
+  catch { toast("排队中的消息没能放回输入框，请在输入框上方的待取回列表中查看", "warning"); return; }
+  if (record) deliverRestored(localStorage, sessionId, recordDrafts(record));
+  else toast("排队中的消息已在其他页面放回");
 }
 
 export async function restart(): Promise<void> {
