@@ -22,6 +22,8 @@ export const pluginView = new Store<PluginView | null>(null);
 let unsubscribe: (() => void) | null = null;
 let nav = 0;
 let reloading: Promise<void> | null = null;
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+let retries = 0;
 
 const sessionPath = (ref: SessionRef, op: string) => `/api/plugins/${encodeURIComponent(ref.source)}/sessions/${encodeURIComponent(ref.id)}/${op}`;
 
@@ -32,6 +34,7 @@ function toView(snapshot: SessionSnapshot): PaneSessionView {
 
 export function closePluginView(): void {
   nav++; unsubscribe?.(); unsubscribe = null; pluginView.set(null);
+  clearTimeout(retryTimer); retries = 0;
 }
 
 export async function openPluginNode(node: TreeNode): Promise<void> {
@@ -47,10 +50,14 @@ async function loadSnapshot(ref: SessionRef, mine: number): Promise<void> {
     const snapshot = await api<SessionSnapshot>(sessionPath(ref, "snapshot"));
     if (mine !== nav) return;
     pluginView.set((v) => v && { ...v, model: fromSnapshot(toView(snapshot)), partials: snapshot.unfinishedPartials ?? [], loading: false, error: undefined });
+    retries = 0;
     unsubscribe?.();
     unsubscribe = ws.subscribe(ref, () => pluginView.get()?.model?.view.cursor ?? { epoch: "", seq: 0 }, (record) => onEvent(mine, record));
   } catch (error) {
-    if (mine === nav) pluginView.set((v) => v && { ...v, loading: false, error: (error as Error).message });
+    if (mine !== nav) return;
+    pluginView.set((v) => v && { ...v, loading: false, error: `${(error as Error).message}（正在重试）` });
+    const delay = Math.min(10000, 1000 * 2 ** retries++);
+    clearTimeout(retryTimer); retryTimer = setTimeout(() => { if (mine === nav) void loadSnapshot(ref, mine); }, delay);
   }
 }
 
@@ -62,7 +69,10 @@ function onEvent(mine: number, record: Parameters<typeof apply>[1]): void {
   if (result === "applied") pluginView.touch();
 }
 
-/** 游标断开或 epoch 变化：重取快照，再以新游标续订。 */
+/**
+ * 游标断开或 epoch 变化：重取快照，再以新游标续订。
+ * 取快照失败时（如插件的后台服务暂时离线）按退避间隔重试，直到成功或离开该节点；否则离线期间推来的 resync 无处送达。
+ */
 export function reload(): Promise<void> {
   const view = pluginView.get(); if (!view?.ref) return Promise.resolve();
   if (reloading) return reloading;
@@ -72,7 +82,15 @@ export function reload(): Promise<void> {
       const snapshot = await api<SessionSnapshot>(sessionPath(ref, "snapshot"));
       if (mine !== nav) return;
       pluginView.set((v) => v && { ...v, model: fromSnapshot(toView(snapshot)), partials: snapshot.unfinishedPartials ?? [], error: undefined });
-    } catch (error) { if (mine === nav) pluginView.set((v) => v && { ...v, error: (error as Error).message }); }
+      retries = 0;
+    } catch (error) {
+      reloading = null;
+      if (mine !== nav) return;
+      pluginView.set((v) => v && { ...v, error: `${(error as Error).message}（正在重试）` });
+      const delay = Math.min(10000, 1000 * 2 ** retries++);
+      clearTimeout(retryTimer); retryTimer = setTimeout(() => { if (mine === nav) void reload(); }, delay);
+      return;
+    }
     finally { reloading = null; }
     if (mine === nav) ws.resubscribe(ref);
   })();

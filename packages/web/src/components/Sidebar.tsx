@@ -204,10 +204,10 @@ function NodeMenu({ menu, onClose }: { menu: Menu; onClose: () => void }) {
   }, []);
   return (
     <div class="menu" data-testid="node-menu" style={{ left: `${menu.x}px`, top: `${menu.y}px` }}>
-      {menu.node.kind === "session" && <button class="menu-item" onClick={() => openNode(menu.node)}>打开</button>}
+      {menu.node.kind === "session" ? <button class="menu-item" onClick={() => openNode(menu.node)}>打开</button>
+        : <button class="menu-item" data-testid="node-detail" onClick={() => openNode(menu.node)}>查看详情</button>}
       {actions.map((spec) => <button key={spec.id} class={"menu-item" + (spec.danger ? " danger" : "")} data-testid="node-action"
         onClick={() => void runAction(menu.node.source, spec.id, { type: "node", nodeId: menu.node.id }, openNodeById)}>{spec.title}</button>)}
-      {!actions.length && menu.node.kind !== "session" && <div class="menu-item muted">没有可用操作</div>}
     </div>
   );
 }

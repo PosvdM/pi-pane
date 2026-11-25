@@ -2,6 +2,7 @@
 import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
 import { deliverRestored } from "./restored.ts";
+import { closePluginView } from "./plugin-session.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
@@ -112,6 +113,7 @@ export function reload(): Promise<void> {
 /** 打开已登记的会话（按会话 id）。 */
 export async function open(id: string): Promise<void> {
   const mine = ++nav;
+  closePluginView();
   current.set({ id, model: null, loading: true });
   try {
     const view = await api<PaneSessionView>(`/api/sessions/${encodeURIComponent(id)}/snapshot`);
@@ -141,6 +143,7 @@ export function detach(): void {
 /** 从会话列表打开，或在项目目录下新建（sessionFile 省略）。 */
 export async function openFile(cwd: string, sessionFile?: string, fork = false): Promise<void> {
   const mine = ++nav;
+  closePluginView();
   current.set({ id: "", model: null, loading: true });
   try {
     const result = await api<PaneOpenResult>("/api/sessions/open", { requestId: newId(), cwd, ...(sessionFile ? { sessionFile } : {}), ...(fork ? { fork: true } : {}) });

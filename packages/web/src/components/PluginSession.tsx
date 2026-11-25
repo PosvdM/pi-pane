@@ -26,7 +26,11 @@ function Crumbs({ node }: { node: TreeNode }) {
   if (!chain.length) return null;
   return (
     <div class="crumbs" data-testid="crumbs">
-      {chain.map((n) => <span key={n.id}><button class="link" onClick={() => openNodeById(n.id)}>{n.title}</button><span class="muted"> › </span></span>)}
+      {chain.map((n) => {
+        // 主会话树的项目分组以目录为标题，只显示最后一级。
+        const title = n.source === "pane" && n.kind === "group" ? n.title.split(/[\\/]/).filter(Boolean).pop() ?? n.title : n.title;
+        return <span key={n.id}><button class="link" title={n.title} onClick={() => n.kind === "session" && openNodeById(n.id)}>{title}</button><span class="muted"> › </span></span>;
+      })}
     </div>
   );
 }
@@ -57,7 +61,6 @@ function PluginComposer({ node, running }: { node: TreeNode; running: boolean })
   const [delivery, setDelivery] = useState<"steer" | "followUp">("steer");
   const composer = node.composer;
   const action = composer && actionSpec(node.source, composer.actionId);
-  useEffect(() => { setText(""); }, [node.id]);
   // 停止的语义是取消：清出的待发文本按原顺序放回输入框。
   const stop = async () => { const cleared = await abortPlugin(); if (cleared?.length) setText((value) => [...cleared, value].filter(Boolean).join("\n")); };
   const submit = async () => {
@@ -177,7 +180,7 @@ export function PluginSessionView() {
           ))}
           {model && !model.entries.length && !inFlight?.assistant && <div class="empty-chat">还没有消息。</div>}
         </div>
-        {canSend ? <PluginComposer node={node} running={running} /> : (
+        {canSend ? <PluginComposer key={node.id} node={node} running={running} /> : (
           <div class="readonly-bar" data-testid="plugin-readonly">
             <span>只读：{READONLY_TEXT[model?.view.readonlyReason ?? ""] ?? (node.availability === "archived" ? "会话已存档" : "没有向该会话发消息的权限")}</span>
             {node.capabilities.includes("abort") && running && <button class="btn danger small-btn" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stop()}>停止</button>}
