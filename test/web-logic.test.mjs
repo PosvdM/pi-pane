@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { fromSnapshot, apply, prependHistory } from "../packages/web/src/lib/session-model.ts";
 import { normalize, plainText, prependDrafts, displayQueued, parseSlash, isEmpty, imageIds } from "../packages/web/src/lib/draft.ts";
 import { canonicalize, JcsError } from "../packages/web/src/lib/jcs.ts";
-import { SourceTree, TreePins, MAX_OPEN_NODE_IDS, isHot, childrenAcross, hiddenChildren, unassigned } from "../packages/web/src/lib/tree-state.ts";
+import { SourceTree, TreePins, MAX_OPEN_NODE_IDS, isHot, childrenAcross, hiddenChildren, missingParents, unassigned } from "../packages/web/src/lib/tree-state.ts";
 import { addNotificationTo, clampSidebar, restoreText, sortBanners, splitActions, visibleBanners } from "../packages/web/src/lib/plugin-state.ts";
 import { SessionModel } from "../packages/server/dist/model.js";
 import { NUMBER_VECTORS, hexToDouble, SAMPLE_INPUT, SAMPLE_OUTPUT, SORT_INPUT, SORT_EXPECTED_OUTPUT } from "./fixtures/jcs-vectors.mjs";
@@ -286,6 +286,27 @@ test("快照的打开列表：最近打开的节点有上限；补取的父节�
   const big = new TreePins();
   for (let i = 0; i < 1500; i++) { big.open("o" + i); big.wantParent("p" + i); }
   assert.ok(big.request().length <= MAX_OPEN_NODE_IDS);
+});
+
+test("补取父节点：名额已满时，删除节点腾出的名额在同一次扫描里就能用上", () => {
+  const trees = forest([
+    ["pane", { nodes: [] }],
+    ["a", { nodes: [treeNode("a", "a:1", "pane:session:1"), treeNode("a", "a:2", "pane:session:2")] }],
+  ]);
+  const pinned = new Map([["pane", new TreePins(3, 2)]]);
+  const pinsOf = (source) => { let p = pinned.get(source); if (!p) { p = new TreePins(3, 2); pinned.set(source, p); } return p; };
+  assert.deepEqual([...missingParents(trees, pinned, pinsOf).get("pane")], ["pane:session:1", "pane:session:2"]);
+  // 名额已满：删除最后一个引用 pane:session:1 的节点，同时新节点要补取 pane:session:3。
+  const a = trees.get("a");
+  assert.equal(a.apply({ type: "remove", id: "a:1", revision: 6 }, () => true), "applied");
+  a.apply({ type: "upsert", node: treeNode("a", "a:3", "pane:session:3"), revision: 7 }, () => true);
+  const wanted = missingParents(trees, pinned, pinsOf);
+  assert.deepEqual([...(wanted.get("pane") ?? [])], ["pane:session:3"]);
+  assert.deepEqual([...pinned.get("pane").parents].sort(), ["pane:session:2", "pane:session:3"]);
+  // 已加载的父节点和还没有快照的来源不申请。
+  const fresh = forest([["a", { nodes: [treeNode("a", "a:x", "b:missing")] }]]);
+  fresh.set("b", new SourceTree("b"));
+  assert.equal(missingParents(fresh, new Map(), pinsOf).size, 0);
 });
 
 test("“未归属”：父节点所在来源已加载却没有它、来源不存在、指向未归属分组或形成循环", () => {

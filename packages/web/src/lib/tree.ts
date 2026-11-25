@@ -3,7 +3,7 @@
 import { api, ApiError } from "./api.ts";
 import { activeSources } from "./plugins.ts";
 import { Store } from "./store.ts";
-import { findIn, isHot, RECENT_MS, SourceTree, TreePins } from "./tree-state.ts";
+import { findIn, isHot, missingParents, RECENT_MS, SourceTree, TreePins } from "./tree-state.ts";
 import type { TreeChange, TreeChildrenPage, TreeNode, TreeSnapshot } from "./types.ts";
 import { toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
@@ -89,22 +89,12 @@ function onChange(source: string, change: TreeChange): void {
  * 来源仍给不出该节点时才归入“未归属”，之后不再为它重取（见 TreePins）。不再被引用的父节点从打开列表移除。
  */
 function pinMissingParents(): void {
-  const all = trees.get(); const reload = new Set<string>();
-  const referenced = new Map<string, Set<string>>();
-  for (const [source, t] of all) {
-    if (source === "pane") continue;
-    for (const node of t.nodes.values()) {
-      const parentId = node.parentId; if (!parentId) continue;
-      const parentSource = parentId.slice(0, parentId.indexOf(":"));
-      if (parentSource === source) continue;
-      let refs = referenced.get(parentSource); if (!refs) { refs = new Set(); referenced.set(parentSource, refs); } refs.add(parentId);
-      if (!all.get(parentSource)?.epoch || findIn(all, parentId) || !pins(parentSource).wantParent(parentId)) continue;
-      reload.add(parentSource);
-      let set = awaiting.get(parentSource); if (!set) { set = new Set(); awaiting.set(parentSource, set); } set.add(parentId);
-    }
+  const wanted = missingParents(trees.get(), pinned, pins);
+  for (const [source, parents] of wanted) {
+    let set = awaiting.get(source); if (!set) { set = new Set(); awaiting.set(source, set); }
+    for (const id of parents) set.add(id);
+    scheduleLoad(source, 100);
   }
-  for (const [source, value] of pinned) value.prune(referenced.get(source) ?? new Set());
-  for (const source of reload) scheduleLoad(source, 100);
 }
 
 /** 父节点所在来源已为它重取快照、结果还没到。 */

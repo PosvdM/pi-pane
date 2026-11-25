@@ -136,6 +136,33 @@ export class TreePins {
   retryMissing(): void { this.notFound.clear(); }
 }
 
+/**
+ * 插件节点挂在其他来源未加载的节点下时，要补取的父节点（按来源）。先按当前的树移除不再被引用的父节点，
+ * 再申请补取：删除节点腾出的名额在同一次扫描里就能用上。已加载的、来源还没有快照的、已确认给不出的或超出名额的不申请。
+ */
+export function missingParents(trees: ReadonlyMap<string, SourceTree>, pinned: ReadonlyMap<string, TreePins>, pinsOf: (source: string) => TreePins): Map<string, Set<string>> {
+  const referenced = new Map<string, Set<string>>();
+  for (const [source, t] of trees) {
+    if (source === "pane") continue;
+    for (const node of t.nodes.values()) {
+      const parentId = node.parentId; if (!parentId) continue;
+      const parentSource = sourceOf(parentId);
+      if (parentSource === source) continue;
+      let refs = referenced.get(parentSource); if (!refs) { refs = new Set(); referenced.set(parentSource, refs); } refs.add(parentId);
+    }
+  }
+  for (const [source, value] of pinned) value.prune(referenced.get(source) ?? new Set());
+  const wanted = new Map<string, Set<string>>();
+  for (const [parentSource, refs] of referenced) {
+    if (!trees.get(parentSource)?.epoch) continue;
+    for (const parentId of refs) {
+      if (findIn(trees, parentId) || !pinsOf(parentSource).wantParent(parentId)) continue;
+      let set = wanted.get(parentSource); if (!set) { set = new Set(); wanted.set(parentSource, set); } set.add(parentId);
+    }
+  }
+  return wanted;
+}
+
 /** 同一父节点下按 sortKey 升序，相同时按 id，跨来源也用同一规则（plugin-api.md“渲染”）。 */
 export function bySortKey(a: TreeNode, b: TreeNode): number {
   return a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
