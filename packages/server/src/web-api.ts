@@ -180,8 +180,9 @@ export type PaneServerMessage =
   | { type: "banner"; banner: BannerState }
   | { type: "bannerCleared"; source: string; id: string }
   | { type: "tree"; source: string; change: TreeChange }
-  | { type: "panel"; update: PanelUpdate }
+  | { type: "panel"; source: string; update: PanelUpdate }
   | { type: "form"; form: FormSpec }
+  | { type: "formsAligned" }
   | { type: "formRemoved"; source: string; formId: string; reason: FormRemovedReason }
   | { type: "presence"; request: PanePresenceRequest }
   | { type: "presenceClosed"; id: string; reason: "confirmed" | "cancelled" | "timeout" }

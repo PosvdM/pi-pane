@@ -85,7 +85,7 @@ export class PluginHost {
         assert(resource.notifications.size < 10000, "notificationLimit", "插件通知去重记录达到上限", 429);
         resource.notifications.add(notification.id); this.options.emit({ type: "notification", notification: structuredClone(notification) });
       },
-      panelChanged: (update) => { guard(); this.options.emit({ type: "panel", update: structuredClone(update) }); },
+      panelChanged: (update) => { guard(); this.options.emit({ type: "panel", source, update: structuredClone(update) }); },
       formAdded: (form) => { guard(); this.operations.formAdded(source, form); },
       formRemoved: (id, reason) => { guard(); this.operations.formRemoved(source, id, reason); },
       setBanner: (banner) => { guard(); this.banners.set(source, banner); },
