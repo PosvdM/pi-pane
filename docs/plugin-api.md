@@ -290,7 +290,7 @@ export interface TreeNode {
 
 - 每个主会话一个节点：`id = "pane:session:<piSessionId>"`、`source = "pane"`、`kind = "session"`。覆盖范围是 pi 会话存储中能列出的全部会话（见 [architecture.md](architecture.md#会话列表)），不只是正在托管的会话，所以插件可以把节点挂到任何一个主会话下。
 - 按项目（工作目录）分组：`id = "pane:project:<cwd 规范化后的哈希>"`、`kind = "group"`。
-- “未归属”分组：`id = "pane:group:unassigned"`。父节点是 pi-pane 列不出的主会话（例如终端里用 `--session-dir` 指定了别处的会话）时，插件节点进入这个分组。
+- “未归属”分组：`id = "pane:group:unassigned"`。父节点是 pi-pane 列不出的主会话（例如终端里用 `--session-dir` 指定了别处的会话）时，插件节点进入这个分组。插件也可以把节点直接挂在这个分组下（`parentId` 为它），这类冷节点的数目同样在 `foreignChildCounts` 中以该 id 报告，pi-pane 按普通父节点显示“历史（N）”，展开时对它调用 `tree.children()`（见“按需加载”）。
 
 ### 按需加载
 
@@ -480,6 +480,7 @@ export interface PaneStatusEvent {
 ### 显示规则
 
 - 打开时调 `sessions.snapshot(ref)`，再以快照的 `cursor` 调 `sessions.subscribe`（节点带 `subscribe` 能力时）。
+- 节点撤销 `subscribe` 时，pi-pane 不取消已建立的订阅，只是不再为该节点新建订阅；订阅保持到用户离开该会话视图，期间的 `resync` 照常按新快照的游标续订。协议没有结束事件流的消息，插件不再推送事件即为流结束，所以会话结束时最后几条事件可以晚于撤销 `subscribe` 的树更新送出。插件停用时 pi-pane 服务端释放该插件的全部订阅，浏览器收到插件列表变化后重读插件目录和树。
 - `readonly: true` 或节点没有 `send` 能力时不显示输入框；`readonlyReason = externalWriter` 时显示“该会话可能正在别处运行”。pi-pane 自己的主会话另有“Fork 为新会话”按钮；插件会话没有会话文件，协议也没有 fork 方法，所以不显示该按钮，插件需要时可以声明一个节点动作。
 - `unfinishedPartials` 显示在对话末尾，标注“中断时正在生成的内容”，按块类型分别显示思考、文字和工具调用。
 - 节点的 `action:*` 能力显示为视图顶部的按钮。
