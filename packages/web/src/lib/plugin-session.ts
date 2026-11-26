@@ -7,7 +7,7 @@ import { Store } from "./store.ts";
 import { pinNode } from "./tree.ts";
 import { confirmInApp, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
-import type { AbortResult, PaneSessionView, SendResult, SessionRef, SessionSnapshot, TreeNode, UnfinishedPartial } from "./types.ts";
+import type { AbortResult, PaneSessionView, SendResult, SessionRef, SessionSnapshot, SessionStreamEvent, TreeNode, UnfinishedPartial } from "./types.ts";
 
 export interface PluginView {
   nodeId: string;
@@ -38,6 +38,13 @@ interface Opened {
   again?: boolean;         // 取快照期间又有重取请求
   retries: number;
   retryTimer?: ReturnType<typeof setTimeout>;
+  /** 取快照请求在途：期间订阅送来的事件存入 held，快照到达后按新游标应用，取快照失败时应用到当前内容。 */
+  fetching: boolean;
+  held: SessionStreamEvent[];
+  /** 已发出的取快照请求数，作为请求的序号。 */
+  fetches: number;
+  /** 等待“序号大于 after 的快照”的调用方：该快照应用后得到 true，取快照失败或离开节点时得到 false。 */
+  waiters: { after: number; done: (fresh: boolean) => void }[];
 }
 let opened: Opened | null = null;
 const isCurrent = (o: Opened) => opened === o;
@@ -51,8 +58,27 @@ function toView(snapshot: SessionSnapshot): PaneSessionView {
 
 export function closePluginView(): void {
   const o = opened; opened = null;
-  if (o) { o.unsubscribe?.(); clearTimeout(o.retryTimer); }
+  if (o) { o.unsubscribe?.(); clearTimeout(o.retryTimer); o.held = []; settleWaiters(o, Infinity, false); }
   pluginView.set(null);
+}
+
+/** 结算等待序号不大于 id 的快照之后的调用方（after < id）。 */
+function settleWaiters(o: Opened, id: number, fresh: boolean): void {
+  if (!o.waiters.length) return;
+  const done = o.waiters.filter((w) => w.after < id);
+  o.waiters = o.waiters.filter((w) => w.after >= id);
+  for (const w of done) w.done(fresh);
+}
+
+/**
+ * 重取快照，等到一份在调用之后才发出的快照应用到视图：返回 true；这次取快照失败、节点不再取快照或用户离开节点时返回 false。
+ * 发送冲突后用它确认已读到最新的 controlRevision。
+ */
+function freshSnapshot(o: Opened): Promise<boolean> {
+  if (!isCurrent(o) || !o.open) return Promise.resolve(false);
+  const waiting = new Promise<boolean>((done) => { o.waiters.push({ after: o.fetches, done }); });
+  void reload(o);
+  return waiting;
 }
 
 export async function openPluginNode(node: TreeNode): Promise<void> {
@@ -60,7 +86,7 @@ export async function openPluginNode(node: TreeNode): Promise<void> {
   pinNode(node.source, node.id);
   const session = node.kind === "session" && !!node.sessionRef;
   const canOpen = session && node.capabilities.includes("open");
-  const o: Opened = { ...(session ? { ref: node.sessionRef } : {}), open: canOpen, live: canOpen && node.capabilities.includes("subscribe"), send: node.capabilities.includes("send"), unsubscribe: null, reloading: null, retries: 0 };
+  const o: Opened = { ...(session ? { ref: node.sessionRef } : {}), open: canOpen, live: canOpen && node.capabilities.includes("subscribe"), send: node.capabilities.includes("send"), unsubscribe: null, reloading: null, retries: 0, fetching: false, held: [], fetches: 0, waiters: [] };
   opened = o;
   pluginView.set({ nodeId: node.id, source: node.source, ...(canOpen ? { ref: node.sessionRef } : {}), model: null, partials: [], loading: canOpen, ...(session && !canOpen ? { closed: true } : {}) });
   if (canOpen) await refresh(o);
@@ -83,8 +109,8 @@ export function syncCapabilities(node: TreeNode): void {
   const send = node.capabilities.includes("send");
   const sendChanged = send !== o.send; o.send = send;
   if (open !== o.open) {
-    o.open = open; o.live = live; o.unsubscribe?.(); o.unsubscribe = null; clearTimeout(o.retryTimer); o.retries = 0;
-    if (!open) { pluginView.set((v) => v && { nodeId: v.nodeId, source: v.source, model: null, partials: [], loading: false, closed: true }); return; }
+    o.open = open; o.live = live; o.unsubscribe?.(); o.unsubscribe = null; clearTimeout(o.retryTimer); o.retries = 0; o.held = [];
+    if (!open) { settleWaiters(o, Infinity, false); pluginView.set((v) => v && { nodeId: v.nodeId, source: v.source, model: null, partials: [], loading: false, closed: true }); return; }
     const ref = o.ref;
     pluginView.set((v) => v && { nodeId: v.nodeId, source: v.source, ref, model: null, partials: [], loading: true });
     void refresh(o);
@@ -126,16 +152,33 @@ function refresh(o: Opened): Promise<void> {
     do {
       o.again = false;
       let snapshot: SessionSnapshot;
+      const id = ++o.fetches;
+      o.fetching = true;
       try { snapshot = await api<SessionSnapshot>(sessionPath(ref, "snapshot")); }
-      catch (error) { o.again = false; if (isCurrent(o) && o.open) retry(o, error); return; }
-      if (!isCurrent(o) || !o.open) return;
+      catch (error) {
+        o.fetching = false;
+        // 取快照失败：期间收到的事件仍接在当前内容的游标之后，直接应用；接不上的由重试的快照补齐。
+        const model = isCurrent(o) && o.open ? pluginView.get()?.model : undefined;
+        if (model && applyHeld(o, model)) pluginView.touch();
+        o.held = [];
+        o.again = false; settleWaiters(o, id, false);
+        if (isCurrent(o) && o.open) retry(o, error);
+        return;
+      }
+      o.fetching = false;
+      if (!isCurrent(o) || !o.open) { o.held = []; settleWaiters(o, id, false); return; }
       pluginView.set((v) => {
         if (!v) return v;
         const model = fromSnapshot(toView(snapshot));
         if (v.model) keepLoadedHistory(model, v.model);
+        // 快照在途时收到的事件按新游标应用：快照已包含的按重复忽略，之后的接上。接不上的（含 resync）不处理，
+        // 下面按新游标续订时插件从游标重放，需要时推 resync。
+        applyHeld(o, model);
         return { ...v, model, partials: snapshot.unfinishedPartials ?? [], loading: false, error: undefined };
       });
+      o.held = [];
       o.retries = 0;
+      settleWaiters(o, id, true);
     } while (o.again);
     // 已建立的订阅（含撤销 subscribe 之后保留的）按新游标续订；没有订阅时只在节点有 subscribe 能力时新建。
     if (o.unsubscribe) ws.resubscribe(ref);
@@ -149,13 +192,29 @@ function refresh(o: Opened): Promise<void> {
   return run;
 }
 
-function onEvent(o: Opened, record: Parameters<typeof apply>[1]): void {
+/**
+ * 取快照在途时收到的事件先存下，不丢弃：撤销 subscribe 后插件不再新建订阅，最终状态和最后几条输出可能只经这条订阅送来一次
+ * （plugin-api.md“显示规则”）。快照到达后按新游标应用，取快照失败时应用到当前内容（见 refresh）。
+ */
+function onEvent(o: Opened, record: SessionStreamEvent): void {
+  if (!isCurrent(o)) return;
+  if (o.fetching) { o.held.push(record); return; }
   const view = pluginView.get();
-  // 重取快照期间到达的事件不应用：快照之后会按新游标续订，服务端从游标重放。
-  if (!isCurrent(o) || !view?.model || o.reloading) return;
+  if (!view?.model) return;
   const result = apply(view.model, record);
   if (result === "resync") { void reload(o); return; }
   if (result === "applied") pluginView.touch();
+}
+
+/** 按顺序把存下的事件应用到 model，遇到接不上的（resync）停止；返回是否应用了事件。 */
+function applyHeld(o: Opened, model: ModelState): boolean {
+  let applied = false;
+  for (const record of o.held) {
+    const result = apply(model, record);
+    if (result === "resync") break;
+    if (result === "applied") applied = true;
+  }
+  return applied;
 }
 
 /** 游标断开、epoch 变化或收到 resync：重取快照，再以新游标续订。 */
@@ -183,12 +242,15 @@ export async function loadOlder(): Promise<void> {
  * 其余结果（rejected、conflict、idempotencyConflict、请求被拒、pending 含服务端等待超时、断网、浏览器超时）都在首次响应时把原文放回，
  * pending 和结果未知留下查询入口。查询请求本身失败（断网、超时、403 等）只说明这次查询没有成功。
  * text 为提交时移出输入框、已登记为在途提交的原文。
+ * 首次响应是 conflict 时，原文立即放回，返回的 Promise 等重取的快照应用后才完成（调用方据此保持发送不可用），
+ * 重发才会带上最新的 controlRevision（plugin-api.md“向会话发消息与停止”）；重取失败时提示后完成，用户可以重发。
  */
-export function sendToPlugin(value: string, delivery: "steer" | "followUp" | undefined, text: OpText): Promise<OpState> {
+export async function sendToPlugin(value: string, delivery: "steer" | "followUp" | undefined, text: OpText): Promise<OpState> {
   const o = opened; const view = pluginView.get();
   const ref = o?.ref && view?.ref ? view.ref : undefined;
   const expectedRevision = view?.model?.view.controlRevision;
   const body = { input: { text: value, ...(delivery ? { delivery } : {}) }, idempotencyKey: newId(), ...(expectedRevision === undefined ? {} : { expectedRevision }) };
+  let fresh: Promise<boolean> | undefined;
   const attempt = async (query: boolean): Promise<OpStep> => {
     if (!o || !ref) return { state: "notRun" };
     let result: SendResult;
@@ -198,13 +260,16 @@ export function sendToPlugin(value: string, delivery: "steer" | "followUp" | und
       case "accepted": return { state: "done" };
       case "pending": return { state: "pending", ...((result as { message?: string }).message ? { message: (result as { message?: string }).message } : {}) };
       case "conflict":
-        // 先结算（原文立即放回），再重取快照，用户按最新状态决定是否重发；不等快照返回。
-        void reload(o);
+        // 先结算（原文立即放回），同时重取快照；首次请求的调用方等快照到达后才能重发。
+        if (!query) fresh = freshSnapshot(o);
+        else void reload(o);
         return { state: "notRun", ...(isCurrent(o) ? { message: result.message ?? "会话状态已变化，请确认后重新发送" } : {}) };
       default: return { state: "notRun", message: result.message };
     }
   };
-  return newOperation({ key: body.idempotencyKey, source: ref?.source ?? view?.source ?? "", attempt, pendingText: "消息已提交，插件仍在处理", unknownText: "消息的发送结果未知", text }).run();
+  const state = await newOperation({ key: body.idempotencyKey, source: ref?.source ?? view?.source ?? "", attempt, pendingText: "消息已提交，插件仍在处理", unknownText: "消息的发送结果未知", text }).run();
+  if (fresh && !(await fresh) && o && isCurrent(o) && o.open) toast("没有读取到会话的最新状态，可以重新发送", "error");
+  return state;
 }
 
 /** 停止：清空队列后中止，清出的文本交给调用方放回输入框。冲突时重新读取状态并请用户确认，确认前已切换到其他节点则放弃。 */

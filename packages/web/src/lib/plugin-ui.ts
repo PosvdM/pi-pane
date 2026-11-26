@@ -241,7 +241,13 @@ export function requestFailed(error: unknown, query: boolean): OpStep {
 }
 const pluginPath = (source: string, rest: string) => `/api/plugins/${encodeURIComponent(source)}/${rest}`;
 
-/** 提交持久表单。返回 true 表示弹窗可以关闭。 */
+/** 查询持久表单时这次查询本身没有成功（断网、超时、请求被拒）：已提交的结果仍未确定，进行中状态和弹窗都保持不变。 */
+export class FormQueryFailed extends Error {}
+
+/**
+ * 提交持久表单，retry 给出时为用同一个幂等键查询。返回 true 表示弹窗可以关闭。
+ * 查询时请求本身失败抛出 FormQueryFailed，不改动进行中状态（architecture.md“浏览器中的插件界面”）。
+ */
 export async function submitForm(form: FormSpec, outcome: FormOutcome, retry?: FormBusy): Promise<boolean> {
   const key = formKey(form.source, form.id);
   const idempotencyKey = retry?.idempotencyKey ?? newId(); const revision = retry?.revision ?? form.revision;
@@ -252,9 +258,10 @@ export async function submitForm(form: FormSpec, outcome: FormOutcome, retry?: F
   if (!retry) busy("submitting");
   try { result = await api<FormSubmitResult>(pluginPath(form.source, `forms/${encodeURIComponent(form.id)}`), body, pluginRequestSignal()); }
   catch (error) {
+    // 查询时请求失败（断网、浏览器超时、WebSocket 重连期间的 403 invalidOrigin 等）：失败的是这次查询，已提交的结果仍未确定，
+    // 保留原来的进行中状态（pending 不改成结果未知）。
+    if (retry) throw new FormQueryFailed(`这次查询没有成功（${(error as Error).message}），结果仍未确定，可以稍后再查`);
     if (unknownResult(error)) { busy("unknown", "结果未知"); return true; }
-    // 查询时请求被拒（如 WebSocket 重连期间的 403 invalidOrigin）：失败的是这次查询，已提交的结果仍未确定，保留进行中状态。
-    if (retry) throw new Error(`这次查询没有成功（${(error as Error).message}），结果仍未确定，可以稍后再查`);
     clear(); throw error;
   }
   switch (result.status) {
@@ -266,7 +273,10 @@ export async function submitForm(form: FormSpec, outcome: FormOutcome, retry?: F
   }
 }
 
-/** 用同一个幂等键查询一次已提交表单的当前状态；同一表单的查询进行中时共用它。 */
+/**
+ * 用同一个幂等键查询一次已提交表单的当前状态；同一表单的查询进行中时共用它。返回 true 表示弹窗可以关闭；
+ * 这次查询没有成功时只提示，返回 false，弹窗留着以便再查。
+ */
 const formQueries = new Map<string, Promise<boolean>>();
 export function queryForm(form: FormSpec): Promise<boolean> | undefined {
   const key = formKey(form.source, form.id);
@@ -274,7 +284,7 @@ export function queryForm(form: FormSpec): Promise<boolean> | undefined {
   if (running) return running;
   const busy = formBusy.get()[key];
   if (!busy) return undefined;
-  const query = submitForm(form, busy.outcome, busy).catch((error) => { toast((error as Error).message, "error"); return true; })
+  const query = submitForm(form, busy.outcome, busy).catch((error) => { toast((error as Error).message, "error"); return !(error instanceof FormQueryFailed); })
     .finally(() => { formQueries.delete(key); });
   formQueries.set(key, query);
   return query;
