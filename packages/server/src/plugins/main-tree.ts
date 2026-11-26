@@ -3,8 +3,15 @@ import path from "node:path";
 import type { MainSessionInfo, TreeChange, TreeChildrenPage, TreeCursor, TreeNode, TreeSnapshot, TreeSnapshotRequest } from "@pi-pane/plugin-api";
 import { assert } from "../errors.js";
 import { fileKey } from "../store.js";
+import type { PaneSessionNodeInfo } from "../web-api.js";
 
-export interface MainTreeRow { info: MainSessionInfo; lastActivityAt?: string; messageCount?: number; holds?: { source: string; reason: string }[] }
+export interface MainTreeRow { info: MainSessionInfo; session?: PaneSessionNodeInfo; lastActivityAt?: string; messageCount?: number; holds?: { source: string; reason: string }[] }
+
+/** 会话节点按修改时间从新到旧排列：sortKey 为时间的反序编码加会话 id，keyset 分页也按此顺序。 */
+function sessionSortKey(row: MainTreeRow): string {
+  const time = Date.parse(row.session?.modifiedAt ?? "");
+  return Number.isFinite(time) ? `${String(Number.MAX_SAFE_INTEGER - time).padStart(16, "0")}:${row.info.ref.id}` : `~${row.info.ref.id}`;
+}
 export interface MainTreeOptions { load(): Promise<MainTreeRow[]>; current(): MainTreeRow[]; watch(listener: () => void): () => void }
 
 /** 来源级游标覆盖完整主会话目录；快照只选择热节点及其祖先。 */
@@ -54,7 +61,8 @@ export class MainTree {
       next.set(info.nodeId, {
         id: info.nodeId, source: "pane", kind: "session", parentId, title: info.title, sessionRef: info.ref,
         status: info.status, availability: info.hosted ? "online" : "archived", hasChildren: false,
-        sortKey: info.ref.id, revision: 0, capabilities: ["open", "subscribe", "send", ...(info.hosted ? ["abort"] : [])],
+        sortKey: sessionSortKey(row), revision: 0, capabilities: ["open", "subscribe", "send", ...(info.hosted ? ["abort"] : [])],
+        ...(row.session ? { paneSession: row.session } : {}),
         ...(row.lastActivityAt === undefined ? {} : { lastActivityAt: row.lastActivityAt }),
         ...(row.messageCount === undefined ? {} : { messageCount: row.messageCount }),
         ...(row.holds?.length ? { statusDetail: row.holds.map((hold) => hold.reason).join("；") } : {}),

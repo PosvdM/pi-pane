@@ -13,6 +13,7 @@ type Connection = {
 };
 type Pending = {
   source: string;
+  request: { id: string; title: string; summary: string; payload: unknown; source: string; expiresAt: string };  // 发给浏览器的确认帧
   recipients: Set<Connection>;
   dispatching: boolean;
   timer: ReturnType<typeof setTimeout>;
@@ -150,7 +151,16 @@ export class PresenceBroker {
       || typeof proof.deviceId !== "string" || proof.deviceId !== device.deviceId
       || typeof proof.publicKey !== "string" || proof.publicKey !== device.publicKey
       || proof.alg !== "ECDSA-P256-SHA256" || proof.alg !== device.alg
-      || typeof proof.signature !== "string" || !proof.signature.length) return;
+      || typeof proof.signature !== "string" || !proof.signature.length) {
+      // 签名设备与本连接登记的设备不符（或回应格式无效）：确认仍在进行，告知该浏览器这次确认没有生效，
+      // 并重新发给它，让用户再确认一次，不让它在没有确认框的情况下等到超时。
+      try {
+        connection.send({ type: "notification", notification: { id: `presence-invalid-${id}`, source: pending.source, level: "error",
+          title: "确认未生效", body: "签名设备与本浏览器连接登记的设备不一致，请再确认一次。" } });
+        connection.send({ type: "presence", request: { ...pending.request, payload: snapshot(pending.request.payload) } });
+      } catch { /* 通知失败不影响其他连接。 */ }
+      return;
+    }
     // 签名保持不透明，由插件后台核验签名、挑战内容和设备信任关系。
     this.finish(id, { proof: {
       deviceId: proof.deviceId, publicKey: proof.publicKey, alg: proof.alg, signature: proof.signature,
@@ -189,11 +199,12 @@ export class PresenceBroker {
     if (this.closed || !targets.length) return Promise.reject(failure("noDevice"));
     const { title, summary } = req;
     const id = randomUUID();
+    const expiresAt = new Date(Date.now() + Math.min(timeoutMs, 600_000)).toISOString();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.finish(id, { error: "timeout" }), Math.min(timeoutMs, 600_000));
       timer.unref();
       const recipients = new Set<Connection>();
-      const pending: Pending = { source, recipients, dispatching: true, timer, resolve, reject };
+      const pending: Pending = { source, request: { id, title, summary, payload, source, expiresAt }, recipients, dispatching: true, timer, resolve, reject };
       this.pending.set(id, pending);
       // 各连接使用独立快照，发送回调不能改动其他浏览器收到的挑战。
       for (const connection of targets) {
@@ -202,7 +213,7 @@ export class PresenceBroker {
         recipients.add(connection);
         try {
           connection.send({ type: "presence", request: {
-            id, title, summary, payload: snapshot(payload), source,
+            id, title, summary, payload: snapshot(payload), source, expiresAt,
           } });
         } catch {
           recipients.delete(connection);

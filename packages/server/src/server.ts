@@ -258,6 +258,8 @@ export class PaneServer {
           void this.plugins.alignForms().then(() => {
             if (this.stopping || client.state !== "authed") return;
             for (const form of this.plugins.operations.pending()) this.push(client, { type: "form", form });
+            // 浏览器据此结束对齐：不在这批 form 里的表单已在别处处理，关闭仍打开的旧表单弹窗。
+            this.push(client, { type: "formsAligned" });
           });
           return;
         }

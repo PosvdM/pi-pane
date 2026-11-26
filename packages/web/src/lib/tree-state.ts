@@ -1,0 +1,281 @@
+// 单个来源的会话树状态，按 plugin-api.md“同步”的规则合并快照、订阅变更和分页。不做网络请求，供 tree.ts 使用并可直接单测。
+import type { TreeChange, TreeNode, TreeSnapshot } from "./types.ts";
+
+export const RECENT_MS = 7 * 24 * 3600 * 1000;
+const HOT = new Set(["running", "waiting", "paused"]);
+
+/** 热节点：运行、等待或暂停中，最近活动晚于 recentSince，或在 pinned 中（浏览器打开着）。 */
+export function isHot(node: TreeNode, recentSince: number, pinned: ReadonlySet<string>): boolean {
+  if (pinned.has(node.id) || HOT.has(node.status)) return true;
+  const active = node.lastActivityAt ? Date.parse(node.lastActivityAt) : NaN;
+  return Number.isFinite(active) && active > recentSince;
+}
+
+export type ChangeResult = "applied" | "ignored" | "reset" | "needsAncestors";
+
+export class SourceTree {
+  epoch: string | null = null;
+  /** 已知的最新来源级修订号（快照、订阅或已合并的分页）。 */
+  revision = 0;
+  nodes = new Map<string, TreeNode>();
+  /** 被删除的节点及删除时的修订号，保留到下一次 reset，阻止更旧的 upsert 复活节点。 */
+  tombstones = new Map<string, number>();
+  /** 插件报告的、挂在其他来源节点下的子节点总数。 */
+  foreign: Record<string, number> = {};
+  /** 已分页加载过的父节点；done 表示全部子节点都已加载，之后新出现的子节点直接显示。 */
+  listed = new Map<string, { cursor?: string; done: boolean }>();
+  /**
+   * 来自快照或分页的节点 id。foreignChildCounts 只在快照时更新，计算其他来源父节点下的“历史（N）”时
+   * 只扣除这些节点；订阅推来的新节点不在快照的数目里，不能拿来抵扣。
+   */
+  baseline = new Set<string>();
+  /** 每次 load 或 clear 加一；分页请求据此丢弃发出后树已被重建的结果。 */
+  generation = 0;
+  /** 收到 reset、新快照还没到：期间的分页结果作废，避免把快照已排除的节点插回。 */
+  stale = false;
+  version = 0;
+  readonly source: string;
+  constructor(source: string) { this.source = source; }
+
+  load(snapshot: TreeSnapshot): void {
+    this.epoch = snapshot.epoch; this.revision = snapshot.revision;
+    this.nodes = new Map(snapshot.nodes.map((node) => [node.id, node]));
+    this.baseline = new Set(this.nodes.keys());
+    this.tombstones.clear(); this.listed.clear();
+    this.foreign = { ...(snapshot.foreignChildCounts ?? {}) };
+    this.generation++; this.stale = false; this.version++;
+  }
+
+  clear(): void {
+    this.epoch = null; this.revision = 0; this.nodes.clear(); this.tombstones.clear(); this.listed.clear(); this.baseline.clear(); this.foreign = {};
+    this.generation++; this.stale = false; this.version++;
+  }
+
+  private known(id: string): number {
+    return this.nodes.get(id)?.revision ?? this.tombstones.get(id) ?? -1;
+  }
+
+  /** 应用订阅推来的一条变更。冷节点的父节点尚未完整加载时不显示，等展开“历史”时再取。 */
+  apply(change: TreeChange, hot: (node: TreeNode) => boolean): ChangeResult {
+    if (change.type === "reset") { this.stale = true; return "reset"; }
+    if (change.revision > this.revision) this.revision = change.revision;
+    if (change.type === "remove") {
+      if (change.revision <= this.known(change.id)) return "ignored";
+      this.nodes.delete(change.id); this.tombstones.set(change.id, change.revision); this.version++;
+      return "applied";
+    }
+    const node = change.node;
+    if (change.revision <= this.known(node.id)) return "ignored";
+    const parentKnown = node.parentId === null || !node.parentId.startsWith(this.source + ":") || this.nodes.has(node.parentId);
+    if (!this.nodes.has(node.id)) {
+      const listed = node.parentId !== null && this.listed.get(node.parentId)?.done === true;
+      if (!listed && !hot(node)) return "ignored";
+      if (!parentKnown) return "needsAncestors";
+    }
+    this.nodes.set(node.id, { ...node, revision: change.revision });
+    this.tombstones.delete(node.id); this.version++;
+    return "applied";
+  }
+
+  /** 合并 children() 的一页；页里比本地已知修订号旧的节点不覆盖订阅推来的新内容。 */
+  mergePage(parentId: string, nodes: TreeNode[], pageRevision: number, nextCursor?: string): void {
+    for (const node of nodes) {
+      if (node.revision > this.known(node.id)) { this.nodes.set(node.id, node); this.tombstones.delete(node.id); }
+      if (this.nodes.has(node.id)) this.baseline.add(node.id);
+    }
+    if (pageRevision > this.revision) this.revision = pageRevision;
+    this.listed.set(parentId, { ...(nextCursor ? { cursor: nextCursor } : {}), done: !nextCursor });
+    this.version++;
+  }
+
+  children(parentId: string | null): TreeNode[] {
+    const list: TreeNode[] = [];
+    for (const node of this.nodes.values()) if (node.parentId === parentId) list.push(node);
+    return list.sort(bySortKey);
+  }
+}
+
+/** 快照请求的 openNodeIds 上限，与服务端一致。 */
+export const MAX_OPEN_NODE_IDS = 1000;
+
+/**
+ * 一个来源快照请求里的 openNodeIds（plugin-api.md“按需加载”）。分两部分，合计不超过 MAX_OPEN_NODE_IDS：
+ * - opened：浏览器打开过的节点，按最近使用保留最多 openLimit 个；
+ * - parents：其他来源的节点挂在本来源未加载的节点下时，为补取该父节点加入的 id。没有节点再引用时移除；
+ *   请求过一次、快照仍没有给出的移入 notFound，不再请求（这些子节点归入“未归属”），直到来源 reset 或用户刷新。
+ *   数量达到上限后不再补取新的父节点。
+ */
+export class TreePins {
+  readonly opened = new Set<string>();
+  readonly parents = new Set<string>();
+  readonly notFound = new Set<string>();
+  readonly openLimit: number;
+  readonly parentLimit: number;
+  constructor(openLimit = 200, parentLimit = MAX_OPEN_NODE_IDS - openLimit) { this.openLimit = openLimit; this.parentLimit = parentLimit; }
+  open(id: string): void {
+    this.opened.delete(id); this.opened.add(id);
+    while (this.opened.size > this.openLimit) this.opened.delete(this.opened.values().next().value!);
+  }
+  /** 快照请求的 openNodeIds。 */
+  request(): string[] { return [...new Set([...this.opened, ...this.parents])]; }
+  /** 请求补取父节点；已在请求中、已确认不存在或已达上限时返回 false。 */
+  wantParent(id: string): boolean {
+    if (this.parents.has(id) || this.notFound.has(id) || this.parents.size >= this.parentLimit) return false;
+    this.parents.add(id); return true;
+  }
+  /** 快照到达：请求过的父节点不在快照里，说明来源给不出，移入 notFound。 */
+  loaded(requested: readonly string[], present: (id: string) => boolean): void {
+    for (const id of requested) if (this.parents.has(id) && !present(id)) { this.parents.delete(id); this.notFound.add(id); }
+  }
+  /** 移除不再被任何节点引用的父节点。 */
+  prune(referenced: ReadonlySet<string>): void {
+    for (const id of [...this.parents]) if (!referenced.has(id)) this.parents.delete(id);
+    for (const id of [...this.notFound]) if (!referenced.has(id)) this.notFound.delete(id);
+  }
+  /** 来源 reset 或用户刷新：之前给不出的父节点可以再请求一次。 */
+  retryMissing(): void { this.notFound.clear(); }
+}
+
+/**
+ * 插件节点挂在其他来源未加载的节点下时，要补取的父节点（按来源）。先按当前的树移除不再被引用的父节点，
+ * 再申请补取：删除节点腾出的名额在同一次扫描里就能用上。已加载的、来源还没有快照的、已确认给不出的或超出名额的不申请。
+ */
+export function missingParents(trees: ReadonlyMap<string, SourceTree>, pinned: ReadonlyMap<string, TreePins>, pinsOf: (source: string) => TreePins): Map<string, Set<string>> {
+  const referenced = new Map<string, Set<string>>();
+  for (const [source, t] of trees) {
+    if (source === "pane") continue;
+    for (const node of t.nodes.values()) {
+      const parentId = node.parentId; if (!parentId) continue;
+      const parentSource = sourceOf(parentId);
+      if (parentSource === source) continue;
+      let refs = referenced.get(parentSource); if (!refs) { refs = new Set(); referenced.set(parentSource, refs); } refs.add(parentId);
+    }
+  }
+  for (const [source, value] of pinned) value.prune(referenced.get(source) ?? new Set());
+  const wanted = new Map<string, Set<string>>();
+  for (const [parentSource, refs] of referenced) {
+    if (!trees.get(parentSource)?.epoch) continue;
+    for (const parentId of refs) {
+      if (findIn(trees, parentId) || !pinsOf(parentSource).wantParent(parentId)) continue;
+      let set = wanted.get(parentSource); if (!set) { set = new Set(); wanted.set(parentSource, set); } set.add(parentId);
+    }
+  }
+  return wanted;
+}
+
+/** 同一父节点下按 sortKey 升序，相同时按 id，跨来源也用同一规则（plugin-api.md“渲染”）。 */
+export function bySortKey(a: TreeNode, b: TreeNode): number {
+  return a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+const sourceOf = (id: string) => id.slice(0, Math.max(0, id.indexOf(":")));
+
+export function findIn(trees: ReadonlyMap<string, SourceTree>, id: string): TreeNode | undefined {
+  const own = trees.get(sourceOf(id))?.nodes.get(id);
+  if (own) return own;
+  for (const t of trees.values()) { const node = t.nodes.get(id); if (node) return node; }
+  return undefined;
+}
+
+/** 某个节点在各来源下的子节点：父节点可以属于其他来源（如插件节点挂在主会话、项目分组或另一个插件的节点下），全部同级节点统一按 sortKey 排序。 */
+export function childrenAcross(trees: ReadonlyMap<string, SourceTree>, parentId: string): TreeNode[] {
+  const list: TreeNode[] = [];
+  for (const t of trees.values()) list.push(...t.children(parentId));
+  return list.sort(bySortKey);
+}
+
+export interface HiddenChildren {
+  /** 已知数目的未加载子节点数。 */
+  count: number;
+  /**
+   * 有未加载的子节点但数目不可用：hasChildren 为 true、没有 childCount，或已开始分页、还有下一页而数目差值不大于 0。
+   * 只显示“历史”，不带数字。
+   */
+  unknown: boolean;
+  /** 展开“历史”时要分页的来源。 */
+  sources: string[];
+}
+
+/**
+ * 节点下尚未加载的子节点（plugin-api.md“按需加载”）。
+ * - 同一来源：按父节点的 hasChildren/childCount，扣除该来源已加载的子节点；childCount 由来源随推送更新。
+ * - 其他来源：按各来源快照报告的 foreignChildCounts，每个来源只扣除自己经快照或分页取到的子节点。
+ * 是否还有历史以分页游标为准，数目只是提示：某个来源对该父节点已开始分页、还有下一页时一定显示“历史”，
+ * 差值不大于 0 时不带数字（插件可能把不计入数目的节点也列在分页里）；已分页到最后一页时，该来源不再有未加载的子节点，
+ * 即使差值大于 0。
+ */
+export function hiddenChildren(trees: ReadonlyMap<string, SourceTree>, node: TreeNode): HiddenChildren {
+  const result: HiddenChildren = { count: 0, unknown: false, sources: [] };
+  // 差值不大于 0 时：已开始分页（listed 有记录且没到最后一页）仍按未知数目显示，否则没有历史。
+  const add = (source: string, hidden: number, paging: boolean) => {
+    if (hidden > 0) result.count += hidden;
+    else if (paging) result.unknown = true;
+    else return;
+    result.sources.push(source);
+  };
+  const own = trees.get(node.source);
+  const ownListed = own?.listed.get(node.id);
+  if (own && node.hasChildren && !ownListed?.done) {
+    if (node.childCount === undefined) { result.unknown = true; result.sources.push(node.source); }
+    else add(node.source, node.childCount - own.children(node.id).length, !!ownListed);
+  }
+  for (const [source, t] of trees) {
+    if (source === node.source) continue;
+    const total = t.foreign[node.id];
+    const listed = t.listed.get(node.id);
+    if (!total || listed?.done) continue;
+    add(source, total - t.children(node.id).filter((child) => t.baseline.has(child.id)).length, !!listed);
+  }
+  return result;
+}
+
+/** “未归属”分组下尚未加载的子节点：count、unknown 的含义同 HiddenChildren，parents 为展开时要分页的 (来源, 父节点)。 */
+export interface OrphanHistory { count: number; unknown: boolean; parents: [string, string][] }
+
+/** pi-pane 主会话树中的“未归属”分组（plugin-api.md“pi-pane 自己的节点”）。 */
+export const UNASSIGNED = "pane:group:unassigned";
+
+/**
+ * “未归属”分组的未加载子节点，与普通父节点同一规则（见 hiddenChildren）：每个 (来源, 父节点) 扣除该来源经快照或分页取到的子节点；
+ * 差值不大于 0 而已开始分页、还有下一页时仍显示不带数字的“历史”；已分页到最后一页的不再计入。包括两类：
+ * - 插件按 foreignChildCounts 报告挂在“未归属”分组本身下的子节点，展开时对该分组分页；
+ * - 父节点不在任何来源里时，插件报告挂在该父节点下的子节点，展开时对原父节点分页。skip(parentId) 为 true 的父节点不计入
+ *   （正在补取，或所在来源还没有快照）；父节点在树里时子节点归该父节点显示，也不计入。
+ */
+export function orphanHistory(trees: ReadonlyMap<string, SourceTree>, skip: (parentId: string) => boolean): OrphanHistory {
+  const result: OrphanHistory = { count: 0, unknown: false, parents: [] };
+  for (const [source, t] of trees) {
+    if (source === "pane") continue;
+    for (const [parent, total] of Object.entries(t.foreign)) {
+      const listed = t.listed.get(parent);
+      if (!total || listed?.done) continue;
+      if (parent !== UNASSIGNED && (findIn(trees, parent) || skip(parent))) continue;
+      const hidden = total - t.children(parent).filter((n) => t.baseline.has(n.id)).length;
+      if (hidden > 0) result.count += hidden;
+      else if (listed) result.unknown = true;
+      else continue;
+      result.parents.push([source, parent]);
+    }
+  }
+  return result;
+}
+
+/**
+ * 节点是否放进“未归属”分组：父节点指向 pane:group:unassigned，父节点所在来源已加载却没有该节点（或该来源不存在），
+ * 或沿父链回到自己（循环）。waiting(parentId) 为 true 表示已为该父节点重取快照、结果未到，暂不归入。
+ */
+export function unassigned(trees: ReadonlyMap<string, SourceTree>, node: TreeNode, waiting: (parentId: string) => boolean = () => false): boolean {
+  const parentId = node.parentId;
+  if (parentId === null) return false;
+  if (parentId === UNASSIGNED) return true;
+  let parent = findIn(trees, parentId);
+  if (!parent) {
+    const t = trees.get(sourceOf(parentId));
+    return (!t || !!t.epoch) && !waiting(parentId);
+  }
+  for (let steps = 0; parent && steps < 1000; steps++) {
+    if (parent.id === node.id) return true;
+    parent = parent.parentId === null ? undefined : findIn(trees, parent.parentId);
+  }
+  return false;
+}

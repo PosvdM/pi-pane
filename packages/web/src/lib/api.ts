@@ -21,24 +21,30 @@ async function failure(response: Response): Promise<ApiError> {
   return new ApiError(response.status, body?.error ?? "httpError", body?.message ?? `请求失败（HTTP ${response.status}）`, body);
 }
 
+/** 请求没有得到响应：断网，或 signal 中止（含 AbortSignal.timeout 到时）。服务端是否已执行未知。 */
+function networkError(signal?: AbortSignal | null): ApiError {
+  const timedOut = signal?.aborted && (signal.reason as { name?: string } | undefined)?.name === "TimeoutError";
+  return new ApiError(0, "network", timedOut ? "等待 pi-pane 服务端响应超时" : "无法连接 pi-pane 服务端");
+}
+
 export async function request(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   if (credential) headers.set("Authorization", "Bearer " + credential);
   let response: Response;
   try { response = await fetch(path, { ...init, headers, cache: "no-store" }); }
-  catch { throw new ApiError(0, "network", "无法连接 pi-pane 服务端"); }
+  catch { throw networkError(init.signal); }
   if (!response.ok) throw await failure(response);
   return response;
 }
 
-/** signal 中止时请求以 ApiError（network）结束，与网络中断相同：服务端是否已执行未知。 */
+/** signal 中止（含超时）时请求以 ApiError（network）结束，与网络中断相同：服务端是否已执行未知。 */
 export async function api<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const response = await request(path, body === undefined ? { signal } : {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
   });
   // 响应头已到而响应体读取中断时，结果同样未知，按网络错误处理；完整但无法解析的响应单独标出。
   let text: string;
-  try { text = await response.text(); } catch { throw new ApiError(0, "network", "无法连接 pi-pane 服务端"); }
+  try { text = await response.text(); } catch { throw networkError(signal); }
   try { return JSON.parse(text) as T; } catch { throw new ApiError(response.status, "invalidResponse", "服务端响应无法解析"); }
 }
 

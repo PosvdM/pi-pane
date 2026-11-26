@@ -96,9 +96,11 @@ export class SessionModel {
       this.reset(this.entries, leafId); return;
     }
     // message_end 先于落盘；按完整消息身份移除已持久化项，不能清掉响应之后才完成的消息。
-    for (const entry of fresh) if (entry.type === "message") {
-      const completed = this.inFlight.completed ?? []; const signature = JSON.stringify(entry.message);
-      const i = completed.findIndex((message) => JSON.stringify(message) === signature); if (i >= 0) completed.splice(i, 1);
+    // 扩展注入的消息落盘为 custom_message 条目，与进行中的 custom 消息按 persistedSignature 对应。
+    for (const entry of fresh) {
+      const signature = persistedSignature(entry); if (signature === undefined) continue;
+      const completed = this.inFlight.completed ?? [];
+      const i = completed.findIndex((message) => messageSignature(message) === signature); if (i >= 0) completed.splice(i, 1);
     }
     if (fresh.length) this.emit({ type: "pane_entries", entries: fresh, leafId });
   }
@@ -121,4 +123,17 @@ export class SessionModel {
     for (const event of this.events) if (event.cursor.seq > after.seq) listener(structuredClone(event));
     this.listeners.add(listener); return () => { this.listeners.delete(listener); };
   }
+}
+
+/** 进行中消息的身份：custom 消息只比较扩展写入的字段，其余消息比较完整内容。 */
+export function messageSignature(message: any): string {
+  return message?.role === "custom"
+    ? JSON.stringify(["custom", message.customType, message.content, !!message.display, message.details ?? null])
+    : JSON.stringify(message);
+}
+/** 已落盘条目对应的进行中消息身份；其他类型的条目没有对应的进行中消息。 */
+export function persistedSignature(entry: any): string | undefined {
+  if (entry?.type === "message") return messageSignature(entry.message);
+  if (entry?.type === "custom_message") return JSON.stringify(["custom", entry.customType, entry.content, !!entry.display, entry.details ?? null]);
+  return undefined;
 }

@@ -68,7 +68,8 @@ test('无 origin、伪造 origin、离线 origin 和重连前 origin 均回退�
     const pending = api.confirm(request({ origin }));
     const id = a.at(-1).request.id;
     assert.equal(b.at(-1).request.id, id);
-    assert.deepEqual(a.at(-1), { type: 'presence', request: { id, ...request(), source: 'plugin-a' } });
+    assert.ok(Number.isFinite(Date.parse(a.at(-1).request.expiresAt)), '确认帧带到期时间');
+    assert.deepEqual(a.at(-1), { type: 'presence', request: { id, ...request(), source: 'plugin-a', expiresAt: a.at(-1).request.expiresAt } });
     broker.respond('b', id, { proof: proof('device-b') });
     assert.deepEqual(await pending, proof('device-b'));
     assert.deepEqual(a.at(-1), { type: 'presenceClosed', id, reason: 'confirmed' });
@@ -106,6 +107,9 @@ test('proof 结构、算法和设备必须匹配连接，签名内容保持不�
     { proof: { ...proof('device-a'), publicKey: 'other-key' } },
     { proof: proof('device-a'), error: 'rejected' }, { error: 'arbitrary' },
   ]) broker.respond('a', id, response);
+  // 设备不符的回应不结束确认：浏览器收到“确认未生效”，并再次收到同一确认，可以重新确认。
+  assert.ok(a.some(message => message.type === 'notification' && message.notification.title === '确认未生效'));
+  assert.deepEqual(a.at(-1), a[0]);
   const valid = proof('device-a');
   broker.respond('a', id, { proof: valid });
   valid.signature = 'mutated';

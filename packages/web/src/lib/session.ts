@@ -2,14 +2,14 @@
 import { api, ApiError, newId } from "./api.ts";
 import { apply, fromSnapshot, prependHistory, type Entry, type ModelState } from "./session-model.ts";
 import { deliverRestored } from "./restored.ts";
+import { closePluginView } from "./plugin-session.ts";
 import { awaitSaved, claimSaved, recordDrafts } from "./saved-drafts.ts";
-import { ResponseOrder } from "./response-order.ts";
 import { Store } from "./store.ts";
 import { ask, emptyUi, extensionUi, toast } from "./ui-state.ts";
 import * as ws from "./ws.ts";
 import type {
   DraftNode, PaneCommand, PaneControlCommand, PaneControlResult, PaneOpenResult, PaneQueryResults, PaneQueryType,
-  PaneSessionList, PaneSessionListItem, PaneSessionStats, PaneSessionView,
+  PaneSessionStats, PaneSessionView,
 } from "./types.ts";
 
 export interface Current {
@@ -23,7 +23,6 @@ export interface Current {
   commands?: PaneCommand[];
 }
 export const current = new Store<Current | null>(null);
-export const sessionList = new Store<{ items: PaneSessionListItem[]; loading: boolean; error?: string }>({ items: [], loading: false });
 
 /** 扩展用 set_editor_text 设置的输入框文字。 */
 export const editorText = new Store<{ sessionId: string; text: string; seq: number } | null>(null);
@@ -43,34 +42,6 @@ const FOLLOW_WINDOW_MS = 15000;
 const NETWORK_RETRY_MS = 120000;
 
 const LAST_SESSION_KEY = "pi-pane.lastSession";
-
-/** 并发刷新时，响应比已采用的列表新才采用；请求失败只显示错误，保留已采用的列表。 */
-const listOrder = new ResponseOrder();
-
-export async function refreshList(): Promise<void> {
-  const mine = listOrder.begin();
-  sessionList.set((s) => ({ ...s, loading: true, error: undefined }));
-  try {
-    const { sessions } = await api<PaneSessionList>("/api/sessions");
-    const adopt = listOrder.succeed(mine);
-    if (adopt) sessions.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
-    sessionList.set((s) => ({
-      items: adopt ? sessions : s.items,
-      loading: listOrder.pending,
-      error: listOrder.failedSinceAdopted ? s.error : undefined,
-    }));
-  } catch (error) {
-    const report = listOrder.fail(mine);
-    sessionList.set((s) => ({ ...s, loading: listOrder.pending, error: report ? (error as Error).message : s.error }));
-  }
-}
-
-let listTimer: ReturnType<typeof setTimeout> | undefined;
-/** 当前会话回到 idle、变为只读或被替换（不跟随）后延迟刷新侧栏列表：新建会话的文件在首条用户消息写入时才创建。 */
-function scheduleListRefresh(): void {
-  clearTimeout(listTimer);
-  listTimer = setTimeout(() => { void refreshList(); }, 500);
-}
 
 function setModel(id: string, view: PaneSessionView, extra: Partial<Current> = {}): void {
   const previous = current.get();
@@ -107,11 +78,10 @@ function onEvent(id: string, record: Parameters<typeof apply>[1]): void {
   // 写者退出后不能再查询运行态；先重取快照，避免托管标志更新前发送统计或状态查询。
   if (event.type === "pane_status" && event.readonly === true && state.model.view.hosted) {
     clearTimeout(stateTimer);
-    void reload(); scheduleListRefresh(); current.touch();
+    void reload(); current.touch();
     return;
   }
-  if (event.type === "pane_status" && event.status === "idle") { void refreshStats(); scheduleListRefresh(); }
-  if (event.type === "pane_session_replaced") scheduleListRefresh();
+  if (event.type === "pane_status" && event.status === "idle") void refreshStats();
   if (state.model.view.hosted && (state.model.view.controlRevision !== revision || ["session_info_changed", "model_select", "thinking_level_select", "model_changed", "thinking_level_changed"].includes(event.type))) scheduleStateRefresh();
   current.touch();
 }
@@ -144,6 +114,7 @@ export function reload(): Promise<void> {
 /** 打开已登记的会话（按会话 id）。 */
 export async function open(id: string): Promise<void> {
   const mine = ++nav;
+  closePluginView();
   current.set({ id, model: null, loading: true });
   try {
     const view = await api<PaneSessionView>(`/api/sessions/${encodeURIComponent(id)}/snapshot`);
@@ -151,9 +122,6 @@ export async function open(id: string): Promise<void> {
     setModel(id, view);
     attach(id);
     void refreshAuxiliary();
-    // 跟随会话替换打开新会话时，首轮可能在取快照前已经结束，订阅后不再收到 idle 事件；
-    // 打开后立即刷新列表，不依赖之后的事件。
-    void refreshList();
   } catch (error) {
     if (nav !== mine) return;
     if (error instanceof ApiError && error.status === 404) {
@@ -166,7 +134,7 @@ export async function open(id: string): Promise<void> {
   }
 }
 
-/** 退出主界面（重新配对等）时取消订阅并清空当前会话。 */
+/** 退出主界面（重新配对等）或打开插件节点时：导航代次加一，取消订阅并清空当前会话，在途的打开、重取和控制结果不再改动视图。 */
 export function detach(): void {
   nav++;
   unsubscribe?.(); unsubscribe = null;
@@ -176,6 +144,7 @@ export function detach(): void {
 /** 从会话列表打开，或在项目目录下新建（sessionFile 省略）。 */
 export async function openFile(cwd: string, sessionFile?: string, fork = false): Promise<void> {
   const mine = ++nav;
+  closePluginView();
   current.set({ id: "", model: null, loading: true });
   try {
     const result = await api<PaneOpenResult>("/api/sessions/open", { requestId: newId(), cwd, ...(sessionFile ? { sessionFile } : {}), ...(fork ? { fork: true } : {}) });
@@ -184,7 +153,6 @@ export async function openFile(cwd: string, sessionFile?: string, fork = false):
     setModel(id, result, { warning: result.warning, heldBy: result.heldBy });
     attach(id);
     void refreshAuxiliary();
-    void refreshList();
   } catch (error) {
     if (nav === mine) current.set({ id: "", model: null, loading: false, error: (error as Error).message });
   }

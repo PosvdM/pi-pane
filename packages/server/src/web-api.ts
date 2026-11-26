@@ -1,7 +1,9 @@
 // 浏览器与 pi-pane 服务端之间的 HTTP/WebSocket 数据类型。
 // 会话事件流和条目沿用 plugin-api.md 的 pane 协议；本文件定义协议之外、由服务端从 pi 原始形状转换而来的结构。
 // 前端只以 `import type` 引用本文件，pi 的 RPC 信封只出现在服务端。
-import type { DraftNode, NodeStatus, SessionRef, SessionSnapshot } from "@pi-pane/plugin-api";
+import type {
+  BannerState, DraftNode, FormRemovedReason, FormSpec, NodeStatus, PaneNotification, PanelUpdate, SessionRef, SessionSnapshot, TreeChange,
+} from "@pi-pane/plugin-api";
 
 /** 会话列表的一行。不含消息全文等大字段。 */
 export interface PaneSessionListItem {
@@ -18,6 +20,18 @@ export interface PaneSessionListItem {
   status?: NodeStatus;             // 已在服务端登记时的状态
 }
 export interface PaneSessionList { sessions: PaneSessionListItem[] }
+
+/**
+ * 主会话树（source = "pane"）的会话节点在协议字段之外附带的信息，字段名为 paneSession。插件的节点没有该字段。
+ * 侧栏用它显示修改时间、按文件打开会话，并隐藏尚未写入存档的空会话。
+ */
+export interface PaneSessionNodeInfo {
+  sessionFile: string;
+  cwd: string;
+  modifiedAt?: string;             // 会话内容的修改时间（ISO），打开和订阅不改变它
+  stored: boolean;                 // 存储目录中已有该会话
+  untitled: boolean;               // 没有名称，也没有首条用户文本
+}
 
 export type PaneThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -165,9 +179,33 @@ export type PaneUiAnswerResult = { status: "done" } | { status: "alreadyHandled"
 
 export interface PaneTrustRequest { id: string; cwd: string; expiresAt: string }
 
+/** 浏览器收到的用户在场确认；expiresAt 只用于显示倒计时，到期由服务端裁定。 */
+export interface PanePresenceRequest { id: string; title: string; summary: string; payload: unknown; source: string; expiresAt?: string }
+
+/** GET /api/plugins 的一项。 */
+export interface PanePluginState {
+  locator: string;
+  source?: string;
+  displayName?: string;
+  state: "active" | "failed" | "disabled";
+  error?: string;
+  paneProtocol?: number;
+}
+
 /** 服务端经 WebSocket 推送给浏览器的消息。 */
 export type PaneServerMessage =
-  | { type: "banners"; banners: unknown[]; paneProtocol?: number; connectionId?: string }
+  | { type: "banners"; banners: BannerState[]; paneProtocol?: number; connectionId?: string }
+  | { type: "banner"; banner: BannerState }
+  | { type: "bannerCleared"; source: string; id: string }
+  | { type: "tree"; source: string; change: TreeChange }
+  | { type: "panel"; source: string; update: PanelUpdate }
+  | { type: "form"; form: FormSpec }
+  | { type: "formsAligned" }
+  | { type: "plugins"; source: string; active: boolean }   // 插件启用（含重新启用）或变为不可用
+  | { type: "formRemoved"; source: string; formId: string; reason: FormRemovedReason }
+  | { type: "presence"; request: PanePresenceRequest }
+  | { type: "presenceClosed"; id: string; reason: "confirmed" | "cancelled" | "timeout" }
+  | { type: "notification"; notification: PaneNotification }
   | ({ type: "session" } & import("@pi-pane/plugin-api").SessionStreamEvent)
   | { type: "ui_request"; ref: SessionRef; request: PaneUiRequest }
   | { type: "ui_resolved"; ref: SessionRef; id: string; reason: "answered" | "cancelled" | "expired" | "closed" }

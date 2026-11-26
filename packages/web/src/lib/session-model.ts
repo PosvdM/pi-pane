@@ -26,16 +26,32 @@ export function prependHistory(state: ModelState, entries: Entry[], historyBefor
   state.version++;
 }
 
+/**
+ * 重取快照后保留已加载的更早历史。条目树只追加、parentId 不变（plugin-api.md“历史水位”）：新快照的第一条在旧模型中时，
+ * 旧模型里排在它之前的条目都是它的祖先，接在新快照之前，历史水位沿用旧模型的。第一条不在旧模型中（如换了分支）时不保留。
+ */
+export function keepLoadedHistory(next: ModelState, prev: ModelState): void {
+  if (next.view.historyBefore === null) return;   // 快照已含到开头的全部条目
+  const first = next.entries[0]; if (!first) return;
+  const index = prev.entries.findIndex((e) => e.id === first.id);
+  if (index <= 0) return;
+  next.entries = [...prev.entries.slice(0, index), ...next.entries];
+  next.view.historyBefore = prev.view.historyBefore;
+}
+
 const idle = (): InFlightState => ({ phase: "idle", tools: [], queue: { steering: [], followUp: [] } });
 
-/** 应用一条事件。游标不连续或 epoch 变化时返回 resync，调用方重新取快照。 */
+/**
+ * 应用一条事件。游标不连续或 epoch 变化时返回 resync，调用方重新取快照。
+ * resync 事件不按游标去重：提供方（包括服务端在插件事件出错时的兜底）可能用订阅起点作为它的游标。
+ */
 export function apply(state: ModelState, record: SessionStreamEvent): ApplyResult {
   const cursor = state.view.cursor;
+  const event = record.event as any;
+  if (event?.type === "resync") return "resync";
   if (record.cursor.epoch !== cursor.epoch) return "resync";
   if (record.cursor.seq <= cursor.seq) return "duplicate";
   if (record.cursor.seq !== cursor.seq + 1) return "resync";
-  const event = record.event as any;
-  if (event.type === "resync") return "resync";
   state.view.cursor = { ...record.cursor };
   const inFlight = state.view.inFlight ??= idle();
   switch (event.type) {
@@ -44,10 +60,11 @@ export function apply(state: ModelState, record: SessionStreamEvent): ApplyResul
       const fresh = (event.entries as Entry[]).filter((e) => !known.has(e.id));
       state.entries = [...state.entries, ...fresh];
       state.view.leafId = event.leafId;
-      // 与服务端相同：按完整消息内容移除已经持久化的 completed 项。
-      for (const entry of fresh) if (entry.type === "message") {
-        const completed = inFlight.completed ?? []; const signature = JSON.stringify(entry.message);
-        const i = completed.findIndex((m) => JSON.stringify(m) === signature);
+      // 与服务端（model.ts 的 persistedSignature）相同：按消息身份移除已经持久化的 completed 项，custom_message 对应 custom 消息。
+      for (const entry of fresh) {
+        const signature = persistedSignature(entry); if (signature === undefined) continue;
+        const completed = inFlight.completed ?? [];
+        const i = completed.findIndex((m) => messageSignature(m) === signature);
         if (i >= 0) completed.splice(i, 1);
       }
       break;
@@ -111,3 +128,13 @@ function updateAssistant(inFlight: InFlightState, event: any): void {
   assistant.blocks = assistant.blocks.map((b) => b.contentIndex === i ? next : b);
 }
 
+function messageSignature(message: any): string {
+  return message?.role === "custom"
+    ? JSON.stringify(["custom", message.customType, message.content, !!message.display, message.details ?? null])
+    : JSON.stringify(message);
+}
+function persistedSignature(entry: any): string | undefined {
+  if (entry?.type === "message") return messageSignature(entry.message);
+  if (entry?.type === "custom_message") return JSON.stringify(["custom", entry.customType, entry.content, !!entry.display, entry.details ?? null]);
+  return undefined;
+}

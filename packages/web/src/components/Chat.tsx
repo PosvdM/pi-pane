@@ -4,7 +4,12 @@ import { useStore } from "../lib/store.ts";
 import { closeSession, current, loadOlder, open, openFile, restart } from "../lib/session.ts";
 import { extensionUi, emptyUi, overlay } from "../lib/ui-state.ts";
 import { settings } from "../lib/settings.ts";
+import { formKey, forms, openForm, sortedForms } from "../lib/plugin-ui.ts";
+import { openNodeById } from "../lib/navigate.ts";
+import { findNode, trees } from "../lib/tree.ts";
+import type { TreeNode } from "../lib/types.ts";
 import { Composer } from "./Composer.tsx";
+import { DetailsButton, NodePanels, useDetails, useNodePanels } from "./Panels.tsx";
 import { EntryView, MessageView, StreamingBlocks, toolKey, type ToolContext } from "./Message.tsx";
 
 const STATUS_TEXT: Record<string, string> = {
@@ -26,7 +31,7 @@ function firstUserText(entries: { type: string; message?: any }[]): string {
   return "";
 }
 
-function Header() {
+function Header({ details }: { details?: ReturnType<typeof useDetails> }) {
   const state = useStore(current)!;
   const view = state.model!.view;
   const model = view.state?.model;
@@ -53,6 +58,7 @@ function Header() {
           </button>
         )}
         {view.hosted && <button class="chip-btn" onClick={() => void closeSession()} title="停止 pi 进程并关闭会话">关闭</button>}
+        {details && <DetailsButton details={details} />}
       </div>
     </div>
   );
@@ -60,6 +66,7 @@ function Header() {
 
 function Banners() {
   const state = useStore(current)!;
+  const formMap = useStore(forms);
   const model = state.model!; const view = model.view;
   const banners: any[] = [];
   if (model.replaced) banners.push(
@@ -77,6 +84,10 @@ function Banners() {
   if (view.inFlight?.retry) banners.push(<div class="banner">第 {view.inFlight.retry.attempt}/{view.inFlight.retry.maxAttempts} 次重试：{view.inFlight.retry.errorMessage}</div>);
   if (view.projectTrusted === false) banners.push(<div class="banner muted-banner">项目资源未加载（项目未被信任）。AGENTS.md 等上下文文件不受信任设置影响，始终加载。</div>);
   if (view.holds.length) banners.push(<div class="banner muted-banner">保活：{view.holds.map((h) => h.reason).join("；")}</div>);
+  // 插件的持久表单指向本会话时，在顶部列出并提供“处理”入口（plugin-api.md“持久表单”的节点标记）。
+  for (const form of sortedForms(formMap.values())) if (form.nodeId === "pane:session:" + state.id) banners.push(
+    <div class="banner warn" data-testid="node-pending-banner">待处理：{form.title}<button class="btn small" onClick={() => openForm.set({ key: formKey(form.source, form.id), persistent: true, form })}>处理</button></div>,
+  );
   return <>{banners}</>;
 }
 
@@ -96,8 +107,19 @@ function Statuses({ id }: { id: string }) {
   return <div class="statusbar" data-testid="statusbar">{detail && <span>{detail}</span>}{entries.map(([key, text]) => <span key={key}>{text}</span>)}</div>;
 }
 
+/** 主会话在会话树中的节点；树还没加载到它时按协议的形状补一个，用于匹配 sources 含 "pane" 的节点面板。 */
+function mainNode(id: string): TreeNode {
+  return findNode("pane:session:" + id) ?? { id: "pane:session:" + id, source: "pane", kind: "session", parentId: null, title: id, status: "idle",
+    availability: "online", hasChildren: false, sortKey: "", revision: 0, capabilities: [], sessionRef: { source: "pane", id } };
+}
+
 export function ChatView() {
   const state = useStore(current)!;
+  useStore(trees);
+  const node = mainNode(state.id);
+  // 插件为主会话定义的节点面板（placement = node，appliesTo.sources 含 "pane"）显示在右侧，与插件会话视图相同。
+  const panels = useNodePanels(node);
+  const details = useDetails(node.id);
   const prefs = useStore(settings);
   const model = state.model!;
   const view = model.view;
@@ -111,8 +133,8 @@ export function ChatView() {
     for (const entry of model.entries) if (entry.type === "message" && entry.message?.role === "toolResult") results.set(entry.message.toolCallId, entry.message);
     for (const message of completed as any[]) if (message?.role === "toolResult") results.set(message.toolCallId, message);
     const running = new Map((inFlight?.tools ?? []).map((t) => [t.toolCallId, { partialResult: t.partialResult }]));
-    return { results, running, showHidden: prefs.showHidden };
-  }, [model.version, prefs.showHidden]);
+    return { results, running, showHidden: prefs.showHidden, sessionRef: { source: "pane", id: state.id } };
+  }, [model.version, prefs.showHidden, state.id]);
   const called = useMemo(() => {
     const ids = new Set<string>();
     const scan = (message: any) => { if (message?.role === "assistant" && Array.isArray(message.content)) for (const b of message.content) if (b.type === "toolCall") ids.add(b.id); };
@@ -130,8 +152,9 @@ export function ChatView() {
 
   const visible = (message: any) => !(message?.role === "toolResult" && called.has(message.toolCallId));
   return (
+    <div class="main-split">
     <div class="chat" data-testid="chat" data-session-id={state.id}>
-      <Header />
+      <Header {...(panels.length ? { details } : {})} />
       <Banners />
       <div class="messages" ref={scroller} onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
         {view.historyBefore && <button class="btn ghost load-older" onClick={() => void loadOlder()}>加载更早的消息</button>}
@@ -150,6 +173,8 @@ export function ChatView() {
       <Composer sessionId={state.id} model={model} commands={state.commands} />
       <Widgets id={state.id} placement="belowEditor" />
       <Statuses id={state.id} />
+    </div>
+    {panels.length > 0 && details.shown && <NodePanels node={node} panels={panels} onClose={details.close} drawer={details.narrow} onOpenNode={openNodeById} />}
     </div>
   );
 }

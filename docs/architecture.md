@@ -1,6 +1,6 @@
 # 总体架构
 
-> 状态：M1 服务端核心、M2 前端核心与 M3 插件服务端已实现；浏览器中的插件界面（插件节点、面板、持久表单与待处理区、横幅、`userPresence` 确认）和 agora 联调尚未实现。本文描述完整架构；当前可用接口、前端结构与验收映射见 [development.md](development.md)。
+> 状态：M1 服务端核心、M2 前端核心与 M3（插件服务端与浏览器中的插件界面）已实现，M4 的会议与讨论板面板尚未实现。本文描述完整架构；当前可用接口、前端结构与验收映射见 [development.md](development.md)。
 
 pi-pane 是 pi 的轻量 Web 界面。服务端为每个打开的主会话拉起一个 `pi --mode rpc` 子进程，把聊天流转发给浏览器；子代理、会议等功能由插件通过通用接口显示，pi-pane 本身不实现这些业务。
 
@@ -35,13 +35,13 @@ pi-pane 服务端（server）
  ├─ 只读会话读取：不拉起进程，直接解析会话文件
  ├─ 扩展 UI 适配：pi 原生 select/confirm/input/editor 等 → 浏览器
  ├─ 附件与图片缓存
- └─ 插件宿主（M3，尚未实现）：加载可信的服务端插件（如 pi-agora 的 pane 插件）
+ └─ 插件宿主（M3）：加载可信的服务端插件（如 pi-agora 的 pane 插件）
 ```
 
 | 包 | 职责 |
 | --- | --- |
 | `packages/server` | 服务端：会话托管、RPC 驱动、只读解析、鉴权、WebSocket、附件；插件宿主属于 M3 |
-| `packages/web` | Vite + Preact 前端：会话列表、聊天视图、输入框与图片占位符、斜杠命令、扩展对话框、模型与思考级别、设备密钥；会话树中的插件节点、面板与待处理区属于 M3 |
+| `packages/web` | Vite + Preact 前端：会话树（主会话与插件节点）、聊天视图、输入框与图片占位符、斜杠命令、扩展对话框、模型与思考级别、设备密钥；插件的会话视图、面板、待处理区、横幅、通知与在场确认 |
 | `packages/bridge-extension` | 加载进每个主会话的 pi 扩展（pane-bridge），见“pane-bridge” |
 | `packages/plugin-api` | `@pi-pane/plugin-api`：插件接口和 pane 协议 v1 的 TypeScript 类型，按 [plugin-api.md](plugin-api.md) 导出；插件把它作为 peer 依赖 |
 | `pi-hostkit`（外部依赖） | 平台相关的共享实现，见“平台支持” |
@@ -88,14 +88,13 @@ node <pi>/dist/bundle/cli.js --mode rpc
 
 会话列表直接读 pi 的会话存储，pi-pane 不复制会话数据，终端里创建的会话也能在列表里打开。
 
-前端（`packages/web/src/lib/session.ts`）在以下时机重新请求 `GET /api/sessions`：
+侧栏的会话列表就是主会话树（`source = "pane"`），与插件的树一起由服务端推送驱动（`packages/web/src/lib/tree.ts`）：
 
-- 立即刷新：侧栏挂载、点击刷新按钮、新建或按文件打开会话成功后、按 id 打开会话成功后。自动跟随会话替换走按 id 打开的路径，在新会话打开成功后立即刷新。
-- 延迟 500 毫秒刷新：当前会话回到 idle、变为只读，或收到不自动跟随的会话替换事件。
-
-pi 1.5.x 和 1.6.x 在写入首条用户消息时创建会话文件。跟随替换打开新会话时，首轮可能在取快照前已经结束，订阅后不会再收到 idle 事件，因此打开成功后立即刷新，不依赖后续事件。侧栏只随当前会话的事件刷新：在新会话的首条消息写入前切到其他会话，该会话要等下一次刷新才出现在列表中（#20）。
-
-多次刷新并发时，按发出顺序编号，响应比已采用的列表新才采用（`lib/response-order.ts`）：先发的请求晚到时不覆盖较新的列表；请求失败时只显示错误，保留已采用的列表。
+- 浏览器在每次 WebSocket 建立后取主会话树和各插件树的快照，再从快照游标订阅变更；断线重连时按游标续订，游标过期时服务端推 `reset`，浏览器重取快照。
+- 服务端的会话目录（`session-catalog.ts`）在读取存储目录、登记会话的状态、名称或条目变化时通知主会话树，主会话树向订阅的浏览器推送节点的增删改。所以终端以外的变化（另一个标签页新建会话、插件保活、后台会话结束）不依赖当前打开的会话也会出现在侧栏。
+- 主会话树的会话节点附带 `paneSession`（`web-api.ts` 的 `PaneSessionNodeInfo`）：会话文件、目录、内容修改时间、是否已写入存储、是否没有标题。侧栏只显示已写入存储、已有消息或当前打开的会话，尚未写入的空会话不占位置。新会话写入首条消息后，节点的消息数变化随即推送。
+- 终端里新建的会话要等下一次读取存储目录才出现：侧栏的刷新按钮、取主会话树快照和 `GET /api/sessions` 都会重新读取。
+- 重叠的存储目录读取可能逆序完成，服务端只提交比已提交读取更晚发起的结果，较早的读取不会回退名称、消息数和时间（#18）。
 
 前端的 `GET /api/sessions`（`PaneSessionList`）、插件的 `MainSessionsApi` 与主会话树使用同一份会话目录（`packages/server/src/session-catalog.ts`）：每次读取存储目录后，把每一行转换为只含所需字段的 `StoredSession`，已在服务端登记的会话再叠加实时状态。两处取值相同的字段如下。
 
@@ -107,10 +106,11 @@ pi 1.5.x 和 1.6.x 在写入首条用户消息时创建会话文件。跟随替�
 | 托管 | 登记会话是否有 pi 进程（写者句柄存在，包括启动和停止过程中） | `hosted` | `hosted`；`availability` 为 `online` 或 `archived` |
 | 状态 | 登记会话的模型状态 | `status`，未登记时省略 | `status`，未登记时为 `idle` |
 | 文件与目录 | 登记会话的当前文件和 `cwd`，否则用存储目录 | `sessionFile`、`cwd` | `sessionFile`、`cwd` |
+| 修改时间 | 存储目录的时间与登记会话最后一个带时间戳条目的时间中较新的；都没有时为登记时间 | `modifiedAt`（只用存储目录） | 节点 `paneSession.modifiedAt`，`sortKey` 按它从新到旧排列 |
 
 两处有意保留的差异：
 
-- **时间：** 列表的 `modifiedAt` 只用存储目录的时间（pi 按最后一条消息的时间计算），侧栏按它排序和判断“最近 7 天”，打开或订阅会话不会改变侧栏顺序。树的 `lastActivityAt` 取该时间与登记会话最近活动时间（收到事件、订阅、保活变化）中较新的值，用于选出快照中的热节点。`createdAt` 与 `parentSessionFile` 只在列表中提供。
+- **时间：** 修改时间只随会话内容变化，侧栏按它排序，打开或订阅会话不会改变侧栏顺序。树的 `lastActivityAt` 取存储目录时间与登记会话最近活动时间（收到事件、订阅、保活变化）中较新的值，用于选出快照中的热节点。`createdAt` 与 `parentSessionFile` 只在列表中提供。
 - **范围：** 列表按存储目录中的文件逐个列出，登记会话按 `fileKey` 匹配，尚未写入存储的新会话不出现。树和 `MainSessionsApi.get` 按会话 id 合并，包含尚未写入存储的登记会话，插件可以在首次写入前取得并保活它。
 
 快照视图（`GET /api/sessions/:id/snapshot`）的 `hosted` 表示写者是否接受输入，决定输入框能否发送，与列表的托管含义不同。列表不下发 `allMessagesText` 等消息全文。
@@ -121,6 +121,7 @@ pi 1.5.x 和 1.6.x 在写入首条用户消息时创建会话文件。跟随替�
 - 名称从会话元数据读取；托管期间收到 `session_info_changed` 时先更新名称，再通知插件上下文和主会话树。打开、只读刷新、重绑定和在线事件统一去除名称两端空白，并将空值归一化为未设置。名称缓存与普通 RPC 状态对象相互独立，名称刷新不改写该对象，状态查询也不会覆盖较新的名称；只读文件监视同样刷新名称。名称被清空后，标题使用首条文本用户消息的前 200 个完整 Unicode 字符；文本块以空格连接，去除两端空白后没有文本时插件协议使用会话 id，前端列表使用空字符串。目录、只读、托管记录和前端列表共用 `session-title.ts` 的名称与标题规则。
 - `PiStore.list()` 保留 pi 的原目录字段，并提供去除无消息占位语义的 `firstUserText`。占位字面量也可能是真实用户输入，适配层只在歧义时只读复核首条文本，不能按字面量一律删除。
 - 按项目（工作目录）分组；每个会话显示名称、最后修改时间、消息数。默认只显示托管中、浏览器里打开着、最近 7 天活动过的会话，其余折叠进各项目下的“历史”，展开时分页加载（与 [plugin-api.md](plugin-api.md#按需加载) 的按需加载规则相同）。
+- 插件节点挂在主会话或项目分组下时显示为它的子节点，与主会话一起按 `sortKey` 统一排序；主会话或项目分组是否可展开、“历史（N）”的数目按各插件快照的 `foreignChildCounts` 相加。所属主会话不在主会话树中的插件节点归入“未归属”，其中冷节点的“历史”与普通父节点同一规则（分页游标优先）。插件没有父节点的根节点按插件分组，组名为插件的 `displayName`。
 
 ### 只读查看历史会话
 
@@ -252,6 +253,7 @@ pane-bridge 返回 `"undecided"`，或它的决定被更早加载的扩展抢先
   - 等待其他标签页关闭：扫描时因仍开着而跳过的标签页，以及经 `storage` 事件看到新写入本会话草稿键的标签页，本页在它的锁 `pi-pane.tab.<tabId>` 上排一个等待请求（输入框卸载或切换会话时用 `AbortSignal` 撤销）。那个标签页关闭后本页立即取得锁、随即释放，等 3 秒（`ADOPT_SETTLE_MS`）后再扫描收养。用户关闭前台标签页、接替显示的标签页在它释放锁之前就已回到前台时，草稿由此及时收养，不必再切换会话或标签页。那个标签页只是在刷新时，新页面在这 3 秒内重新取得同一个锁，扫描时跳过，草稿留在刷新后的页面中；新页面超过 3 秒才取得锁时草稿被收养到本页，不会丢失。
   - pi-pane 只服务规范源 `http://127.0.0.1:<port>`（见“规范源与监听”），这是安全上下文，Chrome 在其中总有 Web Locks。万一没有 Web Locks，无法判断 tabId 是否被另一个页面使用，也无法判断标签页是否已关闭：每次加载都换新的 tabId，不沿用 `sessionStorage` 中的值，也不收养任何键。草稿不会丢失，之前的键留到有 Web Locks 的页面收养，但刷新后输入框中看不到刷新前的草稿。
   - 未挂载时（响应晚于切换会话、会话正在加载、页面已回到配对页），每批存成一条独立的待放回记录 `localStorage["pi-pane.restored.<编码后的会话 id>.<时间>-<随机串>"]`，逐条标记是否归属不明。键中的会话 id 把字母、数字、`_`、`-` 以外的每个 UTF-16 码元写成 `%` 加 4 位十六进制，编码可逆、不含分隔符“.”、对任意字符串都不出错，按前缀查找时一个会话不会取走另一个会话的记录（例如 `a` 与 `a.b`）。时间取严格大于该会话已有记录的值，本页面先后存入的多批即使在同一毫秒内也能分出先后。该会话的输入框挂载时取走全部记录，后存入的批次在前；其他标签页挂载着该会话输入框时经 `storage` 事件取走。取走时用 Web Lock 在标签页之间串行，输入框写入草稿存储后只删除本次读到的键，不会删掉期间写入的新批次，同一批也不会放回两次。
+  - 插件会话的输入框（`components/PluginSession.tsx`）使用同一套记录和挂载流程（`components/ComposerDrafts.tsx`），会话 id 换成 `pluginDraftScope(来源, 节点 id)`（`"plugin"`、来源和节点 id 以 NUL 分隔）。主会话的会话 id 是 pi 生成的 UUID，插件 id 也不含 NUL，两类记录不会相同。在途提交的结算见“浏览器中的插件界面”一节 `PluginSession.tsx` 一行。
   - 放回归属不明的草稿时，给该会话记一条提示 `localStorage["pi-pane.notice.<会话 id>"]`（条数为放回时的条数，多次放回累加），输入框上方显示“取回的草稿中有 n 条无法确认是否已经发送，请检查后再决定是否重发”。提示刷新后仍在，只在该会话显示，不随输入框中的编辑增减；用户点“知道了”、用户把输入框清空、或该会话有一条消息送达（只移除提交前已有的提示）时移除。用户删除输入框内容即为放弃。
   - `localStorage` 写入失败（如超出配额）时，草稿、在途提交、待放回记录和提示暂存在页面内存中，读取时优先于 `localStorage`，之后写入成功时清除。该会话的输入框上方显示错误提示，说明草稿只保存到页面关闭前；页面关闭或刷新前由浏览器请用户确认。
   - 会话 id 取自会话文件头，服务端重启并重新配对后，从会话列表打开原会话仍能取回。迟到的结果不弹框，也不在其他会话中显示提示。
@@ -439,15 +441,17 @@ interface DriverHandle {
 type ServerMessage =
   | { type: "session"; ref: SessionRef; cursor: StreamCursor; event: object } // pi 会话事件、pane_* 事件或 resync
   | { type: "tree"; source: string; change: TreeChange }
-  | { type: "panel"; update: PanelUpdate }
+  | { type: "panel"; source: string; update: PanelUpdate }
   | { type: "ui_request"; ref: SessionRef; request: PaneUiRequest }
   | { type: "ui_resolved"; ref: SessionRef; id: string; reason: "answered" | "cancelled" | "expired" | "closed" }
   | { type: "project_trust"; request: { id: string; cwd: string; expiresAt: string } }
   | { type: "project_trust_resolved"; id: string }
   | { type: "drafts_changed"; ref: SessionRef }  // 已订阅会话的清出草稿记录有增删，见“服务端暂存的清出草稿”
   | { type: "form"; form: FormSpec }
+  | { type: "formsAligned" }                      // 连接建立后重发的表单到此为止
+  | { type: "plugins"; source: string; active: boolean } // 插件启用或变为不可用，浏览器重读插件列表、目录和树
   | { type: "formRemoved"; source: string; formId: string; reason: FormRemovedReason }
-  | { type: "presence"; request: { id: string; title: string; summary: string; payload: unknown; source: string } }
+  | { type: "presence"; request: { id: string; title: string; summary: string; payload: unknown; source: string; expiresAt?: string } }
   | { type: "presenceClosed"; id: string; reason: "confirmed" | "cancelled" | "timeout" }
   | { type: "notification"; notification: PaneNotification }
   | { type: "banners"; banners: BannerState[] }   // 当前全部横幅，整体替换
@@ -561,12 +565,13 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 - 握手时校验 `Host` 和 `Origin`，但不在 URL 或握手头里带凭证。
 - 浏览器先用 `Authorization` 头调用 `POST /api/ws-ticket` 取一张一次性 ticket（30 秒有效），连接后发送的第一帧必须是 `{ "type": "auth", "ticket": "…" }`。5 秒内没有收到有效的首帧时服务端关闭连接。
 - 首帧之前服务端不推送任何数据，也不处理其他帧。
-- 鉴权通过后，服务端先发一条 `banners`（当前全部插件横幅，并带 `paneProtocol`、`connectionId`），随后对齐插件持久表单并逐条发送 `form`；对齐期间仍可处理其他订阅。每次重连都一样，所以横幅与待处理表单不依赖事件缓冲。
+- 鉴权通过后，服务端先发一条 `banners`（当前全部插件横幅，并带 `paneProtocol`、`connectionId`），随后对齐插件持久表单，逐条发送 `form`，最后发一条 `formsAligned`；对齐期间仍可处理其他订阅。每次重连都一样，所以横幅与待处理表单不依赖事件缓冲。浏览器在对齐期间保留原有的待处理列表，收到 `formsAligned` 时移除这一批里没有的表单（断线期间已在别处处理、撤回或过期，错过了移除帧），并关闭仍打开着的对应弹窗。
 - 会话订阅帧为 `{ type: "subscribe", ref, after: StreamCursor }`，取消帧为 `{ type: "unsubscribe", ref }`；`ref.source` 可以是 `pane` 或已启用的插件。每个连接以完整的 `(source, id)` 隔离订阅和慢客户端重同步，插件同名会话不会覆盖主会话。
 - 插件树订阅帧为 `{ type: "treeSubscribe", source, after: TreeCursor }`，取消帧为 `{ type: "treeUnsubscribe", source }`。插件负责快照切点和重放边界，服务端转发 `tree` 变更；浏览器按 [树同步规则](plugin-api.md#同步) 合并分页、修订号和 tombstone。
 - 插件的同步订阅异常通过现有 `notification` 错误消息报告，只影响该插件的订阅，不关闭承载主会话的共享连接。
-- 设备注册帧为 `{ type: "device", device: PresenceDevice }`，确认回应帧为 `{ type: "presenceResponse", id, response: { proof?: UserPresenceProof, error?: "rejected" | "unsupported" } }`。设备字段只用于显示和路由，不能替代插件后台的验签。
-- M3 的 v1 兼容扩展包括 `formRemoved.source` 和 `presenceClosed`。浏览器按 `(source, formId)` 识别持久表单；收到 `presenceClosed` 后关闭同一 `id` 的确认框。`confirmed` 表示已有标签页确认，`cancelled` 表示拒绝、取消或来源停用，`timeout` 表示到期。
+- 设备注册帧为 `{ type: "device", device: PresenceDevice }`，浏览器在每次连接建立和重置设备密钥后发送。同一浏览器的标签页共用 IndexedDB 中的密钥：一个标签页重置后经 BroadcastChannel 通知其他标签页重新登记；回应确认前，签名用的密钥与本连接登记的设备不同（含连接刚建立、`device` 帧还没发出）时，先在同一连接上重新登记再发送回应。服务端收到签名设备与本连接登记的设备不符的回应时不结束确认，向该连接发“确认未生效”的通知并重发同一确认，让用户再确认一次。浏览器不能签名（不支持 WebCrypto 或 IndexedDB）时收到确认帧即以 `unsupported` 回应，不等用户操作；确认回应帧为 `{ type: "presenceResponse", id, response: { proof?: UserPresenceProof, error?: "rejected" | "unsupported" } }`。设备字段只用于显示和路由，不能替代插件后台的验签。
+- 插件启用（含重新启用）或变为不可用时服务端广播 `plugins`。浏览器据此重读插件列表、各插件目录和树，并丢掉该插件的面板修订号（插件重启后修订号可能从小值重新开始）；没有横幅的插件停用时界面也随之刷新。每次连接建立时浏览器同样丢掉全部面板修订号。
+- M3 的 v1 兼容扩展包括 `formRemoved.source`、`panel.source`、`formsAligned`、`plugins` 和 `presenceClosed`。浏览器按 `(source, formId)` 识别持久表单，按 `(source, panelId)` 识别面板的修订号和角标；收到 `presenceClosed` 后关闭同一 `id` 的确认框。确认帧的 `expiresAt` 只用于显示倒计时，到期由服务端裁定。`confirmed` 表示已有标签页确认，`cancelled` 表示拒绝、取消或来源停用，`timeout` 表示到期。
 
 ### 其他规则
 
@@ -577,7 +582,7 @@ RPC 的 `prompt` 只执行扩展命令、技能（`/skill:name`）和提示模�
 
 ## 用户在场确认与设备密钥
 
-浏览器第一次登录时用 WebCrypto 生成不可导出的 ECDSA P-256 设备密钥，存在 IndexedDB；密钥管理和签名能力由 M2 提供。M3 的 `userPresence` 确认流程尚未接入，其协议规定：插件调用 `ctx.userPresence.confirm()` 时，浏览器弹出确认框，用户点击确认后签名，插件的后台服务验签。pi-pane 只负责生成、保存密钥和签名，不判断设备是否可信；设备的首次信任（TOFU）和批准由插件后台服务负责。接口、签名格式和流程见 [plugin-api.md](plugin-api.md#用户在场确认)。
+浏览器第一次登录时用 WebCrypto 生成不可导出的 ECDSA P-256 设备密钥，存在 IndexedDB；密钥管理和签名能力由 M2 提供，`userPresence` 确认流程由 M3 提供：插件调用 `ctx.userPresence.confirm()` 时，浏览器弹出确认框，用户点击确认后签名，插件的后台服务验签。pi-pane 只负责生成、保存密钥和签名，不判断设备是否可信；设备的首次信任（TOFU）和批准由插件后台服务负责。接口、签名格式和流程见 [plugin-api.md](plugin-api.md#用户在场确认)。
 
 ## 渲染与资源安全
 
@@ -655,6 +660,24 @@ Agent（主代理和子代理）与用户是同一个操作系统用户，在同
 主会话树由 `main-tree.ts` 从会话目录与当前托管状态构建：项目分组保留在快照中，冷历史按 keyset 游标分页；来源级变更缓冲保留最近 2000 条，游标跨 epoch、超前或缓冲缺口均返回 `reset`。主会话保活可以在尚未打开或托管时登记，不会因此启动进程；hold 始终绑定原 `SessionRef`，进程切换后不会迁到新会话。
 
 详见 [plugin-api.md](plugin-api.md#运行方式与超时)。
+
+### 浏览器中的插件界面
+
+浏览器只按 pane 协议的声明式数据显示插件界面，不加载插件脚本。行为规则见 plugin-api.md 的对应各节，前端的分工如下：
+
+| 模块 | 内容 |
+| --- | --- |
+| `lib/tree-state.ts`、`lib/tree.ts` | 每个来源一棵树：快照、订阅、分页按修订号和 tombstone 合并；冷节点只在父节点完整加载后显示；收到 reset 到新快照之间、或快照重建后，发出较早的分页结果作废；取快照失败时按 1 秒起、最长 10 秒的退避间隔重试。父节点可以属于其他来源（主会话、项目分组或另一个插件），同一父节点下各来源的子节点统一按 `sortKey` 排序。挂在未加载节点下的插件节点触发该来源的快照重取（父节点 id 加入快照请求的 `openNodeIds`；订阅推来的 upsert 和 remove 都重新扫描，删除节点腾出的名额立即用于补取），仍找不到父节点或形成循环时归入“未归属”。`openNodeIds` 由 `TreePins` 维护，合计不超过服务端的 1000 个：浏览器打开过的节点按最近使用保留 200 个；补取的父节点没有节点再引用时移除，请求过一次仍给不出的不再请求，直到该来源 reset 或用户点刷新，达到上限后不再补取新的父节点。“历史（N）”中同一来源的部分按父节点的 `childCount`（随推送更新）扣除已加载的子节点，其他来源的部分按各来源快照的 `foreignChildCounts` 只扣除该来源经快照或分页取到的子节点；`hasChildren` 为 true 而没有 `childCount` 时显示不带数字的“历史”。是否还有历史以分页游标为准：某来源已开始分页且还有下一页时差值不大于 0 也显示不带数字的“历史”，已分页到最后一页的来源不再计入。“未归属”下的冷节点按同一规则计算（`orphanHistory`），包括插件为 `pane:group:unassigned` 本身报告的数目，展开时对该分组分页 |
+| `lib/plugins.ts` | `GET /api/plugins` 与各插件的静态目录（动作、面板、自定义消息渲染器），每次连接建立和横幅的来源可用性变化时重读 |
+| `lib/plugin-ui.ts` | 持久表单（含重连后的对齐）、横幅、通知、在场确认队列与设备登记（任一标签页重置密钥后，打开着的确认框改显示新设备；签名用的设备与确认框显示的不同时不发送，由用户核对后重新确认）、按 `(source, panelId)` 记录的面板修订号（另按节点记录，相邻两次更新指向不同节点时都刷新；每次连接建立后显示中的面板重新拉取，补上断线期间错过的更新）；动作、表单和插件会话发送的提交、幂等键。动作调用和插件会话发送每次是一个操作对象（`lib/operation.ts`），首次请求和之后每次“查询结果”的返回都交给它结算，查询入口在操作结束前始终指向它，同一操作同时只进行一次查询。查询请求本身失败（断网、WebSocket 重连期间连接尚未重新登记导致的 403 `invalidOrigin` 等）只说明这次查询没有成功，不结算原操作，入口保留；持久表单的查询同样处理。发消息、动作和持久表单的提交及其查询都带 75 秒的浏览器超时（`PLUGIN_REQUEST_TIMEOUT_MS`，大于服务端等待插件的 60 秒上限），响应挂起时按结果未知结算，查询超时只说明这次查询没有成功。动作结果带 `openNodeId` 时按发起时的选择代次打开（`lib/navigate.ts` 的 `openFromResult`）：选择代次是导航代次加上用户经 `openNodeById` 发起的选择次数，结果返回前用户已切换会话或节点、或点击了还在等待出现的节点，都不跳转，只提示，也不取消用户正在等待的节点。持久表单从发出提交起记为进行中，关闭弹窗再打开只显示进度和“查询结果”，不能用新的幂等键再交一次；查询到已处理时关闭弹窗。动作的 `confirm` 使用应用内确认框，不用会阻塞页面的 `window.confirm()` |
+| `lib/plugin-state.ts` | 不依赖 DOM 的界面规则：通知保留（自动消失的最多 5 条，error 和 sticky 不被挤掉；info 5 秒、warning 8 秒）、横幅排序与折叠、标题栏动作上限、侧栏宽度范围、输入框文字放回 |
+| `lib/plugin-session.ts` | 打开的插件节点：按 `open` 取快照、按 `subscribe` 订阅，`resync` 后重取；取快照失败时按 1 秒起、最长 10 秒的退避间隔重试。每次打开对应一个控制对象，旧节点的请求返回后不作用于之后打开的节点。已打开的视图跟随节点能力变化：撤销 `open` 时取消订阅并只显示节点信息和面板，补上 `open` 时取快照；撤销 `subscribe` 只影响以后是否新建订阅，已建立的订阅保持到离开该节点，不补取快照（插件常在会话结束时撤销 `subscribe`，最终状态和最后几条输出晚于树更新到达，仍经这条订阅送来），之后的 `resync` 照常续订；补回 `subscribe` 时还没有订阅才从当前游标订阅，不重取快照；重取快照时，新快照的第一条在已加载的条目中就保留它之前已展开的更早历史（条目树只追加、`parentId` 不变，这些条目都是它的祖先），换了分支时不保留；`send` 能力变化时重取快照，插件只通过树节点改能力、不推 `pane_status` 时只读状态也随之更新；取快照期间（含首次打开）能力再次变化时，在途的快照可能早于这次变化，完成后再取一次。取快照在途时订阅送来的事件先存下：快照到达后按新游标应用，快照已包含的按重复忽略；取快照失败时直接应用到当前内容。同时撤销 `send` 和 `subscribe` 时重取的快照在途，最后几条输出和结束状态因此不丢。发送返回 `conflict` 时先结算（原文立即放回），同时重取快照；发送按钮等这份快照应用后才恢复可用，重发带上最新的 `controlRevision`，重取失败时提示并允许重发。停止只依赖 `abort`，没有 `open` 的节点也能停止 |
+| `components/Sidebar.tsx` | 待处理区、合并后的会话树、“＋”菜单、节点右键菜单、侧栏面板、拖动调整宽度（240–480px，保存在 localStorage；视口不超过 760px 时侧栏是固定 280px 的浮层，不显示拖动手柄）。点击会话打开会话视图；点击分组展开或折叠，有适用的节点面板时同时打开；点击资源打开适用的面板。没有名称和首条用户文本的主会话显示“（空会话）” |
+| `components/PluginSession.tsx` | 插件会话视图：面包屑、标题栏动作（最多 3 个，其余在“⋯”菜单）、输入框或只读条、停止（节点声明 `abort` 且会话没有结束时提供，含排队中的任务）。输入框的草稿、在途提交、待放回记录和提示与主会话共用（`components/ComposerDrafts.tsx`，见“取回草稿的交付”），会话 id 换成 `pluginDraftScope(来源, 节点 id)`。提交前把文字登记为在途提交，再清空输入框。`composer` 动作和普通发送（`sessions.send`）按同一个操作对象结算，规则与主会话一致：只有确定送达（`accepted`、动作 `ok`）时丢弃在途记录；确定没有执行（被拒、失败、控制状态冲突、放弃了后续表单）时原样放回；处理中、服务端等待插件超时、断网、浏览器超时时放回并标记为无法确认是否已经发送，另留“查询结果”：查到已送达时提示用户删去放回的文字，查到没有执行时只提示结果。首次结果回来前刷新或关闭页面时，在途记录由下次挂载该节点输入框的标签页按无法确认放回。代价是插件最终受理时输入框里多出一份原文，由用户删除。停止清出的文字放回该节点的输入框；从只读条停止时存成该节点的待放回记录，节点开放输入、输入框挂载时出现 |
+| `components/Panels.tsx` | 面板内容的内置渲染；节点面板（插件节点和主会话共用）；“详情”开关按浏览器记住，视口小于 1100px 时面板是从右侧滑出的抽屉 |
+| `components/PluginDialogs.tsx` | 表单弹窗、在场确认弹窗、页面顶部横幅（默认紧凑，超过 3 条时只显示前 2 条和“另有 N 条横幅”）、右上角通知与待查询的操作 |
+
+M3 不渲染 `timeline` 和 `steps` 两类面板，和不认识的类型一样显示“此面板需要更新的 pi-pane”。
 
 ## pane-bridge
 

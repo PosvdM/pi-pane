@@ -27,7 +27,7 @@ interface HostedSession {
   id: string; file: string; cwd: string; model: SessionModel; control: ControlQueue; handle?: DriverHandle; owner?: symbol;
   state?: any; name?: { value: string | undefined }; syncing?: Promise<void>; dirty: boolean; drafts: Map<string, DraftNode[]>;
   /** pi 队列的镜像，队列项关联发送时的原草稿，见 queue-mirror.ts。随写者和模型重建清空。 */
-  queued: QueueMirror; clients: number; lastActive: number;
+  queued: QueueMirror; clients: number; lastActive: number; opened: number;
   holds: Map<string, { source: string; reason: string }>; ui: Map<string, { request: PaneUiDialog; timer?: ReturnType<typeof setTimeout> }>; recentExternal: boolean; closed: boolean;
 }
 /** clear_queue 之前取的队列镜像与编码草稿记录副本。clear_queue 会先发出空的 queue_update，之后镜像和记录都已清空。 */
@@ -44,6 +44,7 @@ export class Sessions {
   private driver: RpcSubprocessDriver; private timer: ReturnType<typeof setInterval>; private projects = new Set<string>();
   private state: Record<string, unknown> = {};
   private storedById = new Map<string, StoredSession>();
+  private catalogScans = 0; private catalogCommitted = 0;
   private readonly mainListeners = new Set<() => void>();
   private readonly pluginHolds = new Map<string, Map<string, { source: string; reason: string }>>();
   private stateQueue = new ControlQueue();
@@ -135,7 +136,7 @@ export class Sessions {
     assert(!this.closing, "serverStopping", "服务端正在关闭", 503);
     const existing = this.files.get(fileKey(file)); if (existing) return this.view(existing);
     assert(!this.records.has(id), "sessionIdentityConflict", "另一个文件使用了相同的会话标识", 409);
-    const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), queued: emptyMirror(), clients: 0, lastActive: Date.now(), holds: this.holdsFor(id), ui: new Map(), recentExternal, closed: false };
+    const session: HostedSession = { id, file, cwd, model, control: new ControlQueue(), dirty: false, drafts: new Map(), queued: emptyMirror(), clients: 0, lastActive: Date.now(), opened: Date.now(), holds: this.holdsFor(id), ui: new Map(), recentExternal, closed: false };
     this.readName(session, parsed.entries);
     this.records.set(id, session); this.files.set(fileKey(file), session);
     this.watch(file); this.mainChanged();
@@ -164,9 +165,15 @@ export class Sessions {
    * 投影规则见 session-catalog.ts。
    */
   async refreshCatalog(): Promise<StoredSession[]> {
+    // 重叠的扫描可能逆序完成：只有比已提交的扫描更晚发起的结果才写入共享目录，避免较早的扫描回退名称、消息数和时间。
+    const scan = ++this.catalogScans;
     const rows = (await this.store.list([...this.projects])).map(toStoredSession).filter((row): row is StoredSession => !!row);
-    this.storedById = new Map(rows.map((row) => [row.id, row]));
-    this.mainChanged(); return rows;
+    if (scan > this.catalogCommitted) {
+      this.catalogCommitted = scan;
+      this.storedById = new Map(rows.map((row) => [row.id, row]));
+      this.mainChanged();
+    }
+    return rows;
   }
   /** 前端会话列表：存储目录中的每个文件一项，登记会话按文件匹配叠加实时状态。 */
   async list(): Promise<PaneSessionList> {
@@ -186,7 +193,7 @@ export class Sessions {
     return stored || session ? catalogEntry(id, stored, session && this.live(session)) : undefined;
   }
   private live(session: HostedSession): LiveSession {
-    return { file: session.file, cwd: session.cwd, ...(session.name ? { name: session.name } : {}), entries: session.model.entries, lastActive: session.lastActive,
+    return { file: session.file, cwd: session.cwd, ...(session.name ? { name: session.name } : {}), entries: session.model.entries, lastActive: session.lastActive, opened: session.opened,
       hosted: !!session.handle, status: session.model.status, holds: [...session.holds.values()].map((hold) => ({ ...hold })) };
   }
   private holdsFor(id: string): Map<string, { source: string; reason: string }> {

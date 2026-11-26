@@ -43,6 +43,7 @@ pi-pane 是否把每个插件放进独立的 worker 线程隔离，**待定**（
 // 草案，P0 后冻结
 export interface PanePlugin {
   id: string;                         // 即 TreeNode.source，如 "agora"；须符合“插件的加载”中的小写目录名规则
+  displayName?: string;               // 界面中显示的插件名称，1–64 个字符；省略时显示 id
   paneProtocol: [number, number];
   activate(ctx: PaneHostContext): Promise<void>;
   deactivate?(): Promise<void>;
@@ -81,6 +82,7 @@ export default function createPlugin(): PanePlugin;
 ```
 
 - `subscribe` 返回的函数用于取消订阅；浏览器全部断开后 pi-pane 会取消订阅。
+- `displayName` 显示在待处理区的分组标题、横幅、面板、通知和会话视图的来源标签上；不是字符串或长度不在 1–64 个字符之间时，pi-pane 忽略它并记录警告，改为显示 `id`。
 - 各方法的类型见下文对应章节。
 
 ## pi-pane 提供给插件的上下文
@@ -288,7 +290,7 @@ export interface TreeNode {
 
 - 每个主会话一个节点：`id = "pane:session:<piSessionId>"`、`source = "pane"`、`kind = "session"`。覆盖范围是 pi 会话存储中能列出的全部会话（见 [architecture.md](architecture.md#会话列表)），不只是正在托管的会话，所以插件可以把节点挂到任何一个主会话下。
 - 按项目（工作目录）分组：`id = "pane:project:<cwd 规范化后的哈希>"`、`kind = "group"`。
-- “未归属”分组：`id = "pane:group:unassigned"`。父节点是 pi-pane 列不出的主会话（例如终端里用 `--session-dir` 指定了别处的会话）时，插件节点进入这个分组。
+- “未归属”分组：`id = "pane:group:unassigned"`。父节点是 pi-pane 列不出的主会话（例如终端里用 `--session-dir` 指定了别处的会话）时，插件节点进入这个分组。插件也可以把节点直接挂在这个分组下（`parentId` 为它），这类冷节点的数目同样在 `foreignChildCounts` 中以该 id 报告，pi-pane 按普通父节点显示“历史（N）”，展开时对它调用 `tree.children()`（见“按需加载”）。
 
 ### 按需加载
 
@@ -296,7 +298,8 @@ export interface TreeNode {
 
 - `tree.snapshot(req)` 只返回“热节点”及其全部祖先。热节点是：`req.openNodeIds` 中的节点（浏览器里打开着的）、`status` 为 `running`、`waiting`、`paused` 的节点、`lastActivityAt` 晚于 `req.recentSince` 的节点。
 - 其余节点按需加载：用户展开某个节点时，pi-pane 调 `tree.children(parentId, page)` 分页取子节点。
-- 每个父节点下，已加载的子节点正常显示，没有加载的折叠为一行“历史（N）”（N 取自父节点的 `childCount`，未知时不显示数字），展开后分页加载。
+- 每个父节点下，已加载的子节点正常显示，没有加载的折叠为一行“历史（N）”（N 为父节点的 `childCount` 减去已加载的子节点数；`hasChildren` 为 true 而没有 `childCount` 时不显示数字），展开后分页加载。是否还有历史以分页游标为准，数目只是提示：某来源对该父节点已开始分页且还有下一页时一定显示“历史”，差值不大于 0 时不带数字；已分页到最后一页时，该来源不再贡献“历史”，即使差值大于 0。因此插件节点的 `childCount` 应是当前的子节点总数，子节点增减时随父节点的 `upsert` 更新。
+- 插件不能为其他来源的节点填写 `childCount` 和 `hasChildren`（例如 pi-pane 的主会话节点），因此在快照的 `foreignChildCounts` 中报告：键为其他来源的父节点 id，值为该插件挂在它下面的子节点总数，没有子节点的父节点不列出。pi-pane 把各来源的数目相加，决定主会话是否显示展开箭头和“历史（N）”，展开时对报告了数目的来源调用 `tree.children(parentId, page)`。数目以最近一次快照为准，订阅推来的新节点照常显示，总数在下一次快照（含 `reset` 之后的快照）时更新。不提供该字段的插件，其挂在其他来源节点下的冷节点只能在变为热节点后显示。
 
 ```ts
 // pane 协议 v1，草案，P0 后冻结
@@ -310,6 +313,7 @@ export interface TreeSnapshot {
   epoch: string;               // 修订号序列的标识；插件重建修订号序列时更换
   revision: number;            // 快照对应的来源级修订号
   nodes: TreeNode[];
+  foreignChildCounts?: Record<string, number>;  // 挂在其他来源节点下的子节点总数，键为父节点 id
 }
 
 export interface TreeCursor {
@@ -476,7 +480,8 @@ export interface PaneStatusEvent {
 ### 显示规则
 
 - 打开时调 `sessions.snapshot(ref)`，再以快照的 `cursor` 调 `sessions.subscribe`（节点带 `subscribe` 能力时）。
-- `readonly: true` 或节点没有 `send` 能力时不显示输入框；`readonlyReason = externalWriter` 时显示“该会话可能正在别处运行”和“Fork 为新会话”按钮。
+- 节点撤销 `subscribe` 时，pi-pane 不取消已建立的订阅，只是不再为该节点新建订阅；订阅保持到用户离开该会话视图，期间的 `resync` 照常按新快照的游标续订。协议没有结束事件流的消息，插件不再推送事件即为流结束，所以会话结束时最后几条事件可以晚于撤销 `subscribe` 的树更新送出。插件停用时 pi-pane 服务端释放该插件的全部订阅，浏览器收到插件列表变化后重读插件目录和树。
+- `readonly: true` 或节点没有 `send` 能力时不显示输入框；`readonlyReason = externalWriter` 时显示“该会话可能正在别处运行”。pi-pane 自己的主会话另有“Fork 为新会话”按钮；插件会话没有会话文件，协议也没有 fork 方法，所以不显示该按钮，插件需要时可以声明一个节点动作。
 - `unfinishedPartials` 显示在对话末尾，标注“中断时正在生成的内容”，按块类型分别显示思考、文字和工具调用。
 - 节点的 `action:*` 能力显示为视图顶部的按钮。
 
@@ -517,7 +522,7 @@ export interface SessionAbortRequest { clearQueue: boolean; origin: RequestOrigi
 ```
 
 - 节点有 `send` 能力时，输入框提交调用 `sessions.send`；节点同时有 `composer` 时改为调用 `composer.actionId` 指定的动作，`target` 为该节点，文字放在 `input.fields.message`。例如 pi-agora 把“对子代理发消息”映射到自己的 steer 动作。`composer.images` 不为 `true` 时输入框禁用图片。
-- 节点有 `abort` 能力时显示“停止”按钮。“停止”的语义是取消，`clearQueue: true`：插件先清空队列再中止，把清出的文本放进 `clearedText`，pi-pane 放回输入框。语义与主会话一致，见 [architecture.md](architecture.md#停止与控制队列)。
+- 节点有 `abort` 能力时显示“停止”按钮，包括排队中、还没有运行进程的会话；会话视图显示的状态已是 `done`、`failed`、`stopped` 或 `interrupted` 时不显示（会话事件可能先于节点能力的更新到达）。“停止”的语义是取消，`clearQueue: true`：插件先清空队列再中止，把清出的文本放进 `clearedText`，pi-pane 放回输入框。语义与主会话一致，见 [architecture.md](architecture.md#停止与控制队列)。
 
 ### 自定义消息
 
@@ -606,6 +611,7 @@ export interface StepItem {            // 有先后顺序的阶段，如会议�
 }
 ```
 
+- pi-pane 按 `(source, id)` 区分面板，不同插件的同名面板各自记录修订号和角标；服务端推给浏览器的 `panel` 帧带来源（M3 的 pane v1 兼容扩展，不改变 `ctx.panelChanged()` 的签名）。
 - `sidebar` 面板显示在侧栏树下方，标题带角标；`node` 面板在打开符合 `appliesTo` 的节点时显示在会话视图右侧（group 和 resource 节点时代替会话视图）。没有 `appliesTo` 的 `node` 面板适用于该插件自己的全部节点。
 - 内容按需拉取：显示时调用 `panels.content()`。插件调用 `ctx.panelChanged()` 推送变化：带 `badgeCount` 时立即更新角标；正在显示且受影响的面板重新拉取。
 - 每种 `type` 由 pi-pane 内置组件渲染；`timeline` 支持向上加载更多。不认识的 `type` 显示“此面板需要更新的 pi-pane”。
@@ -753,6 +759,7 @@ export type FormRemovedReason = "handled" | "cancelled" | "expired" | "withdrawn
 - **待处理区**：侧栏只有一个“待处理”区，列出所有插件的持久表单，按插件分组，标题带总数角标。插件不另做“待处理”面板。
 - **排序**：组内按 `(createdAt 升序, id 升序)` 排列，这是一个稳定的全序。`forms.pending()` 按同一顺序返回；待处理区不按到达顺序排列，`formAdded` 推来的新表单按 `createdAt`、`id` 插入对应位置，同一 `id` 的更新保持原位置。
 - **新增和更新**：插件调用 `ctx.formAdded(form)`；同一 `id` 的更高 `revision` 替换旧版本，较低或相同的 `revision` 忽略，正在填写的用户看到“表单已更新”提示。
+- **节点上的标记**：表单的 `nodeId` 指向会话树中已显示的节点时，pi-pane 在该节点上显示待处理事项数，打开该节点的会话视图时在顶部列出这些事项和“处理”入口。标记由 pi-pane 根据待处理区的内容推导，插件不需要另外提供。
 - **对齐**：pi-pane 在启动、收到该插件的树 `reset`、每次浏览器连接或重连时调用 `forms.pending()`，以它的结果为准重建该插件的列表：结果里没有的表单移除，`revision` 更高的替换。插件在后台重连后应发树 `reset`，宿主据此对齐表单；没有浏览器订阅时，列表在下次浏览器连接时对齐。同一插件的并发对齐合并为一次查询，某个插件的异常不阻塞其他插件或主会话。对齐期间收到的 `formAdded`/`formRemoved` 在对齐完成后按 `revision` 规则再应用一遍。
 - **关闭显示（dismiss）**：弹窗右上角的“稍后处理”只关闭弹窗，表单留在待处理区，不通知插件，也不是提交结果。
 - **取消（cancel）**：表单带 `cancel` 时显示该按钮，点击后提交 `{ status: "cancelled" }`，这是一个业务结果（如拒绝请求），插件不得当作同意。

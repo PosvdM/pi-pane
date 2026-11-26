@@ -82,17 +82,17 @@ test("MainTree 历史分页使用 keyset，游标绑定父节点及 epoch", asyn
   const snap = await tree.snapshot(request());
   const parentId = snap.nodes.find((node) => node.childCount === 4).id;
   const first = await tree.children(parentId, { epoch: snap.epoch, limit: 2 });
-  assert.deepEqual(first.nodes.map((node) => node.sortKey), ["a", "c"]);
+  assert.deepEqual(first.nodes.map((node) => node.sessionRef.id), ["a", "c"]);
   assert.equal(typeof first.nextCursor, "string");
   // 删除前页节点并在切点两侧插入节点，后页仍从原来的排序键继续。
   await directory.set(["b", "c", "d", "e", "g"].map((id) => row(id)));
   const second = await tree.children(parentId, { epoch: snap.epoch, cursor: first.nextCursor, limit: 2 });
-  assert.deepEqual(second.nodes.map((node) => node.sortKey), ["d", "e"]);
+  assert.deepEqual(second.nodes.map((node) => node.sessionRef.id), ["d", "e"]);
   const last = await tree.children(parentId, { epoch: snap.epoch, cursor: second.nextCursor, limit: 2 });
-  assert.deepEqual(last.nodes.map((node) => node.sortKey), ["g"]);
+  assert.deepEqual(last.nodes.map((node) => node.sessionRef.id), ["g"]);
   assert.equal(last.nextCursor, undefined);
   for (const invalidCursor of ["%", Buffer.from("{}").toString("base64url"),
-    Buffer.from(JSON.stringify({ epoch: "旧代", parentId, after: "c" })).toString("base64url")]) {
+    Buffer.from(JSON.stringify({ epoch: "旧代", parentId, after: "~c" })).toString("base64url")]) {
     await assert.rejects(tree.children(parentId, { epoch: snap.epoch, cursor: invalidCursor, limit: 2 }),
       { code: "invalidTreeCursor" });
   }
@@ -235,4 +235,16 @@ test("MainTree 拒绝无效快照、分页和订阅参数", async (t) => {
   for (const revision of [-1, 0.5, NaN]) {
     assert.throws(() => tree.subscribe({ epoch: snap.epoch, revision }, () => {}), { code: "invalidCursor" });
   }
+});
+
+test("MainTree 会话节点按修改时间从新到旧排列并附带侧栏信息，没有时间的排在最后", async (t) => {
+  const at = (minutes) => new Date(Date.UTC(2026, 0, 1, 0, minutes)).toISOString();
+  const session = (id, modifiedAt) => ({ sessionFile: `/tmp/${id}.jsonl`, cwd: "/tmp", ...(modifiedAt ? { modifiedAt } : {}), stored: true, untitled: false });
+  const rows = [row("old", { session: session("old", at(1)) }), row("new", { session: session("new", at(9)) }), row("none", { session: session("none") }), row("mid", { session: session("mid", at(5)) })];
+  const { tree } = setup(t, rows);
+  const snap = await tree.snapshot(request());
+  const parentId = snap.nodes.find((node) => node.childCount === 4).id;
+  const page = await tree.children(parentId, { epoch: snap.epoch, limit: 10 });
+  assert.deepEqual(page.nodes.map((node) => node.sessionRef.id), ["new", "mid", "old", "none"]);
+  assert.deepEqual(page.nodes[0].paneSession, session("new", at(9)));
 });

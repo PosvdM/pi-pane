@@ -31,6 +31,10 @@ export interface ChoiceDialog {
   resolve: (value: string | null) => void;
 }
 export const choice = new Store<ChoiceDialog | null>(null);
+/** 应用内的“确定/取消”确认，代替会阻塞页面（含 WebSocket 心跳）的 window.confirm()。 */
+export async function confirmInApp(message: string, danger = false): Promise<boolean> {
+  return (await ask("请确认", message, [{ label: "取消", value: "cancel" }, { label: "确定", value: "ok", ...(danger ? { danger: true } : { primary: true }) }])) === "ok";
+}
 export function ask(title: string, message: string, choices: ChoiceDialog["choices"]): Promise<string | null> {
   return new Promise((resolve) => {
     choice.get()?.resolve(null);
