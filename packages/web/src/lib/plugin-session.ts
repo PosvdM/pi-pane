@@ -1,7 +1,7 @@
 // 打开的插件节点：会话节点按能力取快照（open）并订阅事件（subscribe），group 和 resource 节点只显示面板（plugin-api.md“会话视图”“面板”）。
 import { api, newId } from "./api.ts";
 import type { OpState, OpStep, OpText } from "./operation.ts";
-import { newOperation, requestFailed } from "./plugin-ui.ts";
+import { newOperation, pluginRequestSignal, requestFailed } from "./plugin-ui.ts";
 import { apply, fromSnapshot, keepLoadedHistory, prependHistory, type ModelState } from "./session-model.ts";
 import { Store } from "./store.ts";
 import { pinNode } from "./tree.ts";
@@ -31,7 +31,7 @@ interface Opened {
   /** 会话节点的引用；停止（abort）不依赖 open 能力，没有 open 时也保留。 */
   ref?: SessionRef;
   open: boolean;           // 是否取快照（节点有 open 能力）
-  live: boolean;           // 是否订阅实时流（节点同时有 open 和 subscribe 能力）
+  live: boolean;           // 是否新建实时订阅（节点同时有 open 和 subscribe 能力）；已建立的订阅不随它撤销
   send: boolean;           // 节点有 send 能力；变化时快照中的 readonly 可能已过时
   unsubscribe: (() => void) | null;
   reloading: Promise<void> | null;
@@ -69,8 +69,9 @@ export async function openPluginNode(node: TreeNode): Promise<void> {
 /**
  * 节点能力变化时调整已打开的视图（plugin-api.md 的能力表）：
  * - 撤销 open：取消订阅、丢掉已显示的内容，改为只显示节点信息和面板；补上 open：取快照，有 subscribe 时订阅。
- * - 不再提供实时流（如任务结束）就取消订阅，并补取一次快照：插件常在结束时撤销 subscribe，最终状态和最后几条输出可能
- *   晚于树更新到达，退订后就收不到了。重取快照保留已加载的更早历史（keepLoadedHistory）。开始提供实时流时从当前游标订阅，不重取快照；
+ * - 撤销 subscribe 只影响以后是否新建订阅，已建立的订阅保持到用户离开该节点（plugin-api.md“显示规则”）：插件常在会话结束时
+ *   撤销 subscribe，最终状态和最后几条输出可能晚于树更新到达，仍经这条订阅送来；之后的 resync 照常按新游标续订这条订阅。
+ *   补回 subscribe 时还没有订阅（打开时节点就没有 subscribe）才从当前游标订阅，不重取快照。
  * - send 能力有变化（如接管后开放输入）时重取快照：插件可能只通过树节点改能力、不在会话流里推 pane_status，
  *   快照中的 readonly 随之更新。
  */
@@ -92,11 +93,11 @@ export function syncCapabilities(node: TreeNode): void {
   if (!open) return;
   if (live !== o.live) {
     o.live = live;
-    // 撤销时取消订阅并补取快照，得到退订后才到的最终状态；补上时从当前游标订阅，
-    // 插件按游标重放其间的事件，接不上时推 resync（plugin-api.md“事件流”）。
-    if (!live) { o.unsubscribe?.(); o.unsubscribe = null; void reload(o); }
-    else if (o.reloading) o.again = true;  // 取快照在途：可能已越过订阅的判断，完成后再取一次并订阅
-    else if (pluginView.get()?.model && !o.unsubscribe) subscribeLive(o);
+    // 补上时还没有订阅就从当前游标订阅，插件按游标重放其间的事件，接不上时推 resync（plugin-api.md“事件流”）。
+    if (live && !o.unsubscribe) {
+      if (o.reloading) o.again = true;  // 取快照在途：可能已越过订阅的判断，完成后再取一次并订阅
+      else if (pluginView.get()?.model) subscribeLive(o);
+    }
   }
   if (!sendChanged) return;
   // send 变化时快照中的 readonly 可能已过时，重取。首次快照还没返回时也要重取：在途的快照可能早于这次能力变化（refresh 完成后再取一次）。
@@ -136,9 +137,9 @@ function refresh(o: Opened): Promise<void> {
       });
       o.retries = 0;
     } while (o.again);
-    if (!o.live) return;
+    // 已建立的订阅（含撤销 subscribe 之后保留的）按新游标续订；没有订阅时只在节点有 subscribe 能力时新建。
     if (o.unsubscribe) ws.resubscribe(ref);
-    else subscribeLive(o);
+    else if (o.live) subscribeLive(o);
   })().finally(() => {
     // 循环结束到这里之间（含订阅阶段）到达的重取请求只设了标记，在这里补取。
     o.reloading = null;
@@ -179,8 +180,9 @@ export async function loadOlder(): Promise<void> {
 /**
  * 向插件会话发消息（节点有 send 能力、没有 composer 时）。每次发送是一个操作对象（operation.ts）：首次响应和之后每次
  * “查询结果”都由它结算，查询沿用同一个幂等键和同样的内容（plugin-api.md“幂等规则”）。只有 accepted 确定送达；
- * 其余结果（rejected、conflict、idempotencyConflict、请求被拒、pending 含服务端等待超时、断网、超时）都在首次响应时把原文放回，
- * pending 和结果未知留下查询入口。查询请求本身失败（断网、403 等）只说明这次查询没有成功。text 为提交时移出输入框的原文。
+ * 其余结果（rejected、conflict、idempotencyConflict、请求被拒、pending 含服务端等待超时、断网、浏览器超时）都在首次响应时把原文放回，
+ * pending 和结果未知留下查询入口。查询请求本身失败（断网、超时、403 等）只说明这次查询没有成功。
+ * text 为提交时移出输入框、已登记为在途提交的原文。
  */
 export function sendToPlugin(value: string, delivery: "steer" | "followUp" | undefined, text: OpText): Promise<OpState> {
   const o = opened; const view = pluginView.get();
@@ -190,13 +192,14 @@ export function sendToPlugin(value: string, delivery: "steer" | "followUp" | und
   const attempt = async (query: boolean): Promise<OpStep> => {
     if (!o || !ref) return { state: "notRun" };
     let result: SendResult;
-    try { result = await api<SendResult>(sessionPath(ref, "send"), { ...body, connectionId: ws.link.get().connectionId }); }
+    try { result = await api<SendResult>(sessionPath(ref, "send"), { ...body, connectionId: ws.link.get().connectionId }, pluginRequestSignal()); }
     catch (error) { return requestFailed(error, query); }
     switch (result.status) {
       case "accepted": return { state: "done" };
       case "pending": return { state: "pending", ...((result as { message?: string }).message ? { message: (result as { message?: string }).message } : {}) };
       case "conflict":
-        await reload(o);
+        // 先结算（原文立即放回），再重取快照，用户按最新状态决定是否重发；不等快照返回。
+        void reload(o);
         return { state: "notRun", ...(isCurrent(o) ? { message: result.message ?? "会话状态已变化，请确认后重新发送" } : {}) };
       default: return { state: "notRun", message: result.message };
     }

@@ -223,6 +223,13 @@ export async function answerPresence(request: PanePresenceRequest, confirm: bool
   return respondPresence(request, { proof });
 }
 
+/**
+ * 浏览器等待一次插件操作请求（发消息、动作、提交表单及其查询）的最长时间。服务端等待插件最多 60 秒（plugin-api.md“运行方式与超时”），
+ * 到时返回结果未知；这里再留出余量，只在响应挂起（服务端已返回而响应没有到达、连接卡住）时生效，按结果未知结算。
+ */
+export const PLUGIN_REQUEST_TIMEOUT_MS = 75_000;
+export const pluginRequestSignal = () => AbortSignal.timeout(PLUGIN_REQUEST_TIMEOUT_MS);
+
 const unknownResult = (error: unknown) => error instanceof ApiError && (error.code === "network" || error.code === "pluginTimeout" || error.status === 504);
 /**
  * 操作的请求抛错时的结算：断网和超时结果未知；查询时的其他错误（如 WebSocket 重连期间的 403 invalidOrigin）
@@ -243,7 +250,7 @@ export async function submitForm(form: FormSpec, outcome: FormOutcome, retry?: F
   const clear = () => formBusy.set((s) => { const next = { ...s }; delete next[key]; return next; });
   let result: FormSubmitResult;
   if (!retry) busy("submitting");
-  try { result = await api<FormSubmitResult>(pluginPath(form.source, `forms/${encodeURIComponent(form.id)}`), body); }
+  try { result = await api<FormSubmitResult>(pluginPath(form.source, `forms/${encodeURIComponent(form.id)}`), body, pluginRequestSignal()); }
   catch (error) {
     if (unknownResult(error)) { busy("unknown", "结果未知"); return true; }
     // 查询时请求被拒（如 WebSocket 重连期间的 403 invalidOrigin）：失败的是这次查询，已提交的结果仍未确定，保留进行中状态。
@@ -320,7 +327,7 @@ function actionOperation(first: Call, onOpenNode?: (nodeId: string) => void, tex
           idempotencyKey: call.key, connectionId: ws.link.get().connectionId,
           ...(call.target ? { target: call.target } : {}), ...(call.input ? { input: call.input } : {}),
           ...(call.formId ? { formId: call.formId, formRevision: call.formRevision } : {}),
-        });
+        }, pluginRequestSignal());
       } catch (error) { return requestFailed(error, query); }
       switch (result.status) {
         case "ok": if (result.openNodeId) onOpenNode?.(result.openNodeId); return { state: "done", message: result.message ?? `已${spec.title}` };

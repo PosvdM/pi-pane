@@ -2,14 +2,18 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { nodeLabel, openFromResult, openNodeById } from "../lib/navigate.ts";
 import { abortPlugin, loadOlder, pluginView, sendToPlugin, syncCapabilities } from "../lib/plugin-session.ts";
-import { restoreText, splitActions } from "../lib/plugin-state.ts";
+import { splitActions } from "../lib/plugin-state.ts";
+import { plainText } from "../lib/draft.ts";
+import type { OpText } from "../lib/operation.ts";
+import { beginSubmit, clearNotice, deliverRestored, finishSubmit, pluginDraftScope } from "../lib/restored.ts";
 import { formKey, forms, invokeAction, openForm, runAction, sortedForms } from "../lib/plugin-ui.ts";
 import { actionSpec, pluginName } from "../lib/plugins.ts";
 import { settings } from "../lib/settings.ts";
-import { Store, useStore } from "../lib/store.ts";
+import { useStore } from "../lib/store.ts";
 import { findNode, trees } from "../lib/tree.ts";
 import { toast } from "../lib/ui-state.ts";
-import type { ActionSpec, NodeStatus, TreeNode } from "../lib/types.ts";
+import type { ActionSpec, DraftNode, NodeStatus, TreeNode } from "../lib/types.ts";
+import { DraftNotices, useComposerDrafts } from "./ComposerDrafts.tsx";
 import { EntryView, MessageView, StreamingBlocks, toolKey, type ToolContext } from "./Message.tsx";
 import { DetailsButton, NodePanels, useDetails, useNodePanels } from "./Panels.tsx";
 import { nodeActions, STATUS_TEXT, StatusIcon } from "./Sidebar.tsx";
@@ -60,32 +64,18 @@ function HeadActions({ node, actions }: { node: TreeNode; actions: ActionSpec[] 
   );
 }
 
-/**
- * 插件会话输入框里尚未提交的文字，按节点保存：切换节点再回来时还在，提交没有确定送达时即使已切换到其他节点也能放回原节点。
- * 同时写入本标签页的 sessionStorage，刷新页面后仍在（放回输入框的原文也随之保留）；不可用或写入失败时只保存在内存中。
- */
-const DRAFTS_KEY = "pi-pane.pluginDrafts";
-function storedDrafts(): Record<string, string> {
-  try {
-    const value = JSON.parse(sessionStorage.getItem(DRAFTS_KEY) ?? "{}");
-    return value && typeof value === "object" ? Object.fromEntries(Object.entries(value).filter(([, v]) => typeof v === "string")) as Record<string, string> : {};
-  } catch { return {}; }
-}
-const drafts = new Store<Record<string, string>>(storedDrafts());
-drafts.subscribe(() => {
-  try { sessionStorage.setItem(DRAFTS_KEY, JSON.stringify(Object.fromEntries(Object.entries(drafts.get()).filter(([, v]) => v)))); }
-  catch { /* 只保存在内存中。 */ }
-});
-const setDraft = (nodeId: string, update: (value: string) => string) => drafts.set((all) => ({ ...all, [nodeId]: update(all[nodeId] ?? "") }));
+/** 插件会话输入框是纯文本：草稿节点与文字互转。 */
+const textNodes = (text: string): DraftNode[] => text ? [{ type: "text", text }] : [];
 
 /**
- * 停止的语义是取消：清出的待发文本按原顺序放回该节点的输入框（plugin-api.md“向会话发消息与停止”）。
- * 从只读条停止时输入框不在，文字同样存进该节点的草稿，节点之后开放输入时出现在输入框里。
+ * 停止的语义是取消：清出的待发文本按原顺序放回该节点的输入框（plugin-api.md“向会话发消息与停止”），
+ * 与主会话一样按“取回草稿的交付”放回：输入框挂载时直接放在现有内容之前；从只读条停止时输入框不在，
+ * 存成该节点的待放回记录，节点之后开放输入、输入框挂载时出现。
  */
-async function stopNode(nodeId: string, readonly = false): Promise<void> {
+async function stopNode(node: TreeNode, readonly = false): Promise<void> {
   const cleared = await abortPlugin();
   if (!cleared?.length) return;
-  setDraft(nodeId, (value) => [...cleared, value].filter(Boolean).join("\n"));
+  deliverRestored(localStorage, pluginDraftScope(node.source, node.id), cleared.map((text) => ({ nodes: textNodes(text), uncertain: false })));
   if (readonly) toast("已停止，清出的待发消息已存入该会话的输入框，开放输入后可以继续编辑");
 }
 
@@ -93,22 +83,42 @@ async function stopNode(nodeId: string, readonly = false): Promise<void> {
 const ENDED = new Set<NodeStatus>(["done", "failed", "stopped", "interrupted"]);
 
 function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: boolean; canAbort: boolean }) {
-  const text = useStore(drafts)[node.id] ?? "";
+  // 草稿、在途提交和放回与主会话的输入框共用一套（ComposerDrafts.tsx、restored.ts），按 pluginDraftScope 区分节点。
+  const scope = pluginDraftScope(node.source, node.id);
+  const [text, setText] = useState("");
+  const latest = useRef("");
+  const put = (value: string) => { latest.current = value; setText(value); };
+  const drafts = useComposerDrafts(scope, {
+    read: () => textNodes(latest.current),
+    set: (nodes) => put(plainText(nodes)),
+    show: (nodes) => put(plainText(nodes)),
+  });
   const [busy, setBusy] = useState(false);
   const [delivery, setDelivery] = useState<"steer" | "followUp">("steer");
   const composer = node.composer;
   const action = composer && actionSpec(node.source, composer.actionId);
-  const stop = () => void stopNode(node.id);
+  const stop = () => void stopNode(node);
+  const edit = (value: string) => {
+    put(value); drafts.changed(textNodes(value));
+    if (!value.trim()) clearNotice(localStorage, scope);
+  };
   /**
-   * 提交即清空：文字移出输入框后发出请求，等待期间输入框可以继续输入。之后由操作对象（operation.ts）结算：
-   * 确定没有执行（被拒、冲突、放弃了附带的表单）或结果未知（断网、超时）时，原文不在输入框就放回到当前内容之前，
-   * 只放一次；处理中时不放回，留下“查询结果”；已放回后查到已送达时提示删去。动作和普通发送（sessions.send）走同一套。
+   * 提交即清空：文字先登记为在途提交（beginSubmit），再移出输入框、发出请求，等待期间输入框可以继续输入。
+   * 之后由操作对象（operation.ts）在首次结算时交出原文：确定送达时丢弃在途记录；其余结果按 finishSubmit 放回该节点的输入框，
+   * 放在期间新写的内容之前。首次结算前刷新或关闭页面时，在途记录由下次挂载的输入框按无法确认放回。动作和普通发送（sessions.send）走同一套。
    */
   const submit = async () => {
-    const value = text.trim(); if (!value || busy) return;
+    const value = latest.current.trim(); if (!value || busy) return;
     if (composer && !action) { toast("插件没有声明输入框使用的动作", "error"); return; }
-    setDraft(node.id, () => ""); setBusy(true);
-    const original = { restore: () => setDraft(node.id, (current) => restoreText(value, current)) };
+    const flight = beginSubmit(localStorage, scope, textNodes(value));
+    put(""); drafts.changed([]); drafts.flush(); setBusy(true);
+    const original: OpText = {
+      settle: (end) => {
+        // 送达一条消息即视为用户已处理之前放回的归属不明草稿；等待期间新放回的不受影响。
+        if (end === "sent") clearNotice(localStorage, scope, flight.at);
+        finishSubmit(localStorage, flight, end);
+      },
+    };
     // 结果带 openNodeId 时，发起后用户已切换到其他节点就不跳转，只提示。
     const onOpenNode = openFromResult();
     try {
@@ -119,11 +129,12 @@ function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: 
   };
   return (
     <div class="composer-wrap" data-testid="plugin-composer">
+      <DraftNotices sessionId={scope} />
       {action && <div class="composer-hint">发送的文字作为“{action.title}”提交给 {pluginName(node.source)}</div>}
       <div class="composer">
         <textarea class="editor plain-editor" data-testid="plugin-editor" rows={2} value={text} placeholder={composer?.placeholder ?? "输入消息，Enter 发送，Shift+Enter 换行"}
           aria-busy={busy ? "true" : undefined}
-          onInput={(e) => { const value = e.currentTarget.value; setDraft(node.id, () => value); }}
+          onInput={(e) => edit(e.currentTarget.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); void submit(); } }} />
         <div class="composer-actions">
           {!composer && running && (
@@ -153,13 +164,14 @@ export function PluginSessionView() {
   const model = view.model;
   const inFlight = model?.view.inFlight;
   const completed = inFlight?.completed ?? [];
+  // 每次取快照都换一个新模型，版本号从 0 重新开始：依赖里要有模型本身，换了快照才会重算。
   const ctx: ToolContext = useMemo(() => {
     const results = new Map<string, any>();
     for (const entry of model?.entries ?? []) if (entry.type === "message" && entry.message?.role === "toolResult") results.set(entry.message.toolCallId, entry.message);
     for (const message of completed as any[]) if (message?.role === "toolResult") results.set(message.toolCallId, message);
     const running = new Map((inFlight?.tools ?? []).map((t) => [t.toolCallId, { partialResult: t.partialResult }]));
     return { results, running, showHidden: prefs.showHidden, ...(view.ref ? { sessionRef: view.ref } : {}) };
-  }, [model?.version, prefs.showHidden, view.ref?.id]);
+  }, [model, model?.version, prefs.showHidden, view.ref?.id]);
   useLayoutEffect(() => { const el = scroller.current; if (el && stick.current) el.scrollTop = el.scrollHeight; });
   useEffect(() => { stick.current = true; }, [view.nodeId]);
   const capabilities = node?.capabilities.join(" ");
@@ -224,7 +236,7 @@ export function PluginSessionView() {
         {canSend ? <PluginComposer key={node.id} node={node} running={running} canAbort={canAbort} /> : (
           <div class="readonly-bar" data-testid="plugin-readonly">
             <span data-testid="plugin-readonly-reason">只读：{readonlyText}</span>
-            {canAbort && <button class="btn danger small-btn" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stopNode(node.id, true)}>停止</button>}
+            {canAbort && <button class="btn danger small-btn" data-testid="plugin-stop" title="取消当前运行并清空队列" onClick={() => void stopNode(node, true)}>停止</button>}
           </div>
         )}
         <div class="statusbar" data-testid="plugin-statusbar">{(model?.detail ?? node.statusDetail) && <span>{model?.detail ?? node.statusDetail}</span>}<span>来源：{pluginName(node.source)}</span></div>

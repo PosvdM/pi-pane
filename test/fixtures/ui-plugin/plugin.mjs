@@ -19,6 +19,7 @@ export default function createPlugin() {
   const calls = { invoke: [], submit: [], send: [], abort: 0, resolveForm: 0, presence: [], subscribe: [] };
   let slowRelease;
   let noteRelease;
+  let sendRelease;
   let branches = 0;
 
   const node = (id, extra) => ({ id, source: "uitest", kind: "session", parentId: null, title: id, status: "idle", availability: "online",
@@ -77,19 +78,6 @@ export default function createPlugin() {
     listening(id) { return session(id).listeners.size; },
     /** 会话事件流当前的 seq。 */
     seq(id) { return session(id).seq; },
-    /**
-     * 会话结束：追加最后一条输出和结束状态，记入事件日志（续订和快照能取到），但不推给当前订阅，
-     * 模拟会话流的最后几帧晚于撤销 subscribe 的树更新到达、退订后就收不到了。
-     */
-    endQuietly(id, status, text) {
-      const s = session(id);
-      const entry = { type: "message", id: "e" + (s.entries.length + 1), parentId: s.entries.at(-1)?.id ?? null, timestamp: now(),
-        message: { role: "assistant", content: [{ type: "text", text }], timestamp: Date.now(), stopReason: "stop" } };
-      s.entries.push(entry); s.status = status;
-      for (const event of [{ type: "pane_entries", entries: [entry], leafId: entry.id }, { type: "pane_status", status, phase: "idle" }]) {
-        s.seq++; s.log.push({ ref: { source: "uitest", id }, cursor: { epoch: STREAM, seq: s.seq }, event });
-      }
-    },
     /** 换掉会话的当前分支：快照只给 current，更早的 older 要点“加载更早的消息”取得。 */
     branch(id, older, current) {
       const s = session(id);
@@ -112,8 +100,12 @@ export default function createPlugin() {
     releaseSlow() { slowRelease?.(); },
     /** 下一次取快照失败的次数（模拟后台离线）。 */
     failSnapshots: 0,
-    /** 普通发送（sessions.send）的结果：ok 受理并回显；pending 已受理仍在处理，之后由 finishPending 给出最终结果。 */
+    /**
+     * 普通发送（sessions.send）的结果：ok 受理并回显；pending 已受理仍在处理，之后由 finishPending 给出最终结果；
+     * conflict 控制状态冲突；hold 等 releaseSend 给出结果（省略时受理并回显），等待期间同一个键的查询得到 pending。
+     */
     sendMode: "ok",
+    releaseSend(result) { sendRelease?.(result); },
     /** 输入框动作 uitest.note 的结果：ok、reject、pending、slow（超过动作超时）、hold（等 releaseNote）、holdOpen（等 releaseNote 后返回 openNodeId）、needsInput。 */
     composerMode: "ok",
     releaseNote() { noteRelease?.(); },
@@ -177,6 +169,11 @@ export default function createPlugin() {
         calls.send.push({ ref, input, key: req.idempotencyKey });
         return respond(req.idempotencyKey, JSON.stringify([ref, input]), async () => {
           if (control.sendMode === "pending") return { status: "pending" };
+          if (control.sendMode === "conflict") return { status: "conflict", controlRevision: 1, message: "会话状态已变化" };
+          if (control.sendMode === "hold") {
+            const result = await new Promise((resolve) => { sendRelease = resolve; });
+            if (result) return result;
+          }
           control.append(ref.id, "收到：" + input.text); return { status: "accepted" };
         });
       },

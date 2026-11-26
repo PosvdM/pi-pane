@@ -4,7 +4,7 @@ import { fromSnapshot, apply, prependHistory, keepLoadedHistory } from "../packa
 import { normalize, plainText, prependDrafts, displayQueued, parseSlash, isEmpty, imageIds } from "../packages/web/src/lib/draft.ts";
 import { canonicalize, JcsError } from "../packages/web/src/lib/jcs.ts";
 import { SourceTree, TreePins, MAX_OPEN_NODE_IDS, isHot, childrenAcross, hiddenChildren, missingParents, orphanHistory, unassigned } from "../packages/web/src/lib/tree-state.ts";
-import { addNotificationTo, clampSidebar, restoreText, sortBanners, splitActions, visibleBanners } from "../packages/web/src/lib/plugin-state.ts";
+import { addNotificationTo, clampSidebar, sortBanners, splitActions, visibleBanners } from "../packages/web/src/lib/plugin-state.ts";
 import { SessionModel } from "../packages/server/dist/model.js";
 import { NUMBER_VECTORS, hexToDouble, SAMPLE_INPUT, SAMPLE_OUTPUT, SORT_INPUT, SORT_EXPECTED_OUTPUT } from "./fixtures/jcs-vectors.mjs";
 
@@ -297,6 +297,17 @@ test("“未归属”与普通父节点同一规则：分页还有下一页时�
   // 父节点在树里、被跳过（正在补取或来源还没有快照）的不计入。
   const present = forest([["pane", { nodes: [treeNode("pane", "pane:session:1", null)] }], ["a", { nodes: [], foreignChildCounts: { "pane:session:1": 3, "pane:session:x": 1 } }]]);
   assert.deepEqual(orphanHistory(present, (id) => id === "pane:session:x"), { count: 0, unknown: false, parents: [] });
+  // 插件报告直接挂在“未归属”分组下的冷节点：分组在 pi-pane 的树里，也按普通父节点计入“历史”，展开时对该分组分页；分页游标优先。
+  const group = forest([
+    ["pane", { nodes: [treeNode("pane", "pane:group:unassigned", null, { kind: "group", hasChildren: false })] }],
+    ["a", { nodes: [treeNode("a", "a:hot", "pane:group:unassigned")], foreignChildCounts: { "pane:group:unassigned": 3 } }],
+  ]);
+  assert.deepEqual(orphanHistory(group, () => true), { count: 2, unknown: false, parents: [["a", "pane:group:unassigned"]] }, "扣除快照里的热节点，不受 skip 影响");
+  group.get("a").mergePage("pane:group:unassigned", [treeNode("a", "a:hot", "pane:group:unassigned"), treeNode("a", "a:c1", "pane:group:unassigned"), treeNode("a", "a:c2", "pane:group:unassigned")], 6, "2");
+  assert.deepEqual(orphanHistory(group, () => false), { count: 0, unknown: true, parents: [["a", "pane:group:unassigned"]] }, "还有下一页，入口不消失");
+  group.get("a").mergePage("pane:group:unassigned", [treeNode("a", "a:c3", "pane:group:unassigned")], 6);
+  assert.deepEqual(orphanHistory(group, () => false), { count: 0, unknown: false, parents: [] }, "分页到底");
+  assert.equal(unassigned(group, group.get("a").nodes.get("a:c3")), true, "分页取到的节点显示在“未归属”里");
 });
 
 test("重取快照保留已加载的更早历史：新快照的第一条在旧模型中时接上更早的条目，换了分支时不保留", () => {
@@ -417,7 +428,7 @@ test("通知：自动消失的最多 5 条，error 与 sticky 不被挤掉；同
   assert.equal(addNotificationTo(list, n("e1", "error")), list);
 });
 
-test("横幅排序与折叠、标题栏动作上限、侧栏宽度范围、文字放回", () => {
+test("横幅排序与折叠、标题栏动作上限、侧栏宽度范围", () => {
   const b = (id, level) => ({ id, source: "s", level, title: id, sourceUnavailable: false });
   const sorted = sortBanners([b("i", "info"), b("w", "warning"), b("e1", "error"), b("e2", "error")]);
   assert.deepEqual(sorted.map((x) => x.id), ["e1", "e2", "w", "i"]);
@@ -426,6 +437,4 @@ test("横幅排序与折叠、标题栏动作上限、侧栏宽度范围、文�
   assert.deepEqual(visibleBanners(sorted.slice(0, 3), false), { shown: sorted.slice(0, 3), folded: 0 }, "3 条以内全部显示");
   assert.deepEqual(splitActions([1, 2, 3, 4, 5]), { shown: [1, 2, 3], more: [4, 5] });
   assert.deepEqual([100, 240, 300, 480, 900, NaN].map(clampSidebar), [240, 240, 300, 480, 480, 280]);
-  assert.equal(restoreText("提交的", ""), "提交的");
-  assert.equal(restoreText("提交的", "期间新写的"), "提交的\n期间新写的");
 });

@@ -25,6 +25,12 @@ type Locks = Pick<LockManager, "request">;
  * 一个会话的前缀不会是另一个会话键的前缀（例如 a 与 a.b）。
  */
 export const encodeId = (sessionId: string) => sessionId.replace(/[^A-Za-z0-9_-]/g, (c) => "%" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+/**
+ * 插件会话节点在本文件各类记录中使用的“会话 id”：“plugin”、来源和节点 id 以 NUL 分隔。插件节点的输入框与主会话共用同一套
+ * 草稿、在途提交、待放回记录和提示（architecture.md“取回草稿的交付”）。主会话用 pi 的会话 id（UUID），不含 NUL，
+ * 两者不会相同；NUL 也不会出现在插件 id 中，来源和节点 id 的边界不会混淆。
+ */
+export const pluginDraftScope = (source: string, nodeId: string) => `plugin\u0000${source}\u0000${nodeId}`;
 export const noticeKey = (sessionId: string) => `pi-pane.notice.${sessionId}`;
 export const batchPrefix = (sessionId: string) => `pi-pane.restored.${encodeId(sessionId)}.`;
 export const flightPrefix = (sessionId: string) => `pi-pane.inflight.${encodeId(sessionId)}.`;

@@ -232,10 +232,15 @@ export function hiddenChildren(trees: ReadonlyMap<string, SourceTree>, node: Tre
 /** “未归属”分组下尚未加载的子节点：count、unknown 的含义同 HiddenChildren，parents 为展开时要分页的 (来源, 父节点)。 */
 export interface OrphanHistory { count: number; unknown: boolean; parents: [string, string][] }
 
+/** pi-pane 主会话树中的“未归属”分组（plugin-api.md“pi-pane 自己的节点”）。 */
+export const UNASSIGNED = "pane:group:unassigned";
+
 /**
- * 父节点不在任何来源里时，插件按 foreignChildCounts 报告的子节点也属于“未归属”。与普通父节点同一规则（见 hiddenChildren）：
- * 每个 (来源, 父节点) 扣除该来源经快照或分页取到的子节点；差值不大于 0 而已开始分页、还有下一页时仍显示不带数字的“历史”；
- * 已分页到最后一页的不再计入。skip(parentId) 为 true 的父节点不计入（已在树里、正在补取，或所在来源还没有快照）。
+ * “未归属”分组的未加载子节点，与普通父节点同一规则（见 hiddenChildren）：每个 (来源, 父节点) 扣除该来源经快照或分页取到的子节点；
+ * 差值不大于 0 而已开始分页、还有下一页时仍显示不带数字的“历史”；已分页到最后一页的不再计入。包括两类：
+ * - 插件按 foreignChildCounts 报告挂在“未归属”分组本身下的子节点，展开时对该分组分页；
+ * - 父节点不在任何来源里时，插件报告挂在该父节点下的子节点，展开时对原父节点分页。skip(parentId) 为 true 的父节点不计入
+ *   （正在补取，或所在来源还没有快照）；父节点在树里时子节点归该父节点显示，也不计入。
  */
 export function orphanHistory(trees: ReadonlyMap<string, SourceTree>, skip: (parentId: string) => boolean): OrphanHistory {
   const result: OrphanHistory = { count: 0, unknown: false, parents: [] };
@@ -243,7 +248,8 @@ export function orphanHistory(trees: ReadonlyMap<string, SourceTree>, skip: (par
     if (source === "pane") continue;
     for (const [parent, total] of Object.entries(t.foreign)) {
       const listed = t.listed.get(parent);
-      if (!total || listed?.done || findIn(trees, parent) || skip(parent)) continue;
+      if (!total || listed?.done) continue;
+      if (parent !== UNASSIGNED && (findIn(trees, parent) || skip(parent))) continue;
       const hidden = total - t.children(parent).filter((n) => t.baseline.has(n.id)).length;
       if (hidden > 0) result.count += hidden;
       else if (listed) result.unknown = true;
@@ -261,7 +267,7 @@ export function orphanHistory(trees: ReadonlyMap<string, SourceTree>, skip: (par
 export function unassigned(trees: ReadonlyMap<string, SourceTree>, node: TreeNode, waiting: (parentId: string) => boolean = () => false): boolean {
   const parentId = node.parentId;
   if (parentId === null) return false;
-  if (parentId === "pane:group:unassigned") return true;
+  if (parentId === UNASSIGNED) return true;
   let parent = findIn(trees, parentId);
   if (!parent) {
     const t = trees.get(sourceOf(parentId));

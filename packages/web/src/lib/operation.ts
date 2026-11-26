@@ -18,8 +18,13 @@ export interface OpHost {
   toast(message: string, level?: "error"): void;
 }
 
-/** 提交时移出输入框的原文；restore 把它放回输入框（放在当前内容之前）。 */
-export interface OpText { restore(): void }
+/**
+ * 提交时移出输入框的原文，提交前已登记为在途提交（restored.ts 的 beginSubmit）。settle 在首次请求结算时调用一次，
+ * 按 finishSubmit 的三种结果处理在途记录：sent 丢弃；failed 原样放回；unknown 放回并标记为无法确认是否已经发送。
+ * 首次结算之前刷新或关闭页面时，在途记录由下次挂载的输入框按无法确认放回（recoverFlights）。
+ */
+export type OpTextEnd = "sent" | "failed" | "unknown";
+export interface OpText { settle(end: OpTextEnd): void }
 
 export interface OpOptions {
   /** 操作的标识，也是查询入口的 key；请求实际使用的幂等键可能随后续表单变化，由 attempt 自己管理。 */
@@ -38,8 +43,8 @@ export interface OpOptions {
 
 /**
  * 结算规则（与主会话一致：没有确定送达就放回原文）：
- * - 首次请求：done 结束；其余结果（notRun、pending、unknown）都立即把原文放回输入框，只放一次。
- *   notRun 结束；pending 和 unknown 留下查询入口。
+ * - 首次请求：done 结束，在途记录丢弃；其余结果都立即把原文放回输入框，只放一次：notRun 原样放回并结束；
+ *   pending 和 unknown 放回并标记为无法确认是否已经发送，留下查询入口。
  * - 查询：done 结束，提示用户删去放回的文字；notRun 结束，只提示结果（原文已在输入框）；pending 保留入口；
  *   unknown 只说明这次查询没有成功，不结算原操作，入口保留。
  * 关掉查询入口或刷新页面只丢掉查询的机会，原文已在输入框里。插件最终受理时，输入框里会多出一份原文，由用户删除。
@@ -79,10 +84,11 @@ export class Operation {
     return this.running;
   }
 
-  private putBack(): void {
-    if (this.textBack || !this.options.text) return;
-    this.textBack = true;
-    this.options.text.restore();
+  /** 首次结算时交出原文：done 时丢弃在途记录，其余放回（只在首次结算时调用一次）。 */
+  private settleText(state: OpState): void {
+    const end: OpTextEnd = state === "done" ? "sent" : state === "notRun" ? "failed" : "unknown";
+    this.textBack = end !== "sent" && !!this.options.text;
+    this.options.text?.settle(end);
   }
 
   private track(state: "pending" | "unknown", message: string): void {
@@ -93,12 +99,12 @@ export class Operation {
   private finish(state: OpState): void { this.ended = true; this.last = state; this.host.hide(this.key); }
 
   private settleFirst(step: OpStep): void {
+    this.settleText(step.state);
     if (step.state === "done") {
       this.finish("done");
       if (step.message) this.host.toast(step.message);
       return;
     }
-    this.putBack();
     switch (step.state) {
       case "notRun":
         this.finish("notRun");

@@ -10,7 +10,7 @@ const node = (page, id) => page.locator(`[data-node-id="${id}"]`).first();
 const editor = (page) => byId(page, "plugin-editor");
 const say = { fallback: { segments: [{ type: "text", text: "好的" }] } };
 
-test("没有确定送达就放回原文：处理中、首发断网后放回一次，关掉查询条或刷新不丢文字；查询被拒（403）或断网不结算原操作；连续查询只发一次；open 能力变化；只有 abort 的节点可停止；只读条停止的文字存入草稿", { timeout: 120_000 }, async (t) => {
+test("没有确定送达就放回原文：处理中、首发断网后放回一次，关掉查询条或刷新不丢文字；查询被拒（403）或断网不结算原操作；连续查询只发一次；open 能力变化；只有 abort 的节点可停止；只读条停止的文字存入草稿；撤销 subscribe 不退订", { timeout: 120_000 }, async (t) => {
   const s = await setup(t, say, { serverOptions: () => ({ plugins: [pluginDir] }) }); if (!s) return;
   const { page } = s;
   s.allowedErrors.push(/Failed to load resource: net::ERR_FAILED/); // 下面模拟发送请求断网。
@@ -55,7 +55,7 @@ test("没有确定送达就放回原文：处理中、首发断网后放回一�
   plugin().finishPending({ status: "rejected", message: "迟到的拒绝" });
   await editor(page).fill("");
 
-  // pending 后刷新页面：放回的原文按节点存在本标签页的草稿里，刷新后仍在输入框中。
+  // pending 后刷新页面：放回的原文写入本标签页对该节点的草稿存储，刷新后仍在输入框中。
   await sendText("刷新前的文字");
   await sendOp.waitFor();
   await page.reload();
@@ -220,7 +220,8 @@ test("没有确定送达就放回原文：处理中、首发断网后放回一�
   await editor(page).waitFor();
   await page.unroute("**/sessions/a/snapshot");
 
-  // 撤销 subscribe：退订并补取一次快照，已展开的历史保留；补回 subscribe 时从当前游标续订，不重取快照。
+  // 撤销 subscribe 只影响以后是否新建订阅：已建立的订阅保持到离开该节点，不退订、不补取快照，已展开的历史保留。
+  // 会话结束时插件常先撤销 subscribe，最后的输出和结束状态晚于树更新到达，仍经这条订阅送来。
   const synced = (caps) => page.waitForFunction((want) => document.querySelector('[data-testid="plugin-session"]')?.getAttribute("data-synced-capabilities") === want, caps);
   const exact = (value) => page.getByText(value, { exact: true });
   const older = () => page.getByRole("button", { name: "加载更早的消息" });
@@ -235,45 +236,24 @@ test("没有确定送达就放回原文：处理中、首发断网后放回一�
   await older().click();
   await exact("更早的消息").waitFor();
   assert.equal(hSnapshots.length, 1);
-  const refetched = page.waitForResponse((response) => response.url().endsWith("/sessions/h/snapshot"));
-  plugin().upsert({ ...h, capabilities: ["open"] });
-  await synced("open");
-  await refetched;
-  await until(() => plugin().listening("h") === 0);
-  // 快照响应处理后立即替换模型；留出时间确认已展开的历史没有被清掉。
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal(hSnapshots.length, 2, "撤销 subscribe 时补取一次快照");
-  assert.equal(await exact("更早的消息").count(), 1, "补取快照后已展开的历史保留");
-  assert.equal(await older().count(), 0);
-  // 禁用期间产生的事件：没有订阅，页面不显示；补回 subscribe 时从禁用前的游标续订，插件重放这条事件，只显示一次。
-  const cursorBefore = plugin().calls.subscribe.length;
-  const seqBefore = plugin().seq("h");
-  plugin().append("h", "禁用期间的输出");
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal(await exact("禁用期间的输出").count(), 0, "退订后不再收到事件");
-  plugin().upsert({ ...h, capabilities: ["open", "subscribe"] });
-  await synced("open subscribe");
-  await exact("禁用期间的输出").waitFor();
-  await until(() => plugin().listening("h") === 1);
-  const resubscribed = plugin().calls.subscribe.slice(cursorBefore).filter((c) => c.id === "h");
-  assert.equal(resubscribed.length, 1, "补回时只订阅一次");
-  assert.equal(resubscribed[0].after.seq, seqBefore, "从禁用前的游标续订，插件重放禁用期间的事件");
-  plugin().append("h", "续订后的输出");
-  await exact("续订后的输出").waitFor();
-  assert.equal(await exact("禁用期间的输出").count(), 1, "重放的事件只显示一次");
-  assert.equal(await exact("更早的消息").count(), 1, "已展开的历史保留");
-  assert.equal(hSnapshots.length, 2, "补回实时流不重取快照");
-
-  // 会话结束时插件先撤销 subscribe，最终状态和最后一条输出晚于树更新到达（退订后收不到）：补取的快照给出最终状态。
-  plugin().endQuietly("h", "done", "最后的输出");
+  const subscribesBefore = plugin().calls.subscribe.length;
   plugin().upsert({ ...h, status: "done", capabilities: ["open"] });
   await synced("open");
+  plugin().append("h", "最后的输出");
+  plugin().emit("h", { type: "pane_status", status: "done", phase: "idle" });
   await exact("最后的输出").waitFor();
   await byId(page, "plugin-status").filter({ hasText: "已完成" }).waitFor();
+  assert.equal(plugin().listening("h"), 1, "撤销 subscribe 不退订");
+  assert.equal(hSnapshots.length, 1, "撤销 subscribe 不补取快照");
   assert.equal(await exact("更早的消息").count(), 1, "已展开的历史保留");
-  // 恢复实时流，供下面的分支切换用例使用。
+  // 补回 subscribe：已有订阅，不再新建订阅，也不重取快照。
   plugin().upsert({ ...h, status: "running", capabilities: ["open", "subscribe"] });
   await synced("open subscribe");
+  plugin().append("h", "补回后的输出");
+  await exact("补回后的输出").waitFor();
+  assert.equal(plugin().calls.subscribe.slice(subscribesBefore).filter((c) => c.id === "h").length, 0, "补回时不重复订阅");
+  assert.equal(plugin().listening("h"), 1);
+  assert.equal(hSnapshots.length, 1, "补回实时流不重取快照");
 
   // 分支切换（resync 重取快照）之后，迟到的旧分支历史页丢弃，不覆盖新分支的“加载更早的消息”。
   plugin().branch("h", ["旧分支更早的消息"], ["旧分支的消息"]); plugin().resync("h");

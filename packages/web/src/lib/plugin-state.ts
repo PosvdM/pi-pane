@@ -27,11 +27,6 @@ export function visibleBanners(sorted: BannerState[], showAll: boolean): { shown
   return { shown: sorted.slice(0, 2), folded: sorted.length - 2 };
 }
 
-/** 提交失败后把文字放回输入框：放在等待期间新写的内容之前。 */
-export function restoreText(submitted: string, current: string): string {
-  return [submitted, current].filter((value) => value.trim()).join("\n");
-}
-
 /** 标题栏最多显示 3 个动作，其余放进“⋯”菜单。 */
 export const HEAD_ACTIONS = 3;
 export function splitActions<T>(actions: T[]): { shown: T[]; more: T[] } {
