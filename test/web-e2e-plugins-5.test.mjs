@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { until } from "./fixtures/helpers.mjs";
-import { byId, setup } from "./fixtures/web-e2e.mjs";
+import { byId, observePage, setup } from "./fixtures/web-e2e.mjs";
 
 const pluginDir = fileURLToPath(new URL("./fixtures/ui-plugin/", import.meta.url));
 const plugin = () => globalThis.__uiPlugin;
@@ -11,6 +11,19 @@ const node = (page, id) => page.locator(`[data-node-id="${id}"]`).first();
 const editor = (page) => byId(page, "plugin-editor");
 const say = { fallback: { segments: [{ type: "text", text: "好的" }] } };
 const value = (page) => editor(page).inputValue();
+
+/**
+ * 关闭当前标签页、新开一个配对好的标签页。关闭的页面来不及处理在途请求的结果；新标签页有新的 tabId，
+ * 只能从 localStorage 里的在途记录取回原文。
+ */
+async function reopenTab(s) {
+  const fresh = observePage(await s.context.newPage()); s.pages.push(fresh); fresh.setDefaultTimeout(15_000);
+  await s.page.close();
+  await fresh.goto(`${s.server.origin}/#code=${s.server.auth.issuePairCode()}`);
+  await byId(fresh, "sidebar").waitFor();
+  s.page = fresh;
+  return fresh;
+}
 
 /** 打开插件节点并等标题出现。 */
 async function open(page, id, title) {
@@ -20,13 +33,13 @@ async function open(page, id, title) {
 
 test("插件输入框的在途提交：首次结果回来前刷新，原文按无法确认放回；响应挂起时浏览器超时按结果未知结算；冲突先放回再重取快照", { timeout: 120_000 }, async (t) => {
   const s = await setup(t, say, { serverOptions: () => ({ plugins: [pluginDir] }) }); if (!s) return;
-  const { page } = s;
+  let { page } = s;
   s.allowedErrors.push(/Failed to load resource: net::ERR_FAILED/); // 刷新和浏览器超时中止了在途请求。
 
   // 普通发送：请求已到插件、结果还没回来时刷新。发送时原文已移出输入框，只在在途记录里；刷新后输入框挂载时按无法确认放回。
   await open(page, "uitest:session:a", "任务甲");
   plugin().sendMode = "hold";
-  const sends = plugin().calls.send.length;
+  let sends = plugin().calls.send.length;
   await editor(page).fill("刷新前没有结果的文字");
   await byId(page, "plugin-send").click();
   await until(async () => (await value(page)) === "" && plugin().calls.send.length === sends + 1);
@@ -38,17 +51,29 @@ test("插件输入框的在途提交：首次结果回来前刷新，原文按�
   await editor(page).fill("");
   await byId(page, "restored-notice").waitFor({ state: "detached" });
 
+  // 结果回来前关闭标签页：页面没有机会处理结果，另一个标签页打开该节点时从在途记录取回原文。
+  sends = plugin().calls.send.length;
+  await editor(page).fill("关页前没有结果的文字");
+  await byId(page, "plugin-send").click();
+  await until(async () => (await value(page)) === "" && plugin().calls.send.length === sends + 1);
+  page = await reopenTab(s);
+  plugin().releaseSend({ status: "rejected", message: "插件拒绝了这条消息" });
+  await open(page, "uitest:session:a", "任务甲");
+  await until(async () => (await value(page)) === "关页前没有结果的文字");
+  await byId(page, "restored-notice").waitFor();
+  await editor(page).fill("");
+
   // composer 动作：同上。
   await open(page, "uitest:session:d", "排队的任务");
   plugin().composerMode = "hold";
   const invokes = plugin().calls.invoke.length;
-  await editor(page).fill("刷新前没有结果的留言");
+  await editor(page).fill("关页前没有结果的留言");
   await byId(page, "plugin-send").click();
   await until(async () => (await value(page)) === "" && plugin().calls.invoke.length === invokes + 1);
-  await page.reload();
+  page = await reopenTab(s);
   plugin().composerMode = "ok"; plugin().releaseNote();
   await open(page, "uitest:session:d", "排队的任务");
-  await until(async () => (await value(page)) === "刷新前没有结果的留言");
+  await until(async () => (await value(page)) === "关页前没有结果的留言");
   await byId(page, "restored-notice").waitFor();
   await editor(page).fill("");
 
