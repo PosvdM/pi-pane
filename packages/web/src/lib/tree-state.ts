@@ -229,6 +229,31 @@ export function hiddenChildren(trees: ReadonlyMap<string, SourceTree>, node: Tre
   return result;
 }
 
+/** “未归属”分组下尚未加载的子节点：count、unknown 的含义同 HiddenChildren，parents 为展开时要分页的 (来源, 父节点)。 */
+export interface OrphanHistory { count: number; unknown: boolean; parents: [string, string][] }
+
+/**
+ * 父节点不在任何来源里时，插件按 foreignChildCounts 报告的子节点也属于“未归属”。与普通父节点同一规则（见 hiddenChildren）：
+ * 每个 (来源, 父节点) 扣除该来源经快照或分页取到的子节点；差值不大于 0 而已开始分页、还有下一页时仍显示不带数字的“历史”；
+ * 已分页到最后一页的不再计入。skip(parentId) 为 true 的父节点不计入（已在树里、正在补取，或所在来源还没有快照）。
+ */
+export function orphanHistory(trees: ReadonlyMap<string, SourceTree>, skip: (parentId: string) => boolean): OrphanHistory {
+  const result: OrphanHistory = { count: 0, unknown: false, parents: [] };
+  for (const [source, t] of trees) {
+    if (source === "pane") continue;
+    for (const [parent, total] of Object.entries(t.foreign)) {
+      const listed = t.listed.get(parent);
+      if (!total || listed?.done || findIn(trees, parent) || skip(parent)) continue;
+      const hidden = total - t.children(parent).filter((n) => t.baseline.has(n.id)).length;
+      if (hidden > 0) result.count += hidden;
+      else if (listed) result.unknown = true;
+      else continue;
+      result.parents.push([source, parent]);
+    }
+  }
+  return result;
+}
+
 /**
  * 节点是否放进“未归属”分组：父节点指向 pane:group:unassigned，父节点所在来源已加载却没有该节点（或该来源不存在），
  * 或沿父链回到自己（循环）。waiting(parentId) 为 true 表示已为该父节点重取快照、结果未到，暂不归入。

@@ -1,8 +1,8 @@
 // 打开的插件节点：会话节点按能力取快照（open）并订阅事件（subscribe），group 和 resource 节点只显示面板（plugin-api.md“会话视图”“面板”）。
-import { api, ApiError, newId } from "./api.ts";
+import { api, newId } from "./api.ts";
 import type { OpState, OpStep, OpText } from "./operation.ts";
-import { newOperation } from "./plugin-ui.ts";
-import { apply, fromSnapshot, prependHistory, type ModelState } from "./session-model.ts";
+import { newOperation, requestFailed } from "./plugin-ui.ts";
+import { apply, fromSnapshot, keepLoadedHistory, prependHistory, type ModelState } from "./session-model.ts";
 import { Store } from "./store.ts";
 import { pinNode } from "./tree.ts";
 import { confirmInApp, toast } from "./ui-state.ts";
@@ -69,7 +69,8 @@ export async function openPluginNode(node: TreeNode): Promise<void> {
 /**
  * 节点能力变化时调整已打开的视图（plugin-api.md 的能力表）：
  * - 撤销 open：取消订阅、丢掉已显示的内容，改为只显示节点信息和面板；补上 open：取快照，有 subscribe 时订阅。
- * - 不再提供实时流（如任务结束）就取消订阅，开始提供就从当前游标订阅，都不重取快照；
+ * - 不再提供实时流（如任务结束）就取消订阅，并补取一次快照：插件常在结束时撤销 subscribe，最终状态和最后几条输出可能
+ *   晚于树更新到达，退订后就收不到了。重取快照保留已加载的更早历史（keepLoadedHistory）。开始提供实时流时从当前游标订阅，不重取快照；
  * - send 能力有变化（如接管后开放输入）时重取快照：插件可能只通过树节点改能力、不在会话流里推 pane_status，
  *   快照中的 readonly 随之更新。
  */
@@ -91,9 +92,9 @@ export function syncCapabilities(node: TreeNode): void {
   if (!open) return;
   if (live !== o.live) {
     o.live = live;
-    // 只有实时流变化时不重取快照，用户已展开的历史保留：撤销时取消订阅；补上时从当前游标订阅，
+    // 撤销时取消订阅并补取快照，得到退订后才到的最终状态；补上时从当前游标订阅，
     // 插件按游标重放其间的事件，接不上时推 resync（plugin-api.md“事件流”）。
-    if (!live) { o.unsubscribe?.(); o.unsubscribe = null; }
+    if (!live) { o.unsubscribe?.(); o.unsubscribe = null; void reload(o); }
     else if (o.reloading) o.again = true;  // 取快照在途：可能已越过订阅的判断，完成后再取一次并订阅
     else if (pluginView.get()?.model && !o.unsubscribe) subscribeLive(o);
   }
@@ -127,7 +128,12 @@ function refresh(o: Opened): Promise<void> {
       try { snapshot = await api<SessionSnapshot>(sessionPath(ref, "snapshot")); }
       catch (error) { o.again = false; if (isCurrent(o) && o.open) retry(o, error); return; }
       if (!isCurrent(o) || !o.open) return;
-      pluginView.set((v) => v && { ...v, model: fromSnapshot(toView(snapshot)), partials: snapshot.unfinishedPartials ?? [], loading: false, error: undefined });
+      pluginView.set((v) => {
+        if (!v) return v;
+        const model = fromSnapshot(toView(snapshot));
+        if (v.model) keepLoadedHistory(model, v.model);
+        return { ...v, model, partials: snapshot.unfinishedPartials ?? [], loading: false, error: undefined };
+      });
       o.retries = 0;
     } while (o.again);
     if (!o.live) return;
@@ -172,23 +178,20 @@ export async function loadOlder(): Promise<void> {
 
 /**
  * 向插件会话发消息（节点有 send 能力、没有 composer 时）。每次发送是一个操作对象（operation.ts）：首次响应和之后每次
- * “查询结果”都由它结算，查询沿用同一个幂等键和同样的内容（plugin-api.md“幂等规则”）。accepted 结束；rejected、conflict、
- * idempotencyConflict 和请求被拒确定没有执行，原文不在输入框时放回；pending 留下查询入口；断网和超时结果未知，
- * 留下查询入口并放回原文。text 为提交时移出输入框的原文。
+ * “查询结果”都由它结算，查询沿用同一个幂等键和同样的内容（plugin-api.md“幂等规则”）。只有 accepted 确定送达；
+ * 其余结果（rejected、conflict、idempotencyConflict、请求被拒、pending 含服务端等待超时、断网、超时）都在首次响应时把原文放回，
+ * pending 和结果未知留下查询入口。查询请求本身失败（断网、403 等）只说明这次查询没有成功。text 为提交时移出输入框的原文。
  */
 export function sendToPlugin(value: string, delivery: "steer" | "followUp" | undefined, text: OpText): Promise<OpState> {
   const o = opened; const view = pluginView.get();
   const ref = o?.ref && view?.ref ? view.ref : undefined;
   const expectedRevision = view?.model?.view.controlRevision;
   const body = { input: { text: value, ...(delivery ? { delivery } : {}) }, idempotencyKey: newId(), ...(expectedRevision === undefined ? {} : { expectedRevision }) };
-  const attempt = async (): Promise<OpStep> => {
+  const attempt = async (query: boolean): Promise<OpStep> => {
     if (!o || !ref) return { state: "notRun" };
     let result: SendResult;
     try { result = await api<SendResult>(sessionPath(ref, "send"), { ...body, connectionId: ws.link.get().connectionId }); }
-    catch (error) {
-      if (error instanceof ApiError && (error.code === "network" || error.code === "pluginTimeout" || error.status === 504)) return { state: "unknown" };
-      return { state: "notRun", message: (error as Error).message };
-    }
+    catch (error) { return requestFailed(error, query); }
     switch (result.status) {
       case "accepted": return { state: "done" };
       case "pending": return { state: "pending", ...((result as { message?: string }).message ? { message: (result as { message?: string }).message } : {}) };

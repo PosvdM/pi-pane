@@ -10,72 +10,98 @@ const node = (page, id) => page.locator(`[data-node-id="${id}"]`).first();
 const editor = (page) => byId(page, "plugin-editor");
 const say = { fallback: { segments: [{ type: "text", text: "好的" }] } };
 
-test("普通发送处理中可查询、查到被拒时放回文字；处理中或首发断网之后的查询（断网、被拒、已受理）由同一操作结算，原文只放回一次；连续查询只发一次；open 能力变化；只有 abort 的节点可停止；只读条停止的文字存入草稿", { timeout: 120_000 }, async (t) => {
+test("没有确定送达就放回原文：处理中、首发断网后放回一次，关掉查询条或刷新不丢文字；查询被拒（403）或断网不结算原操作；连续查询只发一次；open 能力变化；只有 abort 的节点可停止；只读条停止的文字存入草稿", { timeout: 120_000 }, async (t) => {
   const s = await setup(t, say, { serverOptions: () => ({ plugins: [pluginDir] }) }); if (!s) return;
   const { page } = s;
   s.allowedErrors.push(/Failed to load resource: net::ERR_FAILED/); // 下面模拟发送请求断网。
   s.allowedErrors.push(/Failed to load resource: net::ERR_INTERNET_DISCONNECTED/); // 下面断网时可能有请求在途（如 /new 之后的列表刷新）。
+  s.allowedErrors.push(/status of 403/); // 下面模拟查询时连接尚未重新登记，服务端返回 403 invalidOrigin。
 
-  // 普通发送（sessions.send）返回处理中：输入框清空，留下“查询结果”；同一个键查到被拒时文字放回。
+  // 只有确定送达（accepted）不放回；处理中、被拒、断网、超时都在首次响应时把原文放回输入框（放在期间新写的内容之前，只放一次）。
   await node(page, "uitest:session:a").click();
   await byId(page, "plugin-title").filter({ hasText: "任务甲" }).waitFor();
   const sendKeys = [];
   page.on("request", (request) => { if (request.url().endsWith("/sessions/a/send")) sendKeys.push(request.postDataJSON().idempotencyKey); });
+  const queryOf = (op) => op.locator('[data-testid="action-query"]').click();
+  const sendText = async (value) => { await editor(page).fill(value); await byId(page, "plugin-send").click(); };
+  const cleared = async () => { await until(async () => (await byId(page, "action-pending").count()) === 0); };
+  const backOp = byId(page, "action-pending").filter({ hasText: "文字已放回输入框" });
+  /** 同样文字的提示可能还没消失（error 提示要手动关闭，最多保留 5 条）：先关掉已有的提示，再等这一步的提示出现。 */
+  const toastAfter = async (text, act) => {
+    while (await byId(page, "toast").count()) await byId(page, "toast").first().getByRole("button", { name: "关闭" }).click().catch(() => {});
+    await act(); await byId(page, "toast").filter({ hasText: text }).first().waitFor();
+  };
+
+  // pending：原文立即放回，留下“查询结果”；查到被拒只提示结果，不重复放回。
   plugin().sendMode = "pending";
-  await editor(page).fill("普通发送的文字");
-  await byId(page, "plugin-send").click();
-  const sendOp = byId(page, "action-pending").filter({ hasText: "插件仍在处理" });
+  await sendText("普通发送的文字");
+  const sendOp = byId(page, "action-pending").filter({ hasText: "插件仍在处理，文字已放回输入框" });
   await sendOp.waitFor();
-  assert.equal(await editor(page).inputValue(), "");
+  assert.equal(await editor(page).inputValue(), "普通发送的文字");
   plugin().finishPending({ status: "rejected", message: "插件拒绝了这条消息" });
-  await sendOp.locator('[data-testid="action-query"]').click();
+  await queryOf(sendOp);
   await byId(page, "toast").filter({ hasText: "插件拒绝了这条消息" }).waitFor();
-  await until(async () => (await editor(page).inputValue()) === "普通发送的文字");
-  await until(async () => (await byId(page, "action-pending").count()) === 0);
+  await cleared();
+  assert.equal(await editor(page).inputValue(), "普通发送的文字", "只放回一次");
   assert.equal(sendKeys.length, 2); assert.equal(sendKeys[0], sendKeys[1], "查询沿用同一个幂等键");
   await editor(page).fill("");
 
-  // 每次发送是一个操作对象：首次响应、每次查询、断网都交给它结算，原文最多放回一次。
-  const queryOf = (op) => op.locator('[data-testid="action-query"]').click();
-  const drop = (route) => route.abort("failed");
-  /** 请求送到服务端、插件已处理，响应在回到浏览器的路上丢失。 */
+  // pending 后关掉查询条：原文已在输入框，关闭只放弃查询，文字不丢。
+  await sendText("关掉查询条的文字");
+  await sendOp.waitFor();
+  await sendOp.getByRole("button", { name: "关闭" }).click();
+  await cleared();
+  assert.equal(await editor(page).inputValue(), "关掉查询条的文字");
+  plugin().finishPending({ status: "rejected", message: "迟到的拒绝" });
+  await editor(page).fill("");
+
+  // pending 后刷新页面：放回的原文按节点存在本标签页的草稿里，刷新后仍在输入框中。
+  await sendText("刷新前的文字");
+  await sendOp.waitFor();
+  await page.reload();
+  await node(page, "uitest:session:a").click();
+  await byId(page, "plugin-title").filter({ hasText: "任务甲" }).waitFor();
+  await until(async () => (await editor(page).inputValue()) === "刷新前的文字");
+  plugin().finishPending({ status: "rejected", message: "迟到的拒绝" });
+  await editor(page).fill("");
+
+  // 查询本身被拒（WebSocket 重连期间，连接还没重新登记，服务端对这次查询返回 403 invalidOrigin）：
+  // 只说明这次查询没有成功，不结算原操作，入口保留；之后查到已送达时提示删去放回的文字。
+  let staleQuery = false;
+  await page.route("**/sessions/a/send", async (route) => {
+    if (!staleQuery) { await route.continue().catch(() => {}); return; }
+    staleQuery = false;
+    await route.continue({ postData: JSON.stringify({ ...route.request().postDataJSON(), connectionId: "已断开的连接" }) }).catch(() => {});
+  });
+  await sendText("查询被拒的文字");
+  await sendOp.waitFor();
+  staleQuery = true;
+  const invalid = page.waitForResponse((response) => response.url().endsWith("/sessions/a/send") && response.status() === 403);
+  await queryOf(sendOp);
+  await invalid;
+  await byId(page, "toast").filter({ hasText: "这次查询没有成功" }).waitFor();
+  await sendOp.waitFor();
+  assert.equal(await editor(page).inputValue(), "查询被拒的文字");
+  plugin().finishPending({ status: "accepted" });
+  await toastAfter("已送达，请删去输入框里放回的文字", () => queryOf(sendOp));
+  await cleared();
+  assert.equal(await editor(page).inputValue(), "查询被拒的文字", "放回的文字由用户删除");
+  await editor(page).fill("");
+  await page.unroute("**/sessions/a/send");
+
+  // 首发断网：请求送到服务端、插件已处理，响应在回到浏览器的路上丢失。原文放回，之后的查询结算。
   const lose = async (route) => { await route.fetch().catch(() => {}); await route.abort("failed"); };
   let armed = null;
   await page.route("**/sessions/a/send", async (route) => { const handler = armed; armed = null; if (handler) await handler(route); else await route.continue().catch(() => {}); });
   const once = (handler) => { armed = handler; };
-  const sendText = async (value) => { await editor(page).fill(value); await byId(page, "plugin-send").click(); };
-  const cleared = async () => { await until(async () => (await byId(page, "action-pending").count()) === 0); };
 
-  // pending → 查询断网 → 查询被拒：断网时原文放回（提示与实际一致），之后查到被拒不再重复放回。
-  plugin().sendMode = "pending";
-  await sendText("第二段文字");
-  await sendOp.waitFor();
-  assert.equal(await editor(page).inputValue(), "");
-  once(drop);
-  await queryOf(sendOp);
-  const backOp = byId(page, "action-pending").filter({ hasText: "文字已放回输入框" });
-  await backOp.waitFor();
-  await until(async () => (await editor(page).inputValue()) === "第二段文字");
-  plugin().finishPending({ status: "rejected", message: "插件拒绝了第二段" });
-  await queryOf(backOp);
-  await byId(page, "toast").filter({ hasText: "插件拒绝了第二段" }).waitFor();
-  await cleared();
-  assert.equal(await editor(page).inputValue(), "第二段文字", "只放回一次");
-  await editor(page).fill("");
-
-  // pending → 查询已受理：结束，原文不放回。
-  await sendText("第三段文字");
-  await sendOp.waitFor();
-  plugin().finishPending({ status: "accepted" });
-  await queryOf(sendOp);
-  await cleared();
-  assert.equal(await editor(page).inputValue(), "");
-
-  // 首发断网（插件已受理、仍在处理）→ 查询被拒：断网时放回一次，被拒时不重复。
+  // 首发断网（插件已受理、仍在处理）→ 查询断网 → 查询被拒：放回一次；查询断网只提示，被拒时不重复放回。
   once(lose);
   await sendText("第四段文字");
   await backOp.waitFor();
   await until(async () => (await editor(page).inputValue()) === "第四段文字");
+  once((route) => route.abort("failed"));
+  await toastAfter("这次查询没有成功", () => queryOf(backOp));
   plugin().finishPending({ status: "rejected", message: "插件拒绝了第四段" });
   await queryOf(backOp);
   await byId(page, "toast").filter({ hasText: "插件拒绝了第四段" }).waitFor();
@@ -89,14 +115,13 @@ test("普通发送处理中可查询、查到被拒时放回文字；处理中�
   await sendText("第五段文字");
   await backOp.waitFor();
   await until(async () => (await editor(page).inputValue()) === "第五段文字");
-  await queryOf(backOp);
-  await byId(page, "toast").filter({ hasText: "已送达，请删去输入框里放回的文字" }).waitFor();
+  await toastAfter("已送达，请删去输入框里放回的文字", () => queryOf(backOp));
   await cleared();
   await page.getByText("收到：第五段文字").waitFor();
   await editor(page).fill("");
   await page.unroute("**/sessions/a/send");
 
-  // 连续点两次“查询结果”只发一次查询；查到后续表单并提交后，已执行的文字不放回。
+  // 连续点两次“查询结果”只发一次查询；查到后续表单并提交后已执行：原文在 pending 时已放回，提示删去。
   await node(page, "uitest:session:d").click();
   await byId(page, "plugin-title").filter({ hasText: "排队的任务" }).waitFor();
   plugin().composerMode = "pending";
@@ -104,6 +129,7 @@ test("普通发送处理中可查询、查到被拒时放回文字；处理中�
   await byId(page, "plugin-send").click();
   const noteOp = byId(page, "action-pending").filter({ hasText: "留言处理中" });
   await noteOp.waitFor();
+  assert.equal(await editor(page).inputValue(), "要查询的留言");
   plugin().finishPending({ status: "needsInput", followUpForm: { id: "note-more", source: "uitest", revision: 1, title: "补充留言", createdAt: new Date().toISOString(), fields: [{ id: "more", label: "补充", type: "text" }] } });
   plugin().composerMode = "ok";
   const noteKeys = [];
@@ -117,11 +143,34 @@ test("普通发送处理中可查询、查到被拒时放回文字；处理中�
   await page.unroute("**/actions/uitest.note/invoke");
   assert.equal(noteKeys.length, 1, "两次点击共用一次查询");
   await byId(page, "form-dialog").locator("input").fill("补充内容");
-  await byId(page, "form-submit").click();
-  await byId(page, "toast").filter({ hasText: "已留言" }).waitFor();
+  await toastAfter("已送达，请删去输入框里放回的文字", () => byId(page, "form-submit").click());
+  await byId(page, "toast").filter({ hasText: "已留言" }).first().waitFor();
   await byId(page, "form-dialog").waitFor({ state: "detached" });
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  assert.equal(await editor(page).inputValue(), "", "已执行的留言不放回输入框");
+  assert.equal(await editor(page).inputValue(), "要查询的留言", "只放回一次");
+  await editor(page).fill("");
+
+  // composer 动作的结果迟到并带 openNodeId：结果到达前用户已切换到其他节点，不跳转，只提示；没有切换时照常打开。
+  plugin().composerMode = "holdOpen";
+  await editor(page).fill("跳转留言");
+  await byId(page, "plugin-send").click();
+  await until(async () => (await editor(page).inputValue()) === "");
+  await node(page, "uitest:session:a").click();
+  await byId(page, "plugin-title").filter({ hasText: "任务甲" }).waitFor();
+  plugin().releaseNote();
+  await byId(page, "toast").filter({ hasText: "可在会话列表中打开" }).waitFor();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(await byId(page, "plugin-session").getAttribute("data-node-id"), "uitest:session:a", "没有被拉回发起的节点");
+  plugin().composerMode = "holdOpen";
+  plugin().upsert({ ...plugin().nodes.get("uitest:session:a"), composer: { actionId: "uitest.note" } });
+  await byId(page, "plugin-composer").filter({ hasText: "作为“留言”提交" }).waitFor();
+  await editor(page).fill("留在原处的留言");
+  await byId(page, "plugin-send").click();
+  await until(async () => (await editor(page).inputValue()) === "");
+  plugin().releaseNote();
+  await page.locator('[data-testid="plugin-session"][data-node-id="uitest:session:d"]').waitFor();
+  const restoredA = plugin().nodes.get("uitest:session:a"); delete restoredA.composer;
+  plugin().upsert(restoredA);
+  plugin().composerMode = "ok";
 
   // 运行中撤销 open：已显示的内容和订阅撤掉，只剩节点信息与停止；补回 open 后重新取快照并订阅。
   await node(page, "uitest:session:a").click();
@@ -171,7 +220,7 @@ test("普通发送处理中可查询、查到被拒时放回文字；处理中�
   await editor(page).waitFor();
   await page.unroute("**/sessions/a/snapshot");
 
-  // 只撤销 subscribe：不重取快照，已展开的历史保留；补回 subscribe 时从当前游标续订。
+  // 撤销 subscribe：退订并补取一次快照，已展开的历史保留；补回 subscribe 时从当前游标续订，不重取快照。
   const synced = (caps) => page.waitForFunction((want) => document.querySelector('[data-testid="plugin-session"]')?.getAttribute("data-synced-capabilities") === want, caps);
   const exact = (value) => page.getByText(value, { exact: true });
   const older = () => page.getByRole("button", { name: "加载更早的消息" });
@@ -182,17 +231,49 @@ test("普通发送处理中可查询、查到被拒时放回文字；处理中�
   page.on("request", (request) => { if (request.url().endsWith("/sessions/h/snapshot")) hSnapshots.push(request.url()); });
   await node(page, "uitest:session:h").click();
   await exact("当前的消息").waitFor();
+  await until(() => plugin().listening("h") === 1);
   await older().click();
   await exact("更早的消息").waitFor();
   assert.equal(hSnapshots.length, 1);
+  const refetched = page.waitForResponse((response) => response.url().endsWith("/sessions/h/snapshot"));
   plugin().upsert({ ...h, capabilities: ["open"] });
   await synced("open");
+  await refetched;
+  await until(() => plugin().listening("h") === 0);
+  // 快照响应处理后立即替换模型；留出时间确认已展开的历史没有被清掉。
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(hSnapshots.length, 2, "撤销 subscribe 时补取一次快照");
+  assert.equal(await exact("更早的消息").count(), 1, "补取快照后已展开的历史保留");
+  assert.equal(await older().count(), 0);
+  // 禁用期间产生的事件：没有订阅，页面不显示；补回 subscribe 时从禁用前的游标续订，插件重放这条事件，只显示一次。
+  const cursorBefore = plugin().calls.subscribe.length;
+  const seqBefore = plugin().seq("h");
+  plugin().append("h", "禁用期间的输出");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(await exact("禁用期间的输出").count(), 0, "退订后不再收到事件");
   plugin().upsert({ ...h, capabilities: ["open", "subscribe"] });
   await synced("open subscribe");
+  await exact("禁用期间的输出").waitFor();
+  await until(() => plugin().listening("h") === 1);
+  const resubscribed = plugin().calls.subscribe.slice(cursorBefore).filter((c) => c.id === "h");
+  assert.equal(resubscribed.length, 1, "补回时只订阅一次");
+  assert.equal(resubscribed[0].after.seq, seqBefore, "从禁用前的游标续订，插件重放禁用期间的事件");
   plugin().append("h", "续订后的输出");
   await exact("续订后的输出").waitFor();
+  assert.equal(await exact("禁用期间的输出").count(), 1, "重放的事件只显示一次");
   assert.equal(await exact("更早的消息").count(), 1, "已展开的历史保留");
-  assert.equal(hSnapshots.length, 1, "只有实时流变化时不重取快照");
+  assert.equal(hSnapshots.length, 2, "补回实时流不重取快照");
+
+  // 会话结束时插件先撤销 subscribe，最终状态和最后一条输出晚于树更新到达（退订后收不到）：补取的快照给出最终状态。
+  plugin().endQuietly("h", "done", "最后的输出");
+  plugin().upsert({ ...h, status: "done", capabilities: ["open"] });
+  await synced("open");
+  await exact("最后的输出").waitFor();
+  await byId(page, "plugin-status").filter({ hasText: "已完成" }).waitFor();
+  assert.equal(await exact("更早的消息").count(), 1, "已展开的历史保留");
+  // 恢复实时流，供下面的分支切换用例使用。
+  plugin().upsert({ ...h, status: "running", capabilities: ["open", "subscribe"] });
+  await synced("open subscribe");
 
   // 分支切换（resync 重取快照）之后，迟到的旧分支历史页丢弃，不覆盖新分支的“加载更早的消息”。
   plugin().branch("h", ["旧分支更早的消息"], ["旧分支的消息"]); plugin().resync("h");

@@ -224,6 +224,14 @@ export async function answerPresence(request: PanePresenceRequest, confirm: bool
 }
 
 const unknownResult = (error: unknown) => error instanceof ApiError && (error.code === "network" || error.code === "pluginTimeout" || error.status === 504);
+/**
+ * 操作的请求抛错时的结算：断网和超时结果未知；查询时的其他错误（如 WebSocket 重连期间的 403 invalidOrigin）
+ * 是这次查询被拒，原操作的结果仍未知；首次请求被服务端拒绝时确定没有执行。
+ */
+export function requestFailed(error: unknown, query: boolean): OpStep {
+  if (unknownResult(error)) return { state: "unknown" };
+  return { state: query ? "unknown" : "notRun", message: (error as Error).message };
+}
 const pluginPath = (source: string, rest: string) => `/api/plugins/${encodeURIComponent(source)}/${rest}`;
 
 /** 提交持久表单。返回 true 表示弹窗可以关闭。 */
@@ -238,6 +246,8 @@ export async function submitForm(form: FormSpec, outcome: FormOutcome, retry?: F
   try { result = await api<FormSubmitResult>(pluginPath(form.source, `forms/${encodeURIComponent(form.id)}`), body); }
   catch (error) {
     if (unknownResult(error)) { busy("unknown", "结果未知"); return true; }
+    // 查询时请求被拒（如 WebSocket 重连期间的 403 invalidOrigin）：失败的是这次查询，已提交的结果仍未确定，保留进行中状态。
+    if (retry) throw new Error(`这次查询没有成功（${(error as Error).message}），结果仍未确定，可以稍后再查`);
     clear(); throw error;
   }
   switch (result.status) {
@@ -269,7 +279,7 @@ export function queryForm(form: FormSpec): Promise<boolean> | undefined {
  */
 export type PendingOp = OpEntry;
 export const pendingOps = new Store<PendingOp[]>([]);
-/** 关闭查询入口（用户点 ✕）：不再查询，操作对象随之不可达。 */
+/** 关闭查询入口（用户点 ✕）：不再查询，操作对象随之不可达。提交的原文在首次响应不是已送达时就已放回输入框，关闭不会丢失文字。 */
 export function settleOp(key: string): void { pendingOps.set((list) => list.filter((a) => a.key !== key)); }
 export function queryOp(op: PendingOp): Promise<unknown> { return op.query(); }
 
@@ -302,7 +312,7 @@ function actionOperation(first: Call, onOpenNode?: (nodeId: string) => void, tex
   const { spec } = first;
   const base = first.key;
   let call = first; let followUp = 0;
-  const attempt = async (): Promise<OpStep> => {
+  const attempt = async (query: boolean): Promise<OpStep> => {
     for (;;) {
       let result: ActionResult;
       try {
@@ -311,10 +321,7 @@ function actionOperation(first: Call, onOpenNode?: (nodeId: string) => void, tex
           ...(call.target ? { target: call.target } : {}), ...(call.input ? { input: call.input } : {}),
           ...(call.formId ? { formId: call.formId, formRevision: call.formRevision } : {}),
         });
-      } catch (error) {
-        if (unknownResult(error)) return { state: "unknown" };
-        return { state: "notRun", message: (error as Error).message };
-      }
+      } catch (error) { return requestFailed(error, query); }
       switch (result.status) {
         case "ok": if (result.openNodeId) onOpenNode?.(result.openNodeId); return { state: "done", message: result.message ?? `已${spec.title}` };
         case "pending": return { state: "pending", ...(result.message ? { message: result.message } : {}) };

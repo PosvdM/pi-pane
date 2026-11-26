@@ -2,7 +2,7 @@
 // 列表由服务端推送的会话树驱动：主会话树（source = "pane"）的变更经 WebSocket 推来，不依赖当前会话的事件。
 import { useEffect, useRef, useState } from "preact/hooks";
 import { sidebarOpen } from "../lib/actions.ts";
-import { nodeLabel, openNode, openNodeById } from "../lib/navigate.ts";
+import { nodeLabel, openFromResult, openNode, openNodeById } from "../lib/navigate.ts";
 import { closePluginView, pluginView } from "../lib/plugin-session.ts";
 import { clampSidebar, SIDEBAR_MAX, SIDEBAR_MIN } from "../lib/plugin-state.ts";
 import { formBusy, formKey, forms, openForm, panelKey, panelState, runAction, sortedForms } from "../lib/plugin-ui.ts";
@@ -10,7 +10,7 @@ import { actionSpec, pluginName, plugins } from "../lib/plugins.ts";
 import { current, openFile } from "../lib/session.ts";
 import { useStore } from "../lib/store.ts";
 import { awaitingParent, findNode, loadChildren, reloadAll, treeStatus, trees } from "../lib/tree.ts";
-import { childrenAcross, hiddenChildren, unassigned } from "../lib/tree-state.ts";
+import { childrenAcross, hiddenChildren, orphanHistory, unassigned } from "../lib/tree-state.ts";
 import { overlay } from "../lib/ui-state.ts";
 import type { SourceTree } from "../lib/tree-state.ts";
 import type { FormSpec, NodeStatus, PaneSessionNodeInfo, TreeNode } from "../lib/types.ts";
@@ -205,7 +205,7 @@ function NodeMenu({ menu, onClose }: { menu: Menu; onClose: () => void }) {
       {menu.node.kind === "session" ? <button class="menu-item" onClick={() => openNode(menu.node)}>打开</button>
         : <button class="menu-item" data-testid="node-detail" onClick={() => openNode(menu.node)}>查看详情</button>}
       {actions.map((spec) => <button key={spec.id} class={"menu-item" + (spec.danger ? " danger" : "")} data-testid="node-action"
-        onClick={() => void runAction(menu.node.source, spec.id, { type: "node", nodeId: menu.node.id }, openNodeById)}>{spec.title}</button>)}
+        onClick={() => void runAction(menu.node.source, spec.id, { type: "node", nodeId: menu.node.id }, openFromResult())}>{spec.title}</button>)}
     </div>
   );
 }
@@ -222,7 +222,7 @@ function AddMenu({ onClose }: { onClose: () => void }) {
     <div class="menu add-menu" data-testid="add-menu">
       <button class="menu-item" onClick={() => overlay.set("new-session")}>新建会话</button>
       {globals.map((spec) => <button key={spec.source + spec.id} class={"menu-item" + (spec.danger ? " danger" : "")} data-testid="global-action"
-        onClick={() => void runAction(spec.source, spec.id, { type: "global" }, openNodeById)}>{spec.title}<span class="src-tag">{pluginName(spec.source)}</span></button>)}
+        onClick={() => void runAction(spec.source, spec.id, { type: "global" }, openFromResult())}>{spec.title}<span class="src-tag">{pluginName(spec.source)}</span></button>)}
     </div>
   );
 }
@@ -277,21 +277,18 @@ export function Sidebar() {
   }) : [];
   // 父节点不存在（所在来源已加载却没有它，或来源不在）、指向“未归属”或形成循环的插件节点归入“未归属”。
   const orphans: TreeNode[] = []; const roots = new Map<string, TreeNode[]>();
-  let orphanHidden = 0; const orphanParents: [string, string][] = [];
   for (const [source, t] of allTrees) {
     if (source === "pane") continue;
     for (const node of t.children(null)) roots.set(source, [...(roots.get(source) ?? []), node]);
     for (const node of t.nodes.values()) if (unassigned(allTrees, node, awaitingParent)) orphans.push(node);
-    // 报告了子节点数、但父节点不在任何来源里：这些冷节点也属于“未归属”，按来源扣除已显示的快照节点。
-    for (const [parent, count] of Object.entries(t.foreign)) {
-      if (findNode(parent) || t.listed.get(parent)?.done || awaitingParent(parent)) continue;
-      const parentTree = allTrees.get(parent.slice(0, parent.indexOf(":")));
-      if (parentTree && !parentTree.epoch) continue;
-      orphanHidden += Math.max(0, count - t.children(parent).filter((n) => t.baseline.has(n.id)).length);
-      orphanParents.push([source, parent]);
-    }
   }
-  const loadOrphans = () => { for (const [source, parent] of orphanParents) void loadChildren(source, parent); };
+  // 报告了子节点数、但父节点不在任何来源里：这些冷节点也属于“未归属”，与普通父节点同一规则（分页游标优先）。
+  const orphanMore = orphanHistory(allTrees, (parent) => {
+    if (awaitingParent(parent)) return true;
+    const parentTree = allTrees.get(parent.slice(0, parent.indexOf(":")));
+    return !!parentTree && !parentTree.epoch;
+  });
+  const loadOrphans = () => { for (const [source, parent] of orphanMore.parents) void loadChildren(source, parent); };
   const errors = Object.entries(status).filter(([, s]) => s.error);
   const loading = Object.values(status).some((s) => s.loading);
   const empty = !projects.some((g) => childrenAcross(allTrees, g.id).length > 0 || (g.childCount ?? 0) > 0) && !roots.size && !orphans.length;
@@ -317,11 +314,11 @@ export function Sidebar() {
             {nodes.map((node) => <NodeRow key={node.id} node={node} depth={0} ctx={ctx} />)}
           </div>
         ))}
-        {(orphans.length > 0 || orphanHidden > 0) && (
+        {(orphans.length > 0 || orphanMore.count > 0 || orphanMore.unknown) && (
           <div class="project" data-testid="unassigned">
             <div class="project-head" title="所属主会话已不在列表中的插件节点"><span class="project-name">未归属</span></div>
             {orphans.map((node) => <NodeRow key={node.id} node={node} depth={0} ctx={ctx} />)}
-            {orphanHidden > 0 && <button class="link history" data-testid="unassigned-history" onClick={loadOrphans}>历史（{orphanHidden}）</button>}
+            {(orphanMore.count > 0 || orphanMore.unknown) && <button class="link history" data-testid="unassigned-history" onClick={loadOrphans}>{orphanMore.count > 0 ? `历史（${orphanMore.count}）` : "历史"}</button>}
           </div>
         )}
       </div>

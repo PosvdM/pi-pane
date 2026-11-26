@@ -77,11 +77,15 @@ function scheduleLoad(source: string, delay = 50): void {
   timers.set(source, setTimeout(() => { timers.delete(source); void loadTree(source); }, delay));
 }
 
-function onChange(source: string, change: TreeChange): void {
+/**
+ * 应用订阅推来的一条树变更。upsert 和 remove 都重新扫描要补取的父节点：删除节点可能去掉某个父节点的最后一个引用，
+ * 腾出的名额要用于此前因名额已满没有申请的父节点。导出供测试走同一条路径。
+ */
+export function onChange(source: string, change: TreeChange): void {
   const result = tree(source).apply(change, hot(source));
   if (result === "reset") { pins(source).retryMissing(); scheduleLoad(source); return; }
   if (result === "needsAncestors" && change.type === "upsert") { pins(source).open(change.node.id); scheduleLoad(source, 300); return; }
-  if (result === "applied") { trees.touch(); if (change.type === "upsert") pinMissingParents(); }
+  if (result === "applied") { trees.touch(); pinMissingParents(); }
 }
 
 /**

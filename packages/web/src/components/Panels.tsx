@@ -1,6 +1,7 @@
 // 插件面板：按 PanelContent 的类型用内置组件渲染，内容按需拉取，收到 panelChanged 后重新拉取（plugin-api.md“面板”）。
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api } from "../lib/api.ts";
+import { openFromResult } from "../lib/navigate.ts";
 import { panelGeneration, panelKey, panelRevision, panelState, runAction } from "../lib/plugin-ui.ts";
 import { actionSpec, pluginName, plugins } from "../lib/plugins.ts";
 import { Store, useStore } from "../lib/store.ts";
@@ -20,13 +21,14 @@ export function panelsFor(node: TreeNode, panels: PanelSpec[]): PanelSpec[] {
   });
 }
 
-function RowActions({ source, panelId, rowId, nodeId, actions, onOpenNode }: { source: string; panelId: string; rowId: string; nodeId?: string; actions?: string[]; onOpenNode: (id: string) => void }) {
+/** 行动作。结果带 openNodeId 时按发起时的导航代次打开（见 openFromResult）。 */
+function RowActions({ source, panelId, rowId, nodeId, actions }: { source: string; panelId: string; rowId: string; nodeId?: string; actions?: string[] }) {
   const specs = (actions ?? []).map((id) => actionSpec(source, id)).filter((spec) => spec?.scope.includes("panelRow"));
   if (!specs.length) return null;
   return (
     <span class="row-actions" onClick={(e) => e.stopPropagation()}>
       {specs.map((spec) => <button key={spec!.id} class={"btn small-btn" + (spec!.danger ? " danger" : "")} data-testid="panel-row-action"
-        onClick={() => void runAction(source, spec!.id, { type: "panelRow", panelId, rowId, ...(nodeId ? { nodeId } : {}) }, onOpenNode)}>{spec!.title}</button>)}
+        onClick={() => void runAction(source, spec!.id, { type: "panelRow", panelId, rowId, ...(nodeId ? { nodeId } : {}) }, openFromResult())}>{spec!.title}</button>)}
     </span>
   );
 }
@@ -43,7 +45,7 @@ export function PanelBody({ panel, content, onOpenNode }: { panel: PanelSpec; co
         <tbody>{content.rows.map((row) => (
           <tr key={row.rowId} class={row.nodeId ? "clickable" : ""} data-testid="panel-row" onClick={() => row.nodeId && onOpenNode(row.nodeId)}>
             {content.columns.map((c) => <td key={c.key}>{row.cells[c.key] ?? ""}</td>)}
-            <td><RowActions source={panel.source} panelId={panel.id} rowId={row.rowId} nodeId={row.nodeId} actions={row.actions} onOpenNode={onOpenNode} /></td>
+            <td><RowActions source={panel.source} panelId={panel.id} rowId={row.rowId} nodeId={row.nodeId} actions={row.actions} /></td>
           </tr>
         ))}</tbody>
       </table>
@@ -53,7 +55,7 @@ export function PanelBody({ panel, content, onOpenNode }: { panel: PanelSpec; co
         <div key={item.id} class={"panel-item" + (item.nodeId ? " clickable" : "")} data-testid="panel-row" onClick={() => item.nodeId && onOpenNode(item.nodeId)}>
           <div class="panel-item-head"><span class="session-label">{item.title}</span>{item.badge && <span class="node-badge">{item.badge}</span>}</div>
           {item.subtitle && <div class="muted small">{item.subtitle}</div>}
-          <RowActions source={panel.source} panelId={panel.id} rowId={item.id} nodeId={item.nodeId} actions={item.actions} onOpenNode={onOpenNode} />
+          <RowActions source={panel.source} panelId={panel.id} rowId={item.id} nodeId={item.nodeId} actions={item.actions} />
         </div>
       ))}</div>
     );

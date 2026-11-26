@@ -1,7 +1,7 @@
 // 插件交给浏览器的弹窗与提示：表单、用户在场确认、横幅、通知、结果未知的动作（plugin-api.md“表单”“用户在场确认”“横幅”“通知”“动作”）。
 import { useEffect, useRef, useState } from "preact/hooks";
 import { getOrCreateDevice, type DeviceInfo } from "../lib/device-key.ts";
-import { openNodeById } from "../lib/navigate.ts";
+import { openFromResult, openNodeById } from "../lib/navigate.ts";
 import { sortBanners, visibleBanners } from "../lib/plugin-state.ts";
 import {
   answerPresence, banners, deviceVersion, dismissNotification, formBusy, notifications, openForm, pendingOps, presence, queryForm, queryOp, runAction, settleOp, submitForm,
@@ -271,7 +271,7 @@ function Banner({ banner }: { banner: BannerState }) {
           {banner.body && <Markdown text={banner.body} />}
           {banner.actions?.length ? <div class="row">{banner.actions.map((id) => (
             <button key={id} class="btn" data-testid="banner-action" disabled={banner.sourceUnavailable || !actionSpec(banner.source, id)}
-              onClick={() => void runAction(banner.source, id, { type: "global" }, openNodeById)}>{actionSpec(banner.source, id)?.title ?? id}</button>
+              onClick={() => void runAction(banner.source, id, { type: "global" }, openFromResult())}>{actionSpec(banner.source, id)?.title ?? id}</button>
           ))}</div> : null}
         </div>
       )}
@@ -337,7 +337,7 @@ export function PluginToasts() {
             <div class="toast-actions">
               {n.nodeId && <button class="btn small-btn" onClick={() => { dismissNotification(n.source, n.id); openNodeById(n.nodeId!); }}>打开</button>}
               {n.actions?.map((id) => actionSpec(n.source, id)).filter(Boolean).map((spec) => (
-                <button key={spec!.id} class={"btn small-btn" + (spec!.danger ? " danger" : "")} onClick={() => void runAction(n.source, spec!.id, n.nodeId ? { type: "node", nodeId: n.nodeId } : { type: "global" }, openNodeById)}>{spec!.title}</button>
+                <button key={spec!.id} class={"btn small-btn" + (spec!.danger ? " danger" : "")} onClick={() => void runAction(n.source, spec!.id, n.nodeId ? { type: "node", nodeId: n.nodeId } : { type: "global" }, openFromResult())}>{spec!.title}</button>
               ))}
               <span class="muted small">{pluginName(n.source)}</span>
             </div>

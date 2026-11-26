@@ -1,6 +1,6 @@
 // 插件节点视图：会话节点显示聊天记录、动作、输入框或只读条；group 和 resource 节点只显示面板（plugin-api.md“会话视图”“向会话发消息与停止”“面板”）。
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import { nodeLabel, openNodeById } from "../lib/navigate.ts";
+import { nodeLabel, openFromResult, openNodeById } from "../lib/navigate.ts";
 import { abortPlugin, loadOlder, pluginView, sendToPlugin, syncCapabilities } from "../lib/plugin-session.ts";
 import { restoreText, splitActions } from "../lib/plugin-state.ts";
 import { formKey, forms, invokeAction, openForm, runAction, sortedForms } from "../lib/plugin-ui.ts";
@@ -44,7 +44,7 @@ function HeadActions({ node, actions }: { node: TreeNode; actions: ActionSpec[] 
     return () => { clearTimeout(timer); removeEventListener("click", close); };
   }, [menu]);
   const { shown, more } = splitActions(actions);
-  const run = (spec: ActionSpec) => void runAction(node.source, spec.id, { type: "node", nodeId: node.id }, openNodeById);
+  const run = (spec: ActionSpec) => void runAction(node.source, spec.id, { type: "node", nodeId: node.id }, openFromResult());
   return (
     <>
       {shown.map((a) => <button key={a.id} class={"btn small-btn" + (a.danger ? " danger" : "")} data-testid="node-head-action" title={a.confirm} onClick={() => run(a)}>{a.title}</button>)}
@@ -61,10 +61,21 @@ function HeadActions({ node, actions }: { node: TreeNode; actions: ActionSpec[] 
 }
 
 /**
- * 插件会话输入框里尚未提交的文字，按节点保存在本标签页内存中：切换节点再回来时还在，
- * 提交失败时即使已切换到其他节点也能放回原节点。
+ * 插件会话输入框里尚未提交的文字，按节点保存：切换节点再回来时还在，提交没有确定送达时即使已切换到其他节点也能放回原节点。
+ * 同时写入本标签页的 sessionStorage，刷新页面后仍在（放回输入框的原文也随之保留）；不可用或写入失败时只保存在内存中。
  */
-const drafts = new Store<Record<string, string>>({});
+const DRAFTS_KEY = "pi-pane.pluginDrafts";
+function storedDrafts(): Record<string, string> {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(DRAFTS_KEY) ?? "{}");
+    return value && typeof value === "object" ? Object.fromEntries(Object.entries(value).filter(([, v]) => typeof v === "string")) as Record<string, string> : {};
+  } catch { return {}; }
+}
+const drafts = new Store<Record<string, string>>(storedDrafts());
+drafts.subscribe(() => {
+  try { sessionStorage.setItem(DRAFTS_KEY, JSON.stringify(Object.fromEntries(Object.entries(drafts.get()).filter(([, v]) => v)))); }
+  catch { /* 只保存在内存中。 */ }
+});
 const setDraft = (nodeId: string, update: (value: string) => string) => drafts.set((all) => ({ ...all, [nodeId]: update(all[nodeId] ?? "") }));
 
 /**
@@ -98,9 +109,11 @@ function PluginComposer({ node, running, canAbort }: { node: TreeNode; running: 
     if (composer && !action) { toast("插件没有声明输入框使用的动作", "error"); return; }
     setDraft(node.id, () => ""); setBusy(true);
     const original = { restore: () => setDraft(node.id, (current) => restoreText(value, current)) };
+    // 结果带 openNodeId 时，发起后用户已切换到其他节点就不跳转，只提示。
+    const onOpenNode = openFromResult();
     try {
       // 有 composer 时改为调用指定动作，文字放在 input.fields.message；不弹确认，也不取附带表单。
-      if (action) await invokeAction(action, { type: "node", nodeId: node.id }, { answers: [], fields: { message: value } }, openNodeById, original);
+      if (action) await invokeAction(action, { type: "node", nodeId: node.id }, { answers: [], fields: { message: value } }, onOpenNode, original);
       else await sendToPlugin(value, running ? delivery : undefined, original);
     } finally { setBusy(false); }
   };

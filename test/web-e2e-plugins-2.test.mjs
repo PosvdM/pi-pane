@@ -10,7 +10,7 @@ const plugin = () => globalThis.__uiPlugin;
 const node = (page, id) => page.locator(`[data-node-id="${id}"]`).first();
 const editor = (page) => byId(page, "plugin-editor");
 
-test("插件输入框：提交即清空、被拒或放弃后放回、等待期间新写的文字保留、结果未知与处理中可查询；排队任务可停止；标题栏动作超过 3 个进“⋯”", { timeout: 120_000 }, async (t) => {
+test("插件输入框：提交即清空、没有确定送达就放回（被拒、放弃、处理中、服务端等待超时）、等待期间新写的文字保留、处理中与结果未知可查询；排队任务可停止；标题栏动作超过 3 个进“⋯”", { timeout: 120_000 }, async (t) => {
   const s = await setup(t, { fallback: { segments: [{ type: "text", text: "好的" }] } }, {
     serverOptions: () => ({ plugins: [pluginDir] }), allowedErrors: [/status of 504/],
   }); if (!s) return;
@@ -54,16 +54,6 @@ test("插件输入框：提交即清空、被拒或放弃后放回、等待期�
   await node(page, "uitest:session:d").click();
   await page.getByText("留言：第二段").waitFor();
   assert.equal(await editor(page).inputValue(), "新写的");
-  // 机器较慢时，上面等待放行的请求可能超过动作超时（1 秒），服务端按“结果未知”返回 pending，留下查询入口，文字不放回。
-  // 插件随后已执行：查询结算为已送达，入口消失，输入框里期间新写的文字不受影响。
-  await until(async () => {
-    const entries = byId(page, "action-pending");
-    if ((await entries.count()) === 0) return true;
-    await entries.first().locator('[data-testid="action-query"]').click({ timeout: 1000 }).catch(() => {});
-    return false;
-  });
-  assert.equal(await editor(page).inputValue(), "新写的");
-
   // needsInput：放弃后续表单视为没有执行，文字放回。
   plugin().composerMode = "needsInput";
   await editor(page).fill("要补充的");
@@ -72,33 +62,41 @@ test("插件输入框：提交即清空、被拒或放弃后放回、等待期�
   await byId(page, "form-close").click();
   await until(async () => (await editor(page).inputValue()) === "要补充的");
 
-  // 处理中：文字不放回，留下“查询结果”；用同一个键查到插件最终没有执行时，文字放回原节点的输入框。
+  // 处理中：没有确定送达，文字立即放回（放在期间新写的内容之前），留下“查询结果”；
+  // 用同一个键查到插件最终没有执行时只提示结果，文字不重复放回。
   const keys = [];
   page.on("request", (request) => { if (request.url().includes("/actions/uitest.note/invoke")) keys.push(request.postDataJSON().idempotencyKey); });
   await editor(page).fill("");
   plugin().composerMode = "pending";
   await editor(page).fill("排队留言");
   await byId(page, "plugin-send").click();
-  await byId(page, "action-pending").filter({ hasText: "留言处理中" }).waitFor();
-  assert.equal(await editor(page).inputValue(), "");
+  const pendingOp = byId(page, "action-pending").filter({ hasText: "留言处理中，文字已放回输入框" });
+  await pendingOp.waitFor();
+  assert.equal(await editor(page).inputValue(), "排队留言");
+  await editor(page).fill("排队留言\n又写的");
   plugin().finishPending({ status: "failed", message: "留言没有送达" });
-  await byId(page, "action-pending").filter({ hasText: "留言处理中" }).locator('[data-testid="action-query"]').click();
+  await pendingOp.locator('[data-testid="action-query"]').click();
   await byId(page, "toast").filter({ hasText: "留言没有送达" }).waitFor();
-  await until(async () => (await editor(page).inputValue()) === "排队留言");
+  await until(async () => (await byId(page, "action-pending").count()) === 0);
+  assert.equal(await editor(page).inputValue(), "排队留言\n又写的", "查到没有执行时不重复放回");
   await until(() => keys.length === 2);
   assert.equal(keys[0], keys[1], "查询沿用同一个幂等键");
 
-  // 超过动作超时：服务端按“结果未知”返回 pending，文字不放回；之后查询得到成功。
+  // 服务端等待插件超时（uitest.note 的 timeoutMs 为 5 秒）：服务端返回 pending 和“结果未知”，文字同样立即放回；
+  // 之后查询得到已执行，提示用户删去放回的文字。
   await editor(page).fill("");
   plugin().composerMode = "slow";
   await editor(page).fill("慢留言");
   await byId(page, "plugin-send").click();
-  await byId(page, "action-pending").filter({ hasText: "结果未知" }).waitFor({ timeout: 20_000 });
-  assert.equal(await editor(page).inputValue(), "");
-  await page.getByText("留言：慢留言").waitFor({ timeout: 10_000 });
-  await byId(page, "action-pending").filter({ hasText: "结果未知" }).locator('[data-testid="action-query"]').click();
+  const slowOp = byId(page, "action-pending").filter({ hasText: "结果未知" });
+  await slowOp.waitFor({ timeout: 20_000 });
+  assert.equal(await editor(page).inputValue(), "慢留言", "服务端等待超时同样放回");
+  await page.getByText("留言：慢留言").waitFor({ timeout: 15_000 });
+  await slowOp.locator('[data-testid="action-query"]').click();
   await until(async () => (await byId(page, "action-pending").count()) === 0);
-  assert.equal(await editor(page).inputValue(), "", "查到已执行，文字不放回");
+  await byId(page, "toast").filter({ hasText: "已送达，请删去输入框里放回的文字" }).waitFor();
+  assert.equal(await editor(page).inputValue(), "慢留言", "放回的文字由用户删除");
+  await editor(page).fill("");
 
   // 会话视图先报告已结束、树节点的 abort 能力还没撤下时，不再提供停止。
   plugin().emit("d", { type: "pane_status", status: "stopped", phase: "idle" });

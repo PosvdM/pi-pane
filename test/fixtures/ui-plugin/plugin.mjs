@@ -16,7 +16,7 @@ export default function createPlugin() {
   const operations = new Map();    // 幂等键 → { digest, result | promise }
   const handled = new Map();       // formId → revision
   const forms = new Map();
-  const calls = { invoke: [], submit: [], send: [], abort: 0, resolveForm: 0, presence: [] };
+  const calls = { invoke: [], submit: [], send: [], abort: 0, resolveForm: 0, presence: [], subscribe: [] };
   let slowRelease;
   let noteRelease;
   let branches = 0;
@@ -73,6 +73,23 @@ export default function createPlugin() {
       emitSession(id, { type: "pane_entries", entries: [entry], leafId: entry.id });
     },
     resync(id) { emitSession(id, { type: "resync" }); },
+    /** 会话当前的订阅数。 */
+    listening(id) { return session(id).listeners.size; },
+    /** 会话事件流当前的 seq。 */
+    seq(id) { return session(id).seq; },
+    /**
+     * 会话结束：追加最后一条输出和结束状态，记入事件日志（续订和快照能取到），但不推给当前订阅，
+     * 模拟会话流的最后几帧晚于撤销 subscribe 的树更新到达、退订后就收不到了。
+     */
+    endQuietly(id, status, text) {
+      const s = session(id);
+      const entry = { type: "message", id: "e" + (s.entries.length + 1), parentId: s.entries.at(-1)?.id ?? null, timestamp: now(),
+        message: { role: "assistant", content: [{ type: "text", text }], timestamp: Date.now(), stopReason: "stop" } };
+      s.entries.push(entry); s.status = status;
+      for (const event of [{ type: "pane_entries", entries: [entry], leafId: entry.id }, { type: "pane_status", status, phase: "idle" }]) {
+        s.seq++; s.log.push({ ref: { source: "uitest", id }, cursor: { epoch: STREAM, seq: s.seq }, event });
+      }
+    },
     /** 换掉会话的当前分支：快照只给 current，更早的 older 要点“加载更早的消息”取得。 */
     branch(id, older, current) {
       const s = session(id);
@@ -97,7 +114,7 @@ export default function createPlugin() {
     failSnapshots: 0,
     /** 普通发送（sessions.send）的结果：ok 受理并回显；pending 已受理仍在处理，之后由 finishPending 给出最终结果。 */
     sendMode: "ok",
-    /** 输入框动作 uitest.note 的结果：ok、reject、pending、slow（超过动作超时）、hold（等 releaseNote）、needsInput。 */
+    /** 输入框动作 uitest.note 的结果：ok、reject、pending、slow（超过动作超时）、hold（等 releaseNote）、holdOpen（等 releaseNote 后返回 openNodeId）、needsInput。 */
     composerMode: "ok",
     releaseNote() { noteRelease?.(); },
     /** 把处于 pending 的操作改为最终结果，之后用同一个键查询得到它。 */
@@ -151,6 +168,7 @@ export default function createPlugin() {
       subscribe(ref, after, emit) {
         // 按游标重放之后的事件；游标不属于本流或超前时要求重取快照。
         const s = session(ref.id);
+        calls.subscribe.push({ id: ref.id, after: structuredClone(after) });
         if (after.epoch !== STREAM || after.seq > s.seq) emit({ ref, cursor: { epoch: STREAM, seq: s.seq + 1 }, event: { type: "resync" } });
         else for (const record of s.log) if (record.cursor.seq > after.seq) emit(structuredClone(record));
         s.listeners.add(emit); return () => s.listeners.delete(emit);
@@ -193,7 +211,7 @@ export default function createPlugin() {
         { id: "uitest.slow", source: "uitest", title: "慢动作", scope: ["global"], timeoutMs: 1000 },
         { id: "uitest.create", source: "uitest", title: "新建任务", scope: ["global"] },
         { id: "uitest.wipe", source: "uitest", title: "清空", scope: ["global"], confirm: "确定清空？", danger: true },
-        { id: "uitest.note", source: "uitest", title: "留言", scope: ["node"], timeoutMs: 1000 },
+        { id: "uitest.note", source: "uitest", title: "留言", scope: ["node"], timeoutMs: 5000 },
         { id: "uitest.extra1", source: "uitest", title: "附加一", scope: ["node"] },
         { id: "uitest.extra2", source: "uitest", title: "附加二", scope: ["node"] },
       ],
@@ -220,11 +238,11 @@ export default function createPlugin() {
             const mode = control.composerMode;
             if (mode === "reject") return { status: "failed", message: "插件拒绝了留言" };
             if (mode === "pending") return { status: "pending", message: "留言处理中" };
-            if (mode === "slow") await new Promise((resolve) => setTimeout(resolve, 3000));
-            if (mode === "hold") await new Promise((resolve) => { noteRelease = resolve; });
+            if (mode === "slow") await new Promise((resolve) => setTimeout(resolve, 7000));
+            if (mode === "hold" || mode === "holdOpen") await new Promise((resolve) => { noteRelease = resolve; });
             if (mode === "needsInput" && !inv.formId) return { status: "needsInput", followUpForm: { id: "note-more", source: "uitest", revision: 1, title: "补充留言", createdAt: now(), fields: [{ id: "more", label: "补充", type: "text" }] } };
             control.append("d", "留言：" + inv.input?.fields?.message);
-            return { status: "ok", message: "已留言" };
+            return { status: "ok", message: "已留言", ...(mode === "holdOpen" ? { openNodeId: "uitest:session:d" } : {}) };
           }
           if (inv.actionId === "uitest.steer") { control.append(inv.target.nodeId.split(":").pop(), "插话：" + inv.input?.fields?.message); return { status: "ok", message: "已插话" }; }
           return { status: "ok", message: "已" + (inv.actionId === "uitest.retry" ? "返工" : "执行") };

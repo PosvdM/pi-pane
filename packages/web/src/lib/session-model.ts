@@ -26,6 +26,19 @@ export function prependHistory(state: ModelState, entries: Entry[], historyBefor
   state.version++;
 }
 
+/**
+ * 重取快照后保留已加载的更早历史。条目树只追加、parentId 不变（plugin-api.md“历史水位”）：新快照的第一条在旧模型中时，
+ * 旧模型里排在它之前的条目都是它的祖先，接在新快照之前，历史水位沿用旧模型的。第一条不在旧模型中（如换了分支）时不保留。
+ */
+export function keepLoadedHistory(next: ModelState, prev: ModelState): void {
+  if (next.view.historyBefore === null) return;   // 快照已含到开头的全部条目
+  const first = next.entries[0]; if (!first) return;
+  const index = prev.entries.findIndex((e) => e.id === first.id);
+  if (index <= 0) return;
+  next.entries = [...prev.entries.slice(0, index), ...next.entries];
+  next.view.historyBefore = prev.view.historyBefore;
+}
+
 const idle = (): InFlightState => ({ phase: "idle", tools: [], queue: { steering: [], followUp: [] } });
 
 /**

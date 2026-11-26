@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fromSnapshot, apply, prependHistory } from "../packages/web/src/lib/session-model.ts";
+import { fromSnapshot, apply, prependHistory, keepLoadedHistory } from "../packages/web/src/lib/session-model.ts";
 import { normalize, plainText, prependDrafts, displayQueued, parseSlash, isEmpty, imageIds } from "../packages/web/src/lib/draft.ts";
 import { canonicalize, JcsError } from "../packages/web/src/lib/jcs.ts";
-import { SourceTree, TreePins, MAX_OPEN_NODE_IDS, isHot, childrenAcross, hiddenChildren, missingParents, unassigned } from "../packages/web/src/lib/tree-state.ts";
+import { SourceTree, TreePins, MAX_OPEN_NODE_IDS, isHot, childrenAcross, hiddenChildren, missingParents, orphanHistory, unassigned } from "../packages/web/src/lib/tree-state.ts";
 import { addNotificationTo, clampSidebar, restoreText, sortBanners, splitActions, visibleBanners } from "../packages/web/src/lib/plugin-state.ts";
 import { SessionModel } from "../packages/server/dist/model.js";
 import { NUMBER_VECTORS, hexToDouble, SAMPLE_INPUT, SAMPLE_OUTPUT, SORT_INPUT, SORT_EXPECTED_OUTPUT } from "./fixtures/jcs-vectors.mjs";
@@ -280,6 +280,45 @@ test("是否还有历史以分页游标为准：已开始分页且还有下一�
   // 没有开始分页时差值不大于 0 就没有历史。
   const fresh = forest([["y", { nodes: [treeNode("y", "y:root", null, { kind: "group", hasChildren: true, childCount: 1 }), treeNode("y", "y:c1", "y:root")] }]]);
   assert.deepEqual(hiddenChildren(fresh, fresh.get("y").nodes.get("y:root")), { count: 0, unknown: false, sources: [] });
+});
+
+test("“未归属”与普通父节点同一规则：分页还有下一页时差值不大于 0 也显示不带数字的“历史”，分页到底后不显示", () => {
+  // 父节点 pane:session:gone 不在主会话树里。插件报告 2，第一页列出 2 条（含一个不计入数目的热节点）后差值为 0，nextCursor 仍在。
+  const trees = forest([
+    ["pane", { nodes: [] }],
+    ["a", { nodes: [], foreignChildCounts: { "pane:session:gone": 2 } }],
+  ]);
+  const none = () => false;
+  assert.deepEqual(orphanHistory(trees, none), { count: 2, unknown: false, parents: [["a", "pane:session:gone"]] });
+  trees.get("a").mergePage("pane:session:gone", [treeNode("a", "a:hot", "pane:session:gone"), treeNode("a", "a:c2", "pane:session:gone")], 6, "2");
+  assert.deepEqual(orphanHistory(trees, none), { count: 0, unknown: true, parents: [["a", "pane:session:gone"]] }, "还有下一页，入口不消失");
+  trees.get("a").mergePage("pane:session:gone", [treeNode("a", "a:c3", "pane:session:gone")], 6);
+  assert.deepEqual(orphanHistory(trees, none), { count: 0, unknown: false, parents: [] }, "分页到底");
+  // 父节点在树里、被跳过（正在补取或来源还没有快照）的不计入。
+  const present = forest([["pane", { nodes: [treeNode("pane", "pane:session:1", null)] }], ["a", { nodes: [], foreignChildCounts: { "pane:session:1": 3, "pane:session:x": 1 } }]]);
+  assert.deepEqual(orphanHistory(present, (id) => id === "pane:session:x"), { count: 0, unknown: false, parents: [] });
+});
+
+test("重取快照保留已加载的更早历史：新快照的第一条在旧模型中时接上更早的条目，换了分支时不保留", () => {
+  const view = (entries, historyBefore) => ({ ...snapshot(), entries, leafId: entries.at(-1)?.id ?? null, historyBefore });
+  const prev = fromSnapshot(view([entry("c"), entry("d")], "c"));
+  prependHistory(prev, [entry("a"), entry("b")], null);
+  // 新快照从 c 开始：a、b 是 c 的祖先，接在前面，水位沿用旧模型的（已到开头）。
+  const next = fromSnapshot(view([entry("c"), entry("d"), entry("e")], "c"));
+  keepLoadedHistory(next, prev);
+  assert.deepEqual(next.entries.map((e) => e.id), ["a", "b", "c", "d", "e"]); assert.equal(next.view.historyBefore, null);
+  // 新快照从 d 开始（窗口后移）：a、b、c 都保留。
+  const later = fromSnapshot(view([entry("d"), entry("e")], "d"));
+  keepLoadedHistory(later, prev);
+  assert.deepEqual(later.entries.map((e) => e.id), ["a", "b", "c", "d", "e"]);
+  // 换了分支：第一条不在旧模型中，不保留，水位用新快照的。
+  const other = fromSnapshot(view([entry("x")], "x"));
+  keepLoadedHistory(other, prev);
+  assert.deepEqual(other.entries.map((e) => e.id), ["x"]); assert.equal(other.view.historyBefore, "x");
+  // 新快照已含全部条目（水位为 null）时不动。
+  const full = fromSnapshot(view([entry("c"), entry("d")], null));
+  keepLoadedHistory(full, prev);
+  assert.deepEqual(full.entries.map((e) => e.id), ["c", "d"]);
 });
 
 test("跨来源的同级节点统一按 sortKey 排序，相同时按 id", () => {
